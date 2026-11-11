@@ -1,0 +1,42 @@
+{
+  "name": "money-reader-cdio4",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Nhận dạng mệnh giá tiền Việt Nam hỗ trợ người khiếm thị (CDIO4)",
+  "engines": { "node": ">=20.0.0" },
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit -p tsconfig.json && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "copy-ort": "node scripts/copy-ort-wasm.mjs",
+    "postinstall": "node scripts/copy-ort-wasm.mjs",
+    "predev": "node scripts/copy-ort-wasm.mjs",
+    "prebuild": "node scripts/copy-ort-wasm.mjs",
+    "check:registry": "tsx scripts/check-registry.ts",
+    "verify:bundle": "node scripts/verify-bundle.mjs",
+    "cap:sync": "npm run build && npx cap sync android",
+    "cap:open": "npx cap open android"
+  },
+  "dependencies": {
+    "@capacitor-community/text-to-speech": "^6.1.0",
+    "@capacitor/app": "^7.0.0",
+    "@capacitor/core": "^7.0.0",
+    "@capacitor/haptics": "^7.0.0",
+    "@capacitor/preferences": "^7.0.0",
+    "onnxruntime-web": "^1.20.0"
+  },
+  "devDependencies": {
+    "@capacitor/android": "^7.0.0",
+    "@capacitor/cli": "^7.0.0",
+    "@types/node": "^20.0.0",
+    "happy-dom": "^15.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "vite": "^5.4.0",
+    "vitest": "^2.1.0"
+  }
+}

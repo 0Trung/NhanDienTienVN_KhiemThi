@@ -1,0 +1,17 @@
+# Phụ thuộc và sản phẩm build
+node_modules/
+dist/
+coverage/
+
+# Android: KHÔNG ignore cả thư mục android/ (chứa cấu hình), chỉ ignore thư mục build
+android/build/
+android/app/build/
+
+# Sinh tự động bởi npm run copy-ort (postinstall/predev/prebuild)
+public/ort/
+
+# Khác
+*.log
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,33 @@
+PROMPT | FILE | EXPORT | CHỮ KÝ
+P00 | src/utils/event-bus.ts | createEventBus | <E extends Record<string, unknown>>() => { on<K extends keyof E>(k: K, h: (p: E[K]) => void): () => void; off<K extends keyof E>(k: K, h: (p: E[K]) => void): void; emit<K extends keyof E>(k: K, p: E[K]): void }
+P00 | src/utils/logger.ts | createLogger, getRecentLogs | (scope: string) => { debug(...a: unknown[]): void; info(...a: unknown[]): void; warn(...a: unknown[]): void; error(...a: unknown[]): void } ; () => string[]
+P00 | src/utils/geometry.ts | area, intersectionArea, iou, overlapOverMin, center, clampBox, isValidBox | (b: BBox) => number ; (a: BBox, b: BBox) => number (cho intersectionArea, iou, overlapOverMin) ; (b: BBox) => { x: number; y: number } ; (b: BBox, w: number, h: number) => BBox ; (b: BBox) => boolean
+P00 | src/utils/math.ts | clamp, mean, mulberry32 | (v: number, lo: number, hi: number) => number ; (xs: ArrayLike<number>) => number ; (seed: number) => () => number
+P00 | src/utils/time.ts | Clock, systemClock, createFakeClock | type Clock = () => number ; systemClock: Clock ; (start?: number) => { now: Clock; advance(ms: number): void }
+P00 | src/utils/platform.ts | getPlatform, isNative | () => Platform ; () => boolean
+P00 | src/config/denominations.ts | formatVND, isDenomination, buildClassMap | (n: number) => string ; (n: number) => n is Denomination ; (c: ClassesJson) => Denomination[]
+P00 | tests/fakes/*.ts | makeDetection, makeAnalysis, makeInferenceResult, FakeCamera, FakeInference, FakeTtsEngine, FakeSpeech, FakeHaptics, MemorySettingsStore | xem P00 lượt 2
+P02 | src/camera/camera-controller.ts | createCameraService | (opts?: { video?: HTMLVideoElement; fps?: number; torchPort?: ITorchPort }) => ICameraService
+P03 | src/vision/letterbox.ts | computeLetterbox | (srcW: number, srcH: number, inputSize: number) => LetterboxMeta
+P03 | src/vision/image-processor.ts | createPreprocessor | (o: PreprocessorOptions) => IPreprocessor
+P04 | src/vision/post-processor.ts | createPostProcessor | (o: PostProcessorOptions) => IPostProcessor
+P05 | src/vision/inference-client.ts | createInferenceClient | (o: { modelBaseUrl: string; ortBaseUrl: string; config: AppConfig['inference']; workerFactory?: () => Worker }) => IInferenceClient
+P05 | src/vision/benchmark.ts | runBenchmark, Stats | (client: IInferenceClient, makeFrame: () => Promise<CapturedFrame>, n: number) => Promise<{ totalMs: Stats; inferMs: Stats }> ; Stats = { mean: number; p50: number; p95: number }
+P06 | src/analyzer/frame-analyzer.ts | createFrameAnalyzer | (config: AppConfig) => IFrameAnalyzer
+P07 | src/decision/decision-engine.ts | createDecisionEngine | (config: AppConfig['decision']) => IDecisionEngine
+P07 | src/decision/total-calculator.ts | calculateTotal | (d: Denomination[]) => { count: number; denominations: Denomination[]; total: number; formattedTotal: string }
+P08 | src/voice/speech-manager.ts | createSpeechManager | (o: { engines: ITtsEngine[]; haptics: IHaptics; getSettings: () => Settings; config: AppConfig['speech']; now?: () => number }) => ISpeech
+P08 | src/voice/native-tts-engine.ts | createNativeTtsEngine | () => ITtsEngine
+P08 | src/voice/web-speech-engine.ts | createWebSpeechEngine | () => ITtsEngine
+P08 | src/voice/audio-clip-engine.ts | createAudioClipEngine | (o?: { baseUrl?: string }) => ITtsEngine
+P08 | src/voice/haptic-service.ts | createHaptics | (o: { isEnabled: () => boolean }) => IHaptics
+P09 | src/offline/settings-store.ts | createSettingsStore | () => ISettingsStore
+P09 | src/offline/asset-check.ts | checkBundledAssets | (o: { baseUrl: string; fetchFn?: typeof fetch }) => Promise<{ ok: boolean; missing: string[]; warnings: string[]; error?: AppError }>
+P10 | src/accessibility/start-gate.ts | createStartGate | (o: { root: HTMLElement; onStart: () => void; unlock: () => void }) => { show(): void; hide(): void }
+P10 | src/accessibility/gesture-controller.ts | createGestureController | (o: { surface: HTMLElement; onReplay: () => void; onToggleTorch: () => void }) => { dispose(): void }
+P10 | src/accessibility/accessibility-manager.ts | createAccessibilityManager | (o: { root: HTMLElement; torchSupported: boolean; onReplay: () => void; onToggleTorch: () => void; onOpenSettings: () => void }) => { setTorchPressed(on: boolean): void; setStatusText(t: string): void; focusReplay(): void; dispose(): void }
+P10 | src/accessibility/aria-live-engine.ts | createAriaLiveEngine | (o?: { root?: HTMLElement }) => ITtsEngine
+P10 | src/accessibility/settings-manager.ts | createSettingsManager | (store: ISettingsStore, onAck: (a: SettingAck) => void) => { load(): Promise<Settings>; get(): Settings; set(p: Partial<Settings>): Promise<Settings>; subscribe(h: (s: Settings) => void): () => void }
+P10 | src/accessibility/settings-view-model.ts | buildSettingsViewModel, SettingsItem | (get: () => Settings, set: (p: Partial<Settings>) => Promise<Settings>) => SettingsItem[] ; SettingsItem là kiểu export cùng file
+P11 | src/app/app.ts | createApp, AppDeps | (deps: AppDeps) => { start(): Promise<void>; dispose(): void } ; AppDeps là kiểu export cùng file
+P11 | src/app/native-torch.ts | createNativeTorchPort | () => ITorchPort

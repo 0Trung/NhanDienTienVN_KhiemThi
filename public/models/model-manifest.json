@@ -1,0 +1,23 @@
+{
+  "version": "1.0.0",
+  "file": "best.onnx",
+  "sizeBytes": 37843674,
+  "sha256": "1d2ad655d6ecf0cf181e499807e3663e249def0ec51b477afb68b6dc5b02b020",
+  "ultralytics": "8.4.197",
+  "opset": 18,
+  "classCount": 9,
+  "exportedAt": "2026-11-12T13:33:04Z",
+  "inputName": "images",
+  "inputShape": [
+    1,
+    3,
+    416,
+    416
+  ],
+  "outputName": "output0",
+  "outputShape": [
+    1,
+    13,
+    3549
+  ]
+}

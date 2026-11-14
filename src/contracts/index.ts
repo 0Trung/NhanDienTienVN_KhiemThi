@@ -51,6 +51,24 @@ export interface ModelConfigJson {
   outputLayout: 'channels_first' | 'channels_last';    // [1,4+nc,N] | [1,N,4+nc]
   confLow: number; confSure: number; nmsIou: number; agnosticNms: boolean; maxDetections: number;
 }
+/* ───── Dữ liệu vàng do P01 sinh (golden_fixtures.json): dùng cho test tích hợp ở P05, KHÔNG đóng vào APK ───── */
+/** Một hộp theo pipeline mẫu của P01 (CELL 5): toạ độ pixel trong ẢNH GỐC; confidence làm tròn 4 số, bbox làm tròn 1 số. */
+export interface GoldenBox { classId: number; denomination: Denomination; confidence: number; bbox: BBox }
+/** Kết quả của một ảnh ở một size; cùng một ảnh có một mục cho mỗi size đã xuất. Ảnh nằm trong thư mục fixtures/ của gói xuất. */
+export interface GoldenFixture {
+  image: string;                                        // tên file ảnh trong fixtures/
+  kind: `single-${Denomination}` | 'multi' | 'empty';   // một tờ / nhiều tờ / không có tiền
+  srcWidth: number; srcHeight: number;                  // kích thước ảnh gốc
+  size: number;                                         // inputSize của model dùng để sinh mục này
+  boxes: GoldenBox[];                                   // sắp từ TRÁI sang PHẢI như InferenceResult.detections
+}
+export interface GoldenFixtures {
+  version: string; ultralytics: string; generatedBy: 'P01';
+  params: Pick<ModelConfigJson, 'confLow' | 'confSure' | 'nmsIou' | 'agnosticNms' | 'maxDetections' | 'padValue'>;
+  tolerance: { confidence: number; iou: number };       // dung sai gợi ý khi so kết quả TS với golden (canvas không resize giống hệt cv2)
+  note: string;
+  fixtures: GoldenFixture[];
+}
 export interface RawModelOutput { data: Float32Array; dims: readonly number[] }
 export interface ModelInfo {
   version: string; inputSize: number; classCount: number;

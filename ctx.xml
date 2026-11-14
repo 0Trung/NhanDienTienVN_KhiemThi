@@ -1,0 +1,979 @@
+This file is a merged representation of a subset of the codebase, containing specifically included files, combined into a single document by Repomix.
+The content has been processed where content has been compressed (code blocks are separated by ⋮---- delimiter).
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of a subset of the repository's contents that is considered the most important context.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Only files matching these patterns are included: src/contracts/**, src/config/**, src/utils/**, tests/fakes/**, docs/export-registry.txt
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Content has been compressed - code blocks are separated by ⋮---- delimiter
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+docs/
+  export-registry.txt
+src/
+  config/
+    app-config.ts
+    denominations.ts
+  contracts/
+    index.ts
+  utils/
+    event-bus.ts
+    geometry.ts
+    logger.ts
+    math.ts
+    platform.ts
+    time.ts
+tests/
+  fakes/
+    factories.ts
+    fake-camera.ts
+    fake-haptics.ts
+    fake-inference.ts
+    fake-speech.ts
+    fake-tts-engine.ts
+    fakes.test.ts
+    index.ts
+    memory-settings-store.ts
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="docs/export-registry.txt">
+PROMPT | FILE | EXPORT | CHỮ KÝ
+P00 | src/utils/event-bus.ts | createEventBus | <E extends Record<string, unknown>>() => { on<K extends keyof E>(k: K, h: (p: E[K]) => void): () => void; off<K extends keyof E>(k: K, h: (p: E[K]) => void): void; emit<K extends keyof E>(k: K, p: E[K]): void }
+P00 | src/utils/logger.ts | createLogger, getRecentLogs | (scope: string) => { debug(...a: unknown[]): void; info(...a: unknown[]): void; warn(...a: unknown[]): void; error(...a: unknown[]): void } ; () => string[]
+P00 | src/utils/geometry.ts | area, intersectionArea, iou, overlapOverMin, center, clampBox, isValidBox | (b: BBox) => number ; (a: BBox, b: BBox) => number (cho intersectionArea, iou, overlapOverMin) ; (b: BBox) => { x: number; y: number } ; (b: BBox, w: number, h: number) => BBox ; (b: BBox) => boolean
+P00 | src/utils/math.ts | clamp, mean, mulberry32 | (v: number, lo: number, hi: number) => number ; (xs: ArrayLike<number>) => number ; (seed: number) => () => number
+P00 | src/utils/time.ts | Clock, systemClock, createFakeClock | type Clock = () => number ; systemClock: Clock ; (start?: number) => { now: Clock; advance(ms: number): void }
+P00 | src/utils/platform.ts | getPlatform, isNative | () => Platform ; () => boolean
+P00 | src/config/denominations.ts | formatVND, isDenomination, buildClassMap | (n: number) => string ; (n: number) => n is Denomination ; (c: ClassesJson) => Denomination[]
+P00 | tests/fakes/*.ts | makeDetection, makeAnalysis, makeInferenceResult, FakeCamera, FakeInference, FakeTtsEngine, FakeSpeech, FakeHaptics, MemorySettingsStore | xem P00 lượt 2
+P02 | src/camera/camera-controller.ts | createCameraService | (opts?: { video?: HTMLVideoElement; fps?: number; torchPort?: ITorchPort }) => ICameraService
+P03 | src/vision/letterbox.ts | computeLetterbox | (srcW: number, srcH: number, inputSize: number) => LetterboxMeta
+P03 | src/vision/image-processor.ts | createPreprocessor | (o: PreprocessorOptions) => IPreprocessor
+P04 | src/vision/post-processor.ts | createPostProcessor | (o: PostProcessorOptions) => IPostProcessor
+P05 | src/vision/inference-client.ts | createInferenceClient | (o: { modelBaseUrl: string; ortBaseUrl: string; config: AppConfig['inference']; workerFactory?: () => Worker }) => IInferenceClient
+P05 | src/vision/benchmark.ts | runBenchmark, Stats | (client: IInferenceClient, makeFrame: () => Promise<CapturedFrame>, n: number) => Promise<{ totalMs: Stats; inferMs: Stats }> ; Stats = { mean: number; p50: number; p95: number }
+P06 | src/analyzer/frame-analyzer.ts | createFrameAnalyzer | (config: AppConfig) => IFrameAnalyzer
+P07 | src/decision/decision-engine.ts | createDecisionEngine | (config: AppConfig['decision']) => IDecisionEngine
+P07 | src/decision/total-calculator.ts | calculateTotal | (d: Denomination[]) => { count: number; denominations: Denomination[]; total: number; formattedTotal: string }
+P08 | src/voice/speech-manager.ts | createSpeechManager | (o: { engines: ITtsEngine[]; haptics: IHaptics; getSettings: () => Settings; config: AppConfig['speech']; now?: () => number }) => ISpeech
+P08 | src/voice/native-tts-engine.ts | createNativeTtsEngine | () => ITtsEngine
+P08 | src/voice/web-speech-engine.ts | createWebSpeechEngine | () => ITtsEngine
+P08 | src/voice/audio-clip-engine.ts | createAudioClipEngine | (o?: { baseUrl?: string }) => ITtsEngine
+P08 | src/voice/haptic-service.ts | createHaptics | (o: { isEnabled: () => boolean }) => IHaptics
+P09 | src/offline/settings-store.ts | createSettingsStore | () => ISettingsStore
+P09 | src/offline/asset-check.ts | checkBundledAssets | (o: { baseUrl: string; fetchFn?: typeof fetch }) => Promise<{ ok: boolean; missing: string[]; warnings: string[]; error?: AppError }>
+P10 | src/accessibility/start-gate.ts | createStartGate | (o: { root: HTMLElement; onStart: () => void; unlock: () => void }) => { show(): void; hide(): void }
+P10 | src/accessibility/gesture-controller.ts | createGestureController | (o: { surface: HTMLElement; onReplay: () => void; onToggleTorch: () => void }) => { dispose(): void }
+P10 | src/accessibility/accessibility-manager.ts | createAccessibilityManager | (o: { root: HTMLElement; torchSupported: boolean; onReplay: () => void; onToggleTorch: () => void; onOpenSettings: () => void }) => { setTorchPressed(on: boolean): void; setStatusText(t: string): void; focusReplay(): void; dispose(): void }
+P10 | src/accessibility/aria-live-engine.ts | createAriaLiveEngine | (o?: { root?: HTMLElement }) => ITtsEngine
+P10 | src/accessibility/settings-manager.ts | createSettingsManager | (store: ISettingsStore, onAck: (a: SettingAck) => void) => { load(): Promise<Settings>; get(): Settings; set(p: Partial<Settings>): Promise<Settings>; subscribe(h: (s: Settings) => void): () => void }
+P10 | src/accessibility/settings-view-model.ts | buildSettingsViewModel, SettingsItem | (get: () => Settings, set: (p: Partial<Settings>) => Promise<Settings>) => SettingsItem[] ; SettingsItem là kiểu export cùng file
+P11 | src/app/app.ts | createApp, AppDeps | (deps: AppDeps) => { start(): Promise<void>; dispose(): void } ; AppDeps là kiểu export cùng file
+P11 | src/app/native-torch.ts | createNativeTorchPort | () => ITorchPort
+</file>
+
+<file path="src/config/app-config.ts">
+import type { AppConfig, Settings } from '../contracts';
+⋮----
+/** Mọi ngưỡng ở đây là điểm xuất phát để thử nghiệm, chưa phải giá trị đã được chứng minh. */
+⋮----
+blurThreshold: 60,   // phương sai Laplacian: PHẢI hiệu chỉnh trên điện thoại thật
+lowLightMean: 60,    // độ sáng trung bình 0..255
+</file>
+
+<file path="src/config/denominations.ts">
+import { AppError, DENOMINATIONS } from '../contracts';
+import type { ClassesJson, Denomination } from '../contracts';
+⋮----
+/**
+ * Định dạng số tiền theo kiểu Việt Nam, ví dụ 170000 → "170.000 đồng".
+ * Tự ghép dấu chấm (không dùng toLocaleString vì phụ thuộc ICU của thiết bị).
+ * Số không hữu hạn hoặc vượt số nguyên an toàn thì ném RangeError: thà lỗi còn hơn đọc sai số tiền.
+ */
+export function formatVND(n: number): string
+⋮----
+/** Kiểm tra n có thuộc 9 mệnh giá hợp lệ không. */
+export function isDenomination(n: number): n is Denomination
+⋮----
+function corrupt(message: string): AppError
+⋮----
+/**
+ * Dựng bảng tra classId → mệnh giá từ classes.json. KHÔNG giả định thứ tự ID:
+ * kết quả được đặt theo đúng classId ghi trong file.
+ * Ném AppError MODEL_CORRUPT nếu không đủ 9 lớp, classId không phải số nguyên 0..8,
+ * giá trị ngoài danh sách mệnh giá, hoặc có mệnh giá trùng.
+ */
+export function buildClassMap(c: ClassesJson): Denomination[]
+⋮----
+// Đủ 9 khoá phân biệt trong 0..8 nên mảng kết quả không thể có lỗ hổng.
+</file>
+
+<file path="src/contracts/index.ts">
+// NGUỒN SỰ THẬT DUY NHẤT giữa các module (bản 2: đóng gói APK). Không module nào được tự sửa file này.
+⋮----
+/* ───── Nền tảng, mệnh giá, lỗi ───── */
+export type Platform = 'android-native' | 'web';
+⋮----
+export type Denomination = (typeof DENOMINATIONS)[number];
+⋮----
+export type AppErrorCode =
+  | 'UNSUPPORTED_BROWSER' | 'CAMERA_PERMISSION_DENIED' | 'CAMERA_NOT_FOUND' | 'CAMERA_IN_USE' | 'CAMERA_FAILED'
+  | 'MODEL_MISSING' | 'MODEL_CORRUPT' | 'MODEL_INIT_FAILED' | 'INFERENCE_FAILED'
+  | 'TTS_UNAVAILABLE' | 'TTS_NO_VIETNAMESE_VOICE' | 'STORAGE_FAILED' | 'OFFLINE_NOT_READY';
+⋮----
+export class AppError extends Error {
+⋮----
+constructor(code: AppErrorCode, message: string, fatal = false, detail?: unknown)
+⋮----
+/* ───── Khung hình & hình học ───── */
+/** Pixel, gốc ở góc trên-trái, x1<x2, y1<y2. Với Detection: toạ độ trong KHUNG HÌNH GỐC. */
+export interface BBox { x1: number; y1: number; x2: number; y2: number }
+export interface FrameMeta { frameId: number; width: number; height: number; timestamp: number } // timestamp: performance.now() lúc chụp
+export interface CapturedFrame { bitmap: ImageBitmap; meta: FrameMeta } // bên nhận chịu trách nhiệm bitmap.close()
+export interface LetterboxMeta {
+  inputSize: number; srcWidth: number; srcHeight: number;
+  scale: number;                        // min(inputSize/srcWidth, inputSize/srcHeight)
+  newWidth: number; newHeight: number;  // sau resize, làm tròn
+  padX: number; padY: number;           // lề trái/trên, số nguyên
+}
+⋮----
+scale: number;                        // min(inputSize/srcWidth, inputSize/srcHeight)
+newWidth: number; newHeight: number;  // sau resize, làm tròn
+padX: number; padY: number;           // lề trái/trên, số nguyên
+⋮----
+export interface GrayImage { data: Uint8Array; width: number; height: number } // 1 kênh, giữ tỷ lệ gốc, không có lề
+export interface PreprocessResult { tensor: Float32Array; letterbox: LetterboxMeta; gray: GrayImage } // NCHW [1,3,S,S], RGB, 0..1
+⋮----
+/* ───── Mô hình (file do P01 sinh, nằm trong public/models và được đóng sẵn vào APK) ───── */
+export type ClassesJson = Record<string, Denomination>; // khoá = classId dạng chuỗi
+export interface ModelManifest {
+  version: string; file: string; sizeBytes: number; sha256: string;
+  ultralytics: string; opset: number; classCount: number; exportedAt: string;
+  inputName: string; inputShape: number[]; outputName: string; outputShape: number[];
+}
+export interface ModelConfigJson {
+  inputSize: number; padValue: number;                 // padValue = 114
+  channelOrder: 'RGB'; layout: 'NCHW'; normalize: 'div255';
+  outputLayout: 'channels_first' | 'channels_last';    // [1,4+nc,N] | [1,N,4+nc]
+  confLow: number; confSure: number; nmsIou: number; agnosticNms: boolean; maxDetections: number;
+}
+⋮----
+inputSize: number; padValue: number;                 // padValue = 114
+⋮----
+outputLayout: 'channels_first' | 'channels_last';    // [1,4+nc,N] | [1,N,4+nc]
+⋮----
+/* ───── Dữ liệu vàng do P01 sinh (golden_fixtures.json): dùng cho test tích hợp ở P05, KHÔNG đóng vào APK ───── */
+/** Một hộp theo pipeline mẫu của P01 (CELL 5): toạ độ pixel trong ẢNH GỐC; confidence làm tròn 4 số, bbox làm tròn 1 số. */
+export interface GoldenBox { classId: number; denomination: Denomination; confidence: number; bbox: BBox }
+/** Kết quả của một ảnh ở một size; cùng một ảnh có một mục cho mỗi size đã xuất. Ảnh nằm trong thư mục fixtures/ của gói xuất. */
+export interface GoldenFixture {
+  image: string;                                        // tên file ảnh trong fixtures/
+  kind: `single-${Denomination}` | 'multi' | 'empty';   // một tờ / nhiều tờ / không có tiền
+  srcWidth: number; srcHeight: number;                  // kích thước ảnh gốc
+  size: number;                                         // inputSize của model dùng để sinh mục này
+  boxes: GoldenBox[];                                   // sắp từ TRÁI sang PHẢI như InferenceResult.detections
+}
+⋮----
+image: string;                                        // tên file ảnh trong fixtures/
+kind: `single-${Denomination}` | 'multi' | 'empty';   // một tờ / nhiều tờ / không có tiền
+srcWidth: number; srcHeight: number;                  // kích thước ảnh gốc
+size: number;                                         // inputSize của model dùng để sinh mục này
+boxes: GoldenBox[];                                   // sắp từ TRÁI sang PHẢI như InferenceResult.detections
+⋮----
+export interface GoldenFixtures {
+  version: string; ultralytics: string; generatedBy: 'P01';
+  params: Pick<ModelConfigJson, 'confLow' | 'confSure' | 'nmsIou' | 'agnosticNms' | 'maxDetections' | 'padValue'>;
+  tolerance: { confidence: number; iou: number };       // dung sai gợi ý khi so kết quả TS với golden (canvas không resize giống hệt cv2)
+  note: string;
+  fixtures: GoldenFixture[];
+}
+⋮----
+tolerance: { confidence: number; iou: number };       // dung sai gợi ý khi so kết quả TS với golden (canvas không resize giống hệt cv2)
+⋮----
+export interface RawModelOutput { data: Float32Array; dims: readonly number[] }
+export interface ModelInfo {
+  version: string; inputSize: number; classCount: number;
+  backend: 'wasm' | 'webgpu'; threads: number; loadMs: number; warmupMs: number;
+}
+⋮----
+/* ───── Tiền xử lý & hậu xử lý (P03, P04 cài; P05 chỉ dùng qua interface) ───── */
+export interface PreprocessorOptions { inputSize: number; padValue: number; grayThumbWidth: number }
+export interface IPreprocessor { process(bitmap: ImageBitmap): PreprocessResult }
+export interface PostProcessorOptions {
+  classMap: readonly Denomination[];                   // classMap[classId] = mệnh giá (từ buildClassMap của P00)
+  inference: AppConfig['inference'];
+  layoutHint?: 'channels_first' | 'channels_last';
+}
+⋮----
+classMap: readonly Denomination[];                   // classMap[classId] = mệnh giá (từ buildClassMap của P00)
+⋮----
+export interface IPostProcessor { process(raw: RawModelOutput, letterbox: LetterboxMeta, meta: FrameMeta): Detection[] }
+⋮----
+/* ───── Phát hiện & suy luận ───── */
+export interface Detection {
+  id: string;                       // `${frameId}-${index}`
+  classId: number; denomination: Denomination;
+  confidence: number;               // 0..1
+  bbox: BBox;                       // trong khung hình gốc
+  frameId: number; timestamp: number;
+}
+⋮----
+id: string;                       // `${frameId}-${index}`
+⋮----
+confidence: number;               // 0..1
+bbox: BBox;                       // trong khung hình gốc
+⋮----
+export interface InferenceTimings { preprocessMs: number; inferMs: number; postprocessMs: number; totalMs: number }
+/** detections đã sắp từ TRÁI sang PHẢI (tâm x tăng dần, hoà thì theo y). */
+export interface InferenceResult { meta: FrameMeta; detections: Detection[]; gray: GrayImage; timings: InferenceTimings }
+⋮----
+export type WorkerRequest =
+  | { type: 'INIT'; modelBaseUrl: string; ortBaseUrl: string; config: AppConfig['inference'] }
+  | { type: 'INFER'; meta: FrameMeta; bitmap: ImageBitmap }            // bitmap được transfer
+  | { type: 'DISPOSE' };
+⋮----
+| { type: 'INFER'; meta: FrameMeta; bitmap: ImageBitmap }            // bitmap được transfer
+⋮----
+export type WorkerResponse =
+  | { type: 'READY'; info: ModelInfo }
+  | { type: 'RESULT'; result: InferenceResult }
+  | { type: 'DROPPED'; frameId: number }                             // worker đang bận
+  | { type: 'ERROR'; code: AppErrorCode; message: string; fatal: boolean; frameId?: number };
+⋮----
+| { type: 'DROPPED'; frameId: number }                             // worker đang bận
+⋮----
+/* ───── Camera & suy luận (interface) ───── */
+export type CameraStatus = 'IDLE' | 'REQUESTING' | 'ACTIVE' | 'PAUSED' | 'ERROR';
+/** Cổng điều khiển đèn pin dự phòng khi getUserMedia không điều khiển được đèn (một số WebView). */
+export interface ITorchPort { isSupported(): Promise<boolean>; set(on: boolean): Promise<boolean> }
+export interface ICameraService {
+  readonly video: HTMLVideoElement;
+  readonly status: CameraStatus;
+  readonly torchSupported: boolean;
+  start(): Promise<void>;                                  // ném AppError
+  stop(): void;
+  pause(): void;
+  resume(): Promise<void>;
+  setSampling(fps: number): void;
+  onFrame(handler: (f: CapturedFrame) => void | Promise<void>): () => void; // handler async: camera chờ xong mới lấy khung kế
+  onStatus(handler: (s: CameraStatus, error?: AppError) => void): () => void;
+  setTorch(on: boolean): Promise<boolean>;                // true nếu bật/tắt được
+}
+⋮----
+start(): Promise<void>;                                  // ném AppError
+stop(): void;
+pause(): void;
+resume(): Promise<void>;
+setSampling(fps: number): void;
+onFrame(handler: (f: CapturedFrame) => void | Promise<void>): () => void; // handler async: camera chờ xong mới lấy khung kế
+onStatus(handler: (s: CameraStatus, error?: AppError)
+setTorch(on: boolean): Promise<boolean>;                // true nếu bật/tắt được
+⋮----
+export interface IInferenceClient {
+  readonly ready: boolean;
+  init(): Promise<ModelInfo>;                              // ném AppError
+  infer(frame: CapturedFrame): Promise<InferenceResult | null>; // null = bị bỏ; luôn giải phóng bitmap
+  dispose(): void;
+}
+⋮----
+init(): Promise<ModelInfo>;                              // ném AppError
+infer(frame: CapturedFrame): Promise<InferenceResult | null>; // null = bị bỏ; luôn giải phóng bitmap
+dispose(): void;
+⋮----
+/* ───── Phân tích khung hình ───── */
+export interface FrameAnalysis {
+  meta: FrameMeta;
+  detections: Detection[];   // ≥ confLow, trái → phải
+  sure: Detection[];         // ≥ confSure
+  unsure: Detection[];       // [confLow, confSure)
+  overlap: { detected: boolean; maxRatio: number; pairs: Array<[string, string]> };
+  conflict: { detected: boolean; pairs: Array<[string, string]> };   // cùng vị trí nhưng khác mệnh giá
+  position: { tooSmall: boolean; partial: boolean };
+  quality: { blurScore: number; blurry: boolean; brightness: number; lowLight: boolean };
+  stability: { stable: boolean; agree: number; window: number; consensus: Detection[] | null };
+  emptyStreak: number;       // số khung liên tiếp không có detection nào
+}
+⋮----
+detections: Detection[];   // ≥ confLow, trái → phải
+sure: Detection[];         // ≥ confSure
+unsure: Detection[];       // [confLow, confSure)
+⋮----
+conflict: { detected: boolean; pairs: Array<[string, string]> };   // cùng vị trí nhưng khác mệnh giá
+⋮----
+emptyStreak: number;       // số khung liên tiếp không có detection nào
+⋮----
+export interface IFrameAnalyzer { analyze(r: InferenceResult): FrameAnalysis; reset(): void }
+⋮----
+/* ───── Quyết định ───── */
+export type AppState =
+  | 'INITIALIZING' | 'AWAITING_START' | 'WAITING_PERMISSION' | 'LOADING_MODEL' | 'READY'
+  | 'NO_CANDIDATE' | 'DETECTING' | 'UNCERTAIN' | 'OVERLAPPING' | 'STABILIZING'
+  | 'RESULT_READY' | 'SPEAKING' | 'ERROR';
+export type DecisionStatus =
+  | 'NO_MONEY_CANDIDATE' | 'LOW_CONFIDENCE' | 'CLASS_CONFLICT' | 'OVERLAP' | 'PARTIAL_IN_FRAME' | 'TOO_FAR'
+  | 'BLUR' | 'LOW_LIGHT' | 'UNSTABLE' | 'MULTI_NOT_ALLOWED' | 'CONFIDENT_SINGLE' | 'CONFIDENT_MULTI';
+export type GuidanceCode =
+  | 'NO_MONEY' | 'TOO_FAR' | 'PARTIAL_IN_FRAME' | 'BLUR' | 'LOW_LIGHT' | 'LOW_CONFIDENCE'
+  | 'CLASS_CONFLICT' | 'OVERLAP' | 'HOLD_STEADY' | 'MULTI_NOT_ALLOWED';
+/** Chỉ tồn tại khi kết quả đã được xác nhận. denominations sắp từ trái sang phải. */
+export interface RecognitionResult {
+  status: 'CONFIDENT_SINGLE' | 'CONFIDENT_MULTI';
+  count: number; denominations: Denomination[];
+  total: number; formattedTotal: string;   // ví dụ '170.000 đồng'
+  timestamp: number;
+}
+⋮----
+total: number; formattedTotal: string;   // ví dụ '170.000 đồng'
+⋮----
+export type SettingAck =
+  | 'VOICE_ON' | 'VIBRATION_ON' | 'VIBRATION_OFF' | 'TORCH_ON' | 'TORCH_OFF' | 'TORCH_UNSUPPORTED'
+  | 'RATE_SLOW' | 'RATE_NORMAL' | 'RATE_FAST' | 'VERBOSITY_BRIEF' | 'VERBOSITY_DETAILED';
+export type SpeechIntent =
+  | { kind: 'WELCOME' } | { kind: 'PERMISSION_PRIMER' } | { kind: 'CAMERA_READY' }
+  | { kind: 'GUIDANCE'; code: GuidanceCode }
+  | { kind: 'RESULT'; result: RecognitionResult }
+  | { kind: 'REPLAY'; result: RecognitionResult } | { kind: 'REPLAY_EMPTY' }
+  | { kind: 'ERROR'; code: AppErrorCode }
+  | { kind: 'SETTING_ACK'; what: SettingAck };
+export type SystemEvent =
+  | 'APP_STARTED' | 'GESTURE_UNLOCKED' | 'PERMISSION_REQUESTED' | 'MODEL_READY' | 'CAMERA_READY'
+  | 'RESULT_SPEECH_ENDED' | 'APP_BACKGROUNDED' | 'APP_FOREGROUNDED';
+export type DecisionInput =
+  | { type: 'SYSTEM'; event: SystemEvent; now: number }
+  | { type: 'FAILURE'; code: AppErrorCode; now: number }
+  | { type: 'ANALYSIS'; analysis: FrameAnalysis; now: number }
+  | { type: 'USER_REPLAY'; now: number };
+export interface DecisionOutput {
+  state: AppState;
+  status: DecisionStatus | null;
+  reasons: string[];                  // mã lý do để debug
+  speech: SpeechIntent | null;        // tối đa 1 ý định nói mỗi lần
+  result: RecognitionResult | null;   // khác null đúng 1 lần khi công bố kết quả mới
+  shouldCalculateTotal: boolean;      // true chỉ khi đủ điều kiện công bố
+}
+⋮----
+reasons: string[];                  // mã lý do để debug
+speech: SpeechIntent | null;        // tối đa 1 ý định nói mỗi lần
+result: RecognitionResult | null;   // khác null đúng 1 lần khi công bố kết quả mới
+shouldCalculateTotal: boolean;      // true chỉ khi đủ điều kiện công bố
+⋮----
+export interface IDecisionEngine {
+  readonly state: AppState;
+  readonly lastResult: RecognitionResult | null;
+  handle(input: DecisionInput): DecisionOutput;
+  reset(): void;
+}
+⋮----
+handle(input: DecisionInput): DecisionOutput;
+reset(): void;
+⋮----
+/* ───── Giọng nói, rung, cài đặt ───── */
+export interface TtsCapabilities {
+  available: boolean; vietnameseVoice: boolean; offlineVietnamese: boolean;
+  requiresUserGesture: boolean;   // true: phải có một lần chạm trước khi phát được tiếng (Web Speech, mp3 trong trình duyệt)
+  voiceName?: string;
+}
+⋮----
+requiresUserGesture: boolean;   // true: phải có một lần chạm trước khi phát được tiếng (Web Speech, mp3 trong trình duyệt)
+⋮----
+export interface TtsHooks { onStart(): void; onEnd(): void; onError(e: unknown): void }
+export interface ITtsEngine {
+  readonly name: 'native-tts' | 'web-speech' | 'audio-clip' | 'aria-live';
+  init(): Promise<TtsCapabilities>;
+  unlock(): void;
+  speak(text: string, opts: { rate: number; lang: string; audioKey?: string }, hooks: TtsHooks): void;
+  cancel(): void;
+}
+⋮----
+init(): Promise<TtsCapabilities>;
+unlock(): void;
+speak(text: string, opts:
+cancel(): void;
+⋮----
+export interface UtteranceEvent { phase: 'start' | 'end'; kind: SpeechIntent['kind'] }
+export interface ISpeech {
+  readonly isSpeaking: boolean;
+  init(): Promise<TtsCapabilities>;        // trả năng lực của engine ĐÃ CHỌN
+  unlock(): void;                          // gọi trong thao tác chạm đầu tiên (nếu requiresUserGesture)
+  say(intent: SpeechIntent): void;
+  replayLast(): void;                      // đọc lại kết quả gần nhất, hoặc REPLAY_EMPTY
+  cancelAll(): void;
+  onUtterance(handler: (e: UtteranceEvent) => void): () => void;
+}
+⋮----
+init(): Promise<TtsCapabilities>;        // trả năng lực của engine ĐÃ CHỌN
+unlock(): void;                          // gọi trong thao tác chạm đầu tiên (nếu requiresUserGesture)
+say(intent: SpeechIntent): void;
+replayLast(): void;                      // đọc lại kết quả gần nhất, hoặc REPLAY_EMPTY
+cancelAll(): void;
+onUtterance(handler: (e: UtteranceEvent)
+⋮----
+export type HapticEvent = 'START' | 'SUCCESS' | 'UNCERTAIN' | 'ERROR';
+export interface IHaptics { readonly supported: boolean; play(e: HapticEvent): void }
+⋮----
+export interface Settings {
+  schemaVersion: 1;
+  voiceEnabled: boolean; voiceLanguage: 'vi-VN';
+  speechRate: number;                      // 0.8 chậm · 1.0 thường · 1.2 nhanh
+  verbosity: 'BRIEF' | 'DETAILED';
+  speechOutput: 'APP_TTS' | 'SCREEN_READER';
+  vibrationEnabled: boolean; torchEnabled: boolean;
+  fontScale: number;                       // 1..2
+  highContrast: boolean; autoStartCamera: boolean;
+  modelVersion: string;
+}
+⋮----
+speechRate: number;                      // 0.8 chậm · 1.0 thường · 1.2 nhanh
+⋮----
+fontScale: number;                       // 1..2
+⋮----
+export interface ISettingsStore {
+  load(): Promise<Settings>;
+  save(patch: Partial<Settings>): Promise<Settings>;
+  reset(): Promise<Settings>;
+}
+⋮----
+load(): Promise<Settings>;
+save(patch: Partial<Settings>): Promise<Settings>;
+reset(): Promise<Settings>;
+⋮----
+/* ───── Cấu hình (giá trị mặc định ở src/config/app-config.ts) ───── */
+export interface AppConfig {
+  inference: {
+    confLow: number; confSure: number; nmsIou: number; agnosticNms: boolean;
+    maxDetections: number; targetFps: number; preferWebGpu: boolean; verifyChecksum: boolean;
+  };
+  analyzer: {
+    grayThumbWidth: number; overlapRatio: number; conflictIou: number;
+    minAreaRatio: number; edgeMarginRatio: number; blurThreshold: number; lowLightMean: number;
+    stabilizer: { windowSize: number; minAgree: number; matchIou: number; maxAgeMs: number };
+  };
+  decision: {
+    multiNotePolicy: 'SINGLE_ONLY' | 'MULTI';
+    blockOnPartial: boolean; blockOnBlur: boolean; blockOnLowLight: boolean;
+    emptyFramesToReset: number; noMoneyGuidanceDelayMs: number; unstableGuidanceMs: number;
+    guidanceCooldownMs: number; guidancePriority: GuidanceCode[];
+  };
+  speech: { dedupeWindowMs: number; minGapMs: number; guidanceStaleMs: number; maxUtteranceMs: number };
+}
+</file>
+
+<file path="src/utils/event-bus.ts">
+import { createLogger } from './logger';
+⋮----
+type StoredHandler = (payload: unknown) => void;
+interface Entry { readonly handler: StoredHandler }
+⋮----
+export interface EventBus<E extends Record<string, unknown>> {
+  on<K extends keyof E>(k: K, h: (p: E[K]) => void): () => void;
+  off<K extends keyof E>(k: K, h: (p: E[K]) => void): void;
+  emit<K extends keyof E>(k: K, p: E[K]): void;
+}
+⋮----
+on<K extends keyof E>(k: K, h: (p: E[K])
+off<K extends keyof E>(k: K, h: (p: E[K])
+emit<K extends keyof E>(k: K, p: E[K]): void;
+⋮----
+/**
+ * Bus sự kiện nhỏ, có kiểu theo bản đồ sự kiện E.
+ * - on trả về hàm hủy đăng ký.
+ * - Lỗi ném ra trong một handler được ghi log và KHÔNG ảnh hưởng handler khác.
+ * - emit duyệt trên bản chụp danh sách, nên handler tự hủy trong lúc emit không làm mất handler kế tiếp.
+ */
+export function createEventBus<E extends Record<string, unknown>>(): EventBus<E>
+⋮----
+function removeEntry(key: keyof E, entry: Entry): void
+⋮----
+function on<K extends keyof E>(k: K, h: (p: E[K]) => void): () => void
+⋮----
+function off<K extends keyof E>(k: K, h: (p: E[K]) => void): void
+⋮----
+function emit<K extends keyof E>(k: K, p: E[K]): void
+</file>
+
+<file path="src/utils/geometry.ts">
+import type { BBox } from '../contracts';
+import { clamp } from './math';
+⋮----
+/** Diện tích hộp. Hộp suy biến (rộng/cao ≤ 0, đảo ngược, NaN, vô cực) trả 0, không ném lỗi. */
+export function area(b: BBox): number
+⋮----
+/** Diện tích phần giao của hai hộp; rời nhau, chỉ chạm cạnh hoặc suy biến thì 0. */
+export function intersectionArea(a: BBox, b: BBox): number
+⋮----
+/** Intersection over Union, trong [0, 1]; suy biến thì 0. */
+export function iou(a: BBox, b: BBox): number
+⋮----
+/** Diện tích giao chia cho diện tích hộp nhỏ hơn; hộp nhỏ nằm trọn trong hộp lớn thì 1. Suy biến thì 0. */
+export function overlapOverMin(a: BBox, b: BBox): number
+⋮----
+/** Tâm hộp. */
+export function center(b: BBox): { x: number; y: number }
+⋮----
+/** Cắt hộp vào khung [0, w] × [0, h]. Trả hộp mới, không sửa hộp gốc; có thể ra hộp suy biến. */
+export function clampBox(b: BBox, w: number, h: number): BBox
+⋮----
+/** Hộp hợp lệ: mọi toạ độ hữu hạn, x1 < x2 và y1 < y2. */
+export function isValidBox(b: BBox): boolean
+</file>
+
+<file path="src/utils/logger.ts">
+/**
+ * Logger dùng chung. Mức log chỉnh được; bộ đệm vòng giữ 200 dòng gần nhất để xem khi gỡ lỗi.
+ * Mặc định: bản production chỉ ghi warn và error, bản dev ghi từ debug.
+ * Mức log áp dụng cho cả bộ đệm lẫn nơi in ra. Không chạm DOM nên dùng được trong Web Worker.
+ */
+export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
+/** Nơi nhận dòng log đã định dạng. Mặc định là console. */
+export type LogSink = (level: LogLevel, line: string) => void;
+⋮----
+export interface Logger {
+  debug(...a: unknown[]): void;
+  info(...a: unknown[]): void;
+  warn(...a: unknown[]): void;
+  error(...a: unknown[]): void;
+}
+⋮----
+debug(...a: unknown[]): void;
+info(...a: unknown[]): void;
+warn(...a: unknown[]): void;
+error(...a: unknown[]): void;
+⋮----
+function defaultLevel(): LogLevel
+⋮----
+function consoleSink(level: LogLevel, line: string): void
+⋮----
+function formatArg(a: unknown): string
+⋮----
+function write(scope: string, level: LogLevel, args: unknown[]): void
+⋮----
+// Lỗi của nơi nhận log không được làm hỏng luồng chính.
+⋮----
+/** Tạo logger gắn với một phạm vi (tên module). */
+export function createLogger(scope: string): Logger
+⋮----
+/** Các dòng log gần nhất (tối đa 200), cũ trước, mới sau. */
+export function getRecentLogs(): string[]
+⋮----
+/** Đổi mức log tối thiểu được ghi. */
+export function setLogLevel(level: LogLevel): void
+⋮----
+export function getLogLevel(): LogLevel
+⋮----
+/** Thay nơi nhận log (dùng khi test); truyền null để quay về console. */
+export function setLogSink(next: LogSink | null): void
+⋮----
+/** Xóa bộ đệm log. */
+export function clearRecentLogs(): void
+</file>
+
+<file path="src/utils/math.ts">
+/**
+ * Giới hạn v vào đoạn [lo, hi]. Nếu lo > hi thì hai đầu mút được hoán đổi.
+ * v là NaN thì trả về đầu mút dưới.
+ */
+export function clamp(v: number, lo: number, hi: number): number
+⋮----
+/** Trung bình cộng; mảng rỗng trả 0. */
+export function mean(xs: ArrayLike<number>): number
+⋮----
+/** Bộ sinh số giả ngẫu nhiên mulberry32: cùng seed cho cùng dãy, giá trị trong [0, 1). */
+export function mulberry32(seed: number): () => number
+</file>
+
+<file path="src/utils/platform.ts">
+import { Capacitor } from '@capacitor/core';
+import type { Platform } from '../contracts';
+⋮----
+/** true khi đang chạy trong vỏ Capacitor native (APK). Ngoài Capacitor hoặc có lỗi thì false. */
+export function isNative(): boolean
+⋮----
+/** 'android-native' khi chạy trong APK, ngược lại 'web' (trình duyệt khi dev). */
+export function getPlatform(): Platform
+</file>
+
+<file path="src/utils/time.ts">
+/** Đồng hồ trả mili-giây. Được tiêm qua tham số để logic nghiệp vụ test được. */
+export type Clock = () => number;
+⋮----
+/** Đồng hồ thật: performance.now() (cùng hệ quy chiếu với FrameMeta.timestamp). */
+export const systemClock: Clock = () =>
+⋮----
+/** Đồng hồ giả cho test: chỉ chạy khi gọi advance. */
+export function createFakeClock(start = 0): { now: Clock; advance(ms: number): void }
+⋮----
+advance(ms: number): void
+</file>
+
+<file path="tests/fakes/factories.ts">
+import { DENOMINATIONS } from '../../src/contracts';
+import type { Denomination, Detection, FrameAnalysis, FrameMeta, GrayImage, InferenceResult } from '../../src/contracts';
+import { overlapOverMin } from '../../src/utils/geometry';
+⋮----
+/** Siêu dữ liệu khung hình giả: 640×480. */
+export function makeFrameMeta(overrides: Partial<FrameMeta> = {}): FrameMeta
+⋮----
+/** Ảnh xám đồng màu (mặc định 64×48, giá trị 128). */
+export function makeGray(width = 64, height = 48, value = 128): GrayImage
+⋮----
+/**
+ * Detection giả. Mặc định: 20000đ, độ tin cậy 0,9, hộp 300×200 giữa khung 640×480.
+ * classId mặc định = chỉ số của mệnh giá trong DENOMINATIONS (chỉ là quy ước của đồ giả,
+ * code thật phải tra classId qua classes.json).
+ */
+export function makeDetection(overrides: Partial<Detection> = {}): Detection
+⋮----
+/** Kết quả suy luận giả; mặc định không có detection. */
+export function makeInferenceResult(overrides: Partial<InferenceResult> = {}): InferenceResult
+⋮----
+/**
+ * Phân tích khung hình giả. Mặc định là KHUNG KHÔNG CÓ TIỀN (emptyStreak = 1).
+ * `overrides` thay thế nguyên từng trường cấp một (không trộn sâu).
+ */
+export function makeAnalysis(overrides: Partial<FrameAnalysis> = {}): FrameAnalysis
+⋮----
+/** Xếp các tờ tiền từ trái sang phải trong khung 640×480, không chồng nhau, không sát mép. */
+function layoutRow(
+  denominations: readonly Denomination[],
+  confidence: number | readonly number[],
+  frameId = 1,
+): Detection[]
+⋮----
+/** Khung có MỘT tờ chắc chắn (độ tin cậy 0,95), chưa ổn định theo thời gian. */
+export function makeSingleSureAnalysis(
+  denomination: Denomination = 20000,
+  overrides: Partial<FrameAnalysis> = {},
+): FrameAnalysis
+⋮----
+/** Khung có MỘT tờ chưa chắc (mặc định 0,5: nằm giữa confLow và confSure). */
+export function makeUnsureAnalysis(
+  denomination: Denomination = 20000,
+  confidence = 0.5,
+  overrides: Partial<FrameAnalysis> = {},
+): FrameAnalysis
+⋮----
+/** Khung có hai tờ chắc chắn chồng lên nhau (tờ thứ hai đè 40px lên tờ thứ nhất, tỷ lệ chồng 0,25). */
+export function makeOverlapAnalysis(
+  first: Denomination = 20000,
+  second: Denomination = 50000,
+  overrides: Partial<FrameAnalysis> = {},
+): FrameAnalysis
+⋮----
+/**
+ * Khung xung đột: hai detection CÙNG vị trí nhưng KHÁC mệnh giá (cả hai ≥ confSure).
+ * Cờ overlap để không phát hiện: xung đột được ưu tiên hơn chồng lấn.
+ */
+export function makeConflictAnalysis(
+  first: Denomination = 20000,
+  second: Denomination = 50000,
+  overrides: Partial<FrameAnalysis> = {},
+): FrameAnalysis
+⋮----
+/** Khung ổn định: các tờ chắc chắn (0,95), 5/5 khung đồng thuận, consensus = chính các detection. */
+export function makeStableAnalysis(
+  denominations: readonly Denomination[] = [20000],
+  overrides: Partial<FrameAnalysis> = {},
+): FrameAnalysis
+</file>
+
+<file path="tests/fakes/fake-camera.ts">
+import type { AppError, CameraStatus, CapturedFrame, FrameMeta, ICameraService } from '../../src/contracts';
+import { makeFrameMeta } from './factories';
+⋮----
+/**
+ * ImageBitmap giả. close() được gọi nhiều lần vẫn chỉ tính một lần.
+ * `onClose` gọi đúng một lần khi bitmap bị đóng.
+ */
+export function makeFakeBitmap(width: number, height: number, onClose: () => void = () => undefined): ImageBitmap
+⋮----
+close(): void
+⋮----
+export interface FakeCameraOptions {
+  /** Trong môi trường Node không có DOM, video mặc định là một đối tượng rỗng đóng vai giữ chỗ. */
+  video?: HTMLVideoElement;
+  torchSupported?: boolean;
+  /** Nếu đặt, start() chuyển sang ERROR và ném lỗi này. */
+  startError?: AppError;
+  width?: number;
+  height?: number;
+}
+⋮----
+/** Trong môi trường Node không có DOM, video mặc định là một đối tượng rỗng đóng vai giữ chỗ. */
+⋮----
+/** Nếu đặt, start() chuyển sang ERROR và ném lỗi này. */
+⋮----
+/** Camera giả: test tự đẩy khung hình bằng emitFrame và đếm bitmap bên nhận đã close. */
+export class FakeCamera implements ICameraService {
+⋮----
+constructor(options: FakeCameraOptions = {})
+⋮----
+get status(): CameraStatus
+⋮----
+get torchSupported(): boolean
+⋮----
+/** Số bitmap đã tạo nhưng bên nhận chưa close. */
+get openBitmaps(): number
+⋮----
+async start(): Promise<void>
+⋮----
+stop(): void
+⋮----
+pause(): void
+⋮----
+async resume(): Promise<void>
+⋮----
+setSampling(fps: number): void
+⋮----
+onFrame(handler: (f: CapturedFrame) => void | Promise<void>): () => void
+⋮----
+onStatus(handler: (s: CameraStatus, error?: AppError) => void): () => void
+⋮----
+async setTorch(on: boolean): Promise<boolean>
+⋮----
+/** Đổi trạng thái và báo cho mọi handler onStatus. */
+setStatus(status: CameraStatus, error?: AppError): void
+⋮----
+/**
+   * Đẩy một khung hình tới mọi handler, chờ từng handler (kể cả async) xong mới trả về,
+   * giống camera thật chờ xử lý xong mới lấy khung kế. Bên nhận chịu trách nhiệm close bitmap.
+   */
+async emitFrame(overrides: Partial<FrameMeta> = {}): Promise<CapturedFrame>
+</file>
+
+<file path="tests/fakes/fake-haptics.ts">
+import type { HapticEvent, IHaptics } from '../../src/contracts';
+⋮----
+/** Bộ rung giả: ghi lại các sự kiện đã phát. */
+export class FakeHaptics implements IHaptics {
+⋮----
+constructor(supported = true)
+⋮----
+play(e: HapticEvent): void
+⋮----
+clear(): void
+</file>
+
+<file path="tests/fakes/fake-inference.ts">
+import { AppError } from '../../src/contracts';
+import type { CapturedFrame, FrameMeta, IInferenceClient, InferenceResult, ModelInfo } from '../../src/contracts';
+import { makeInferenceResult } from './factories';
+⋮----
+/** Một bước trong kịch bản: kết quả, null (khung bị bỏ), lỗi để ném, hoặc hàm tính kết quả theo khung. */
+export type FakeInferenceStep =
+  | InferenceResult
+  | null
+  | AppError
+  | ((frame: CapturedFrame) => InferenceResult | null);
+⋮----
+export interface FakeInferenceOptions {
+  /** Nếu đặt, init() ném lỗi này. */
+  initError?: AppError;
+  info?: Partial<ModelInfo>;
+}
+⋮----
+/** Nếu đặt, init() ném lỗi này. */
+⋮----
+/**
+ * Bộ suy luận giả chạy theo kịch bản (hàng đợi). Hết kịch bản thì trả kết quả rỗng (không có tiền).
+ * Luôn close bitmap của khung (đúng hợp đồng IInferenceClient), kể cả khi ném lỗi.
+ * infer trước init ném INFERENCE_FAILED để lộ lỗi sai thứ tự gọi.
+ */
+export class FakeInference implements IInferenceClient {
+⋮----
+constructor(options: FakeInferenceOptions = {})
+⋮----
+get ready(): boolean
+⋮----
+/** Thêm các bước vào cuối kịch bản. */
+enqueue(...steps: FakeInferenceStep[]): this
+⋮----
+async init(): Promise<ModelInfo>
+⋮----
+async infer(frame: CapturedFrame): Promise<InferenceResult | null>
+⋮----
+dispose(): void
+</file>
+
+<file path="tests/fakes/fake-speech.ts">
+import type {
+  ISpeech,
+  RecognitionResult,
+  SpeechIntent,
+  TtsCapabilities,
+  UtteranceEvent,
+} from '../../src/contracts';
+⋮----
+export interface FakeSpeechOptions {
+  /** true (mặc định): say() phát ngay sự kiện utterance 'start'; 'end' chỉ phát khi gọi finishCurrent(). */
+  autoStart?: boolean;
+  capabilities?: Partial<TtsCapabilities>;
+}
+⋮----
+/** true (mặc định): say() phát ngay sự kiện utterance 'start'; 'end' chỉ phát khi gọi finishCurrent(). */
+⋮----
+/** ISpeech giả: ghi lại mọi SpeechIntent và mô phỏng sự kiện utterance. */
+export class FakeSpeech implements ISpeech {
+⋮----
+constructor(options: FakeSpeechOptions = {})
+⋮----
+get isSpeaking(): boolean
+⋮----
+get lastIntent(): SpeechIntent | undefined
+⋮----
+async init(): Promise<TtsCapabilities>
+⋮----
+unlock(): void
+⋮----
+say(intent: SpeechIntent): void
+⋮----
+/** Giống ISpeech thật: đọc lại kết quả gần nhất, hoặc REPLAY_EMPTY nếu chưa có. */
+replayLast(): void
+⋮----
+cancelAll(): void
+⋮----
+onUtterance(handler: (e: UtteranceEvent) => void): () => void
+⋮----
+/** Kết thúc câu hiện tại (phát sự kiện 'end'). Trả false nếu không có câu nào. */
+finishCurrent(): boolean
+⋮----
+/** Tự phát một sự kiện utterance tới mọi handler. */
+emitUtterance(event: UtteranceEvent): void
+⋮----
+/** Các ý định đã nói thuộc một loại, ví dụ ofKind('GUIDANCE'). */
+ofKind<K extends SpeechIntent['kind']>(kind: K): Array<Extract<SpeechIntent, { kind: K }>>
+</file>
+
+<file path="tests/fakes/fake-tts-engine.ts">
+import type { ITtsEngine, TtsCapabilities, TtsHooks } from '../../src/contracts';
+⋮----
+export interface SpokenUtterance { text: string; rate: number; lang: string; audioKey?: string }
+⋮----
+export interface FakeTtsEngineOptions {
+  name?: ITtsEngine['name'];
+  capabilities?: Partial<TtsCapabilities>;
+  /** Nếu đặt, init() bị từ chối với giá trị này. */
+  initError?: unknown;
+}
+⋮----
+/** Nếu đặt, init() bị từ chối với giá trị này. */
+⋮----
+/**
+ * Engine đọc giả. KHÔNG tự kết thúc: test gọi finishCurrent() để báo onEnd (hoặc failCurrent() để báo onError).
+ * - requiresUserGesture = true: speak bị từ chối (onError, ghi vào `rejected`) cho tới khi unlock() được gọi.
+ * - speak khi đang có câu phát: câu mới thay câu cũ (không báo hook của câu cũ) và tăng `overlappingSpeaks`.
+ * - cancel(): bỏ câu hiện tại, KHÔNG gọi onEnd.
+ */
+export class FakeTtsEngine implements ITtsEngine {
+⋮----
+constructor(options: FakeTtsEngineOptions = {})
+⋮----
+get isSpeaking(): boolean
+⋮----
+get texts(): string[]
+⋮----
+async init(): Promise<TtsCapabilities>
+⋮----
+unlock(): void
+⋮----
+speak(text: string, opts: { rate: number; lang: string; audioKey?: string }, hooks: TtsHooks): void
+⋮----
+cancel(): void
+⋮----
+/** Kết thúc câu hiện tại (gọi onEnd). Trả false nếu không có câu nào đang phát. */
+finishCurrent(): boolean
+⋮----
+/** Làm câu hiện tại thất bại (gọi onError). Trả false nếu không có câu nào đang phát. */
+failCurrent(error: unknown = new Error('FakeTtsEngine: lỗi phát giả lập')): boolean
+</file>
+
+<file path="tests/fakes/fakes.test.ts">
+import { describe, expect, it, vi } from 'vitest';
+import { DEFAULT_CONFIG, DEFAULT_SETTINGS } from '../../src/config/app-config';
+import { AppError } from '../../src/contracts';
+import type { CameraStatus, FrameAnalysis, UtteranceEvent } from '../../src/contracts';
+import { center } from '../../src/utils/geometry';
+import {
+  FakeCamera,
+  FakeHaptics,
+  FakeInference,
+  FakeSpeech,
+  FakeTtsEngine,
+  MemorySettingsStore,
+  makeAnalysis,
+  makeConflictAnalysis,
+  makeDetection,
+  makeInferenceResult,
+  makeOverlapAnalysis,
+  makeSingleSureAnalysis,
+  makeStableAnalysis,
+  makeUnsureAnalysis,
+} from './index';
+⋮----
+function makeHooks()
+</file>
+
+<file path="tests/fakes/index.ts">
+
+</file>
+
+<file path="tests/fakes/memory-settings-store.ts">
+import { DEFAULT_SETTINGS } from '../../src/config/app-config';
+import type { AppError, ISettingsStore, Settings } from '../../src/contracts';
+⋮----
+/**
+ * Kho cài đặt trong bộ nhớ. Luôn trả bản sao.
+ * Đặt `failWith` (ví dụ AppError STORAGE_FAILED) để cả load, save và reset ném lỗi đó.
+ */
+export class MemorySettingsStore implements ISettingsStore {
+⋮----
+constructor(initial: Partial<Settings> = {})
+⋮----
+/** Bản sao trạng thái hiện tại, không tính là một lần load. */
+get snapshot(): Settings
+⋮----
+async load(): Promise<Settings>
+⋮----
+async save(patch: Partial<Settings>): Promise<Settings>
+⋮----
+async reset(): Promise<Settings>
+</file>
+
+</files>

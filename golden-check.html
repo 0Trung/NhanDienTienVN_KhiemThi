@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Kiểm tra vàng (dev)</title>
+    <style>
+      body { font: 15px/1.4 system-ui, sans-serif; margin: 12px; background: #111; color: #eee; }
+      table { border-collapse: collapse; width: 100%; margin: 8px 0; }
+      th, td { border: 1px solid #555; padding: 4px 6px; text-align: left; }
+      .pass { color: #7f7; }
+      .fail { color: #f77; }
+    </style>
+  </head>
+  <body>
+    <!-- Chỉ dành cho dev. Nằm ở gốc dự án nhưng KHÔNG có trong build.rollupOptions.input nên vite build không đưa vào dist/APK. -->
+    <main id="out"></main>
+    <script type="module" src="/src/dev/golden-check.ts"></script>
+  </body>
+</html>

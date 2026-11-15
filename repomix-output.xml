@@ -124,8 +124,11 @@ src/
   voice/
     audio-clip-engine.ts
     haptic-service.ts
+    haptics-adapter.ts
     native-tts-engine.ts
+    prompt-manager.ts
     speech-manager.ts
+    vietnamese-number.ts
     web-speech-engine.ts
   main.ts
 tests/
@@ -179,6 +182,11 @@ tests/
     post-processor.test.ts
     tensor.test.ts
     worker-core.test.ts
+  voice/
+    haptic-service.test.ts
+    haptics-adapter.test.ts
+    prompt-manager.test.ts
+    vietnamese-number.test.ts
 .gitignore
 capacitor.config.ts
 ctx.xml
@@ -195,647 +203,1048 @@ vite.config.ts
 <files>
 This section contains the contents of the repository's files.
 
-<file path="src/decision/state-manager.ts">
-import type { AppState, SystemEvent } from '../contracts';
+<file path="src/voice/haptics-adapter.ts">
+// FILE ADAPTER DUY NHẤT gọi plugin @capacitor/haptics. Mọi nơi khác đi qua HapticPort.
+import { Haptics } from '@capacitor/haptics';
+import { createLogger } from '../utils/logger';
+import type { HapticPort } from './haptic-service';
 
-/** Nguyên nhân chuyển trạng thái đến từ kết quả phân tích khung hình (nhánh ANALYSIS dùng ở lượt 2). */
-export type AnalysisTrigger =
-  | 'NO_MONEY_SEEN'      // khung không có tiền → NO_CANDIDATE
-  | 'UNCERTAIN_SEEN'     // chưa chắc, xung đột hoặc bị chặn → UNCERTAIN
-  | 'OVERLAP_SEEN'       // chồng lấn → OVERLAPPING
-  | 'UNSTABLE_SEEN'      // chắc nhưng chưa ổn định → STABILIZING
-  | 'STEADY_SEEN'        // ổn định, đã công bố, không có gì mới → DETECTING
-  | 'RESULT_PUBLISHED';  // công bố kết quả mới → SPEAKING
+const log = createLogger('haptics-adapter');
 
-/** Mọi nguyên nhân có thể làm đổi trạng thái. */
-export type StateTrigger = SystemEvent | 'FAILURE' | AnalysisTrigger;
-
-/** Giai đoạn: khởi động, đang quét, đang đọc kết quả, lỗi. */
-export type Phase = 'STARTUP' | 'SCANNING' | 'SPEAKING' | 'ERROR';
-
-/** Ảnh chụp bất biến của máy. Hai cờ model/camera được ghi ở mọi trạng thái khởi động để không mất sự kiện đến sớm. */
-export interface MachineSnapshot {
-  readonly state: AppState;
-  readonly modelReady: boolean;
-  readonly cameraReady: boolean;
-  readonly backgrounded: boolean;
+/** Phần của plugin mà adapter dùng; tách ra để test bằng đồ giả mà không cần plugin thật. */
+export interface HapticsPluginLike {
+  vibrate(options: { duration: number }): Promise<void>;
 }
 
-export interface TransitionResult {
-  /** false = chuyển trái phép, bị bỏ qua. */
-  readonly accepted: boolean;
-  readonly from: AppState;
-  /** Bằng `from` khi bị bỏ qua hoặc không đổi. */
-  readonly to: AppState;
-  /** Ảnh chụp SAU khi áp dụng (chính ảnh đầu vào khi bị bỏ qua). */
-  readonly snapshot: MachineSnapshot;
-  /** [] khi hợp lệ; ['ILLEGAL_TRANSITION', 'NGUYÊN_NHÂN@TRẠNG_THÁI'] khi bị bỏ qua. */
-  readonly reasons: readonly string[];
-}
-
-export const INITIAL_SNAPSHOT: MachineSnapshot = Object.freeze({
-  state: 'INITIALIZING',
-  modelReady: false,
-  cameraReady: false,
-  backgrounded: false,
-});
-
-type Row = Readonly<Partial<Record<StateTrigger, AppState>>>;
-
-/** Hàng chung của mọi trạng thái đang quét; trở lại từ nền thì về DETECTING. */
-function scanningRow(self: AppState): Row {
+/**
+ * Cổng rung dựa trên @capacitor/haptics. Mỗi lần gọi rung MỘT khoảng liên tục durationMs.
+ * Không bao giờ ném lỗi: plugin lỗi (đồng bộ hay bất đồng bộ) thì ghi log và trả false.
+ */
+export function createCapacitorHapticPort(plugin: HapticsPluginLike = Haptics): HapticPort {
   return {
-    NO_MONEY_SEEN: 'NO_CANDIDATE', UNCERTAIN_SEEN: 'UNCERTAIN', OVERLAP_SEEN: 'OVERLAPPING',
-    UNSTABLE_SEEN: 'STABILIZING', STEADY_SEEN: 'DETECTING', RESULT_PUBLISHED: 'SPEAKING',
-    MODEL_READY: self, CAMERA_READY: self, APP_BACKGROUNDED: self, APP_FOREGROUNDED: 'DETECTING', FAILURE: 'ERROR',
+    async vibrate(durationMs: number): Promise<boolean> {
+      try {
+        await plugin.vibrate({ duration: durationMs });
+        return true;
+      } catch (e) {
+        log.warn('Haptics.vibrate lỗi', e);
+        return false;
+      }
+    },
+  };
+}
+</file>
+
+<file path="src/voice/prompt-manager.ts">
+import { isDenomination } from '../config/denominations';
+import type {
+  AppErrorCode,
+  Denomination,
+  GuidanceCode,
+  RecognitionResult,
+  SettingAck,
+  Settings,
+  SpeechIntent,
+} from '../contracts';
+import { denominationToSpeech, moneyToSpeech, numberToVietnameseWords } from './vietnamese-number';
+
+/** Mức ưu tiên của câu nói. Số lớn hơn thì được nói trước và được phép ngắt số nhỏ hơn. */
+export const SPEECH_PRIORITY = { ERROR: 3, RESULT: 2, REPLAY: 2, GUIDANCE: 1, OTHER: 0 } as const;
+export type SpeechPriority = 0 | 1 | 2 | 3;
+
+/** Khóa các file âm thanh ghi sẵn trong public/audio (mỗi khóa ứng với đúng một câu cố định). */
+export const AUDIO_KEYS = [
+  'welcome',
+  'permission-primer',
+  'camera-ready',
+  'no-money',
+  'low-light',
+  'blur',
+  'camera-error',
+  'model-error',
+  'no-vi-voice',
+] as const;
+export type AudioKey = (typeof AUDIO_KEYS)[number];
+
+export interface Prompt {
+  /** Câu sẽ đọc: tiếng Việt, viết hoa chữ đầu, số đã đọc thành chữ, mỗi câu kết thúc bằng dấu câu. */
+  text: string;
+  /** Khóa file mp3 ghi sẵn; chỉ có ở câu cố định có thu âm. */
+  audioKey?: AudioKey;
+  priority: SpeechPriority;
+  /** Mục mới có cùng supersedeKey sẽ thay mục đang chờ trong hàng đợi. */
+  supersedeKey: string;
+}
+
+/* ───── Câu cố định (khớp từng chữ với đặc tả) ───── */
+
+const WELCOME_TEXT = 'Xin chào! Hãy đưa tiền đến trước camera.';
+const PERMISSION_PRIMER_TEXT =
+  'Ứng dụng cần dùng camera để nhận dạng tiền. Hãy chọn Cho phép trên hộp thoại sắp hiện ra.';
+const CAMERA_READY_TEXT = 'Camera đã sẵn sàng, hãy đưa tiền vào trước camera.';
+const REPLAY_EMPTY_TEXT = 'Hiện tại tôi chưa nhận dạng được tờ tiền nào.';
+const TOTAL_CAVEAT_TEXT = 'Tổng này chỉ tính các tờ tôi nhìn thấy.';
+
+const GUIDANCE_TEXT: Readonly<Record<GuidanceCode, string>> = {
+  NO_MONEY: 'Chưa nhận diện được tiền. Hãy đưa tiền đến trước camera.',
+  TOO_FAR: 'Hãy đưa tiền lại gần camera hơn.',
+  PARTIAL_IN_FRAME: 'Hãy đưa toàn bộ tờ tiền vào khung hình.',
+  BLUR: 'Hình ảnh chưa rõ. Hãy giữ điện thoại yên.',
+  LOW_LIGHT: 'Ánh sáng yếu. Hãy bật đèn hỗ trợ hoặc chuyển đến nơi sáng hơn.',
+  // Đây là LỜI HƯỚNG DẪN, KHÔNG khẳng định tiền đang bị gấp.
+  LOW_CONFIDENCE: 'Tôi chưa nhận dạng rõ tờ tiền. Hãy duỗi phẳng tờ tiền và đưa gần camera hơn.',
+  CLASS_CONFLICT: 'Tôi chưa phân biệt được mệnh giá. Hãy giữ tờ tiền thẳng và rõ hơn.',
+  OVERLAP: 'Các tờ tiền có vẻ đang chồng lên nhau. Hãy tách chúng ra.',
+  HOLD_STEADY: 'Hãy giữ tiền yên trước camera.',
+  MULTI_NOT_ALLOWED: 'Hãy đưa từng tờ một.',
+};
+
+const GUIDANCE_AUDIO: Readonly<Partial<Record<GuidanceCode, AudioKey>>> = {
+  NO_MONEY: 'no-money',
+  LOW_LIGHT: 'low-light',
+  BLUR: 'blur',
+};
+
+const MISSING_MODEL_TEXT = 'Ứng dụng thiếu dữ liệu nhận dạng. Hãy cài lại ứng dụng.';
+
+/** Mỗi mã lỗi một câu nêu việc cần làm. */
+const ERROR_TEXT: Readonly<Record<AppErrorCode, string>> = {
+  UNSUPPORTED_BROWSER:
+    'Điện thoại chưa hỗ trợ đủ tính năng cần thiết. Hãy cập nhật WebView trong cửa hàng ứng dụng rồi mở lại ứng dụng.',
+  CAMERA_PERMISSION_DENIED:
+    'Bạn chưa cấp quyền camera. Hãy mở Cài đặt của điện thoại, chọn Ứng dụng, chọn ứng dụng này rồi bật quyền Camera.',
+  CAMERA_NOT_FOUND: 'Không tìm thấy camera trên điện thoại. Hãy thử lại trên một điện thoại có camera sau.',
+  CAMERA_IN_USE: 'Camera đang được ứng dụng khác sử dụng. Hãy đóng ứng dụng đó rồi mở lại ứng dụng này.',
+  CAMERA_FAILED: 'Không mở được camera. Hãy đóng ứng dụng rồi mở lại.',
+  MODEL_MISSING: MISSING_MODEL_TEXT,
+  MODEL_CORRUPT: 'Dữ liệu nhận dạng bị hỏng. Hãy cài lại ứng dụng.',
+  MODEL_INIT_FAILED: 'Không khởi động được bộ nhận dạng. Hãy đóng ứng dụng rồi mở lại.',
+  INFERENCE_FAILED: 'Nhận dạng gặp lỗi. Hãy thử lại, nếu vẫn lỗi thì đóng ứng dụng rồi mở lại.',
+  TTS_UNAVAILABLE:
+    'Giọng đọc của điện thoại đang không hoạt động. Hãy kiểm tra mục Chuyển văn bản thành giọng nói trong Cài đặt rồi mở lại ứng dụng.',
+  TTS_NO_VIETNAMESE_VOICE:
+    'Điện thoại chưa có giọng đọc tiếng Việt. Hãy vào Cài đặt, Chuyển văn bản thành giọng nói, rồi tải dữ liệu giọng Tiếng Việt.',
+  STORAGE_FAILED: 'Không lưu được cài đặt. Hãy kiểm tra bộ nhớ điện thoại còn trống rồi thử lại.',
+  OFFLINE_NOT_READY: MISSING_MODEL_TEXT,
+};
+
+/** Chỉ ba câu lỗi có thu âm sẵn (nội dung mp3 phải khớp câu tương ứng ở trên). */
+const ERROR_AUDIO: Readonly<Partial<Record<AppErrorCode, AudioKey>>> = {
+  CAMERA_PERMISSION_DENIED: 'camera-error',
+  MODEL_MISSING: 'model-error',
+  OFFLINE_NOT_READY: 'model-error',
+  TTS_NO_VIETNAMESE_VOICE: 'no-vi-voice',
+};
+
+const SETTING_ACK_TEXT: Readonly<Record<SettingAck, string>> = {
+  VOICE_ON: 'Đã bật giọng nói.',
+  VIBRATION_ON: 'Đã bật rung.',
+  VIBRATION_OFF: 'Đã tắt rung.',
+  TORCH_ON: 'Đã bật đèn hỗ trợ.',
+  TORCH_OFF: 'Đã tắt đèn hỗ trợ.',
+  TORCH_UNSUPPORTED: 'Điện thoại này không bật được đèn hỗ trợ.',
+  RATE_SLOW: 'Đã đặt tốc độ đọc chậm.',
+  RATE_NORMAL: 'Đã đặt tốc độ đọc bình thường.',
+  RATE_FAST: 'Đã đặt tốc độ đọc nhanh.',
+  VERBOSITY_BRIEF: 'Đã chọn chế độ đọc ngắn gọn.',
+  VERBOSITY_DETAILED: 'Đã chọn chế độ đọc chi tiết.',
+};
+
+/** Các xác nhận cùng một cài đặt dùng chung khóa thay thế: xác nhận mới thay xác nhận cũ đang chờ. */
+const SETTING_ACK_FAMILY: Readonly<Record<SettingAck, string>> = {
+  VOICE_ON: 'VOICE',
+  VIBRATION_ON: 'VIBRATION',
+  VIBRATION_OFF: 'VIBRATION',
+  TORCH_ON: 'TORCH',
+  TORCH_OFF: 'TORCH',
+  TORCH_UNSUPPORTED: 'TORCH',
+  RATE_SLOW: 'RATE',
+  RATE_NORMAL: 'RATE',
+  RATE_FAST: 'RATE',
+  VERBOSITY_BRIEF: 'VERBOSITY',
+  VERBOSITY_DETAILED: 'VERBOSITY',
+};
+
+/* ───── Hàm phụ ───── */
+
+/** Tra bảng câu; thiếu thì ném lỗi để KHÔNG BAO GIỜ đọc ra chữ "undefined". */
+function lookup<K extends string>(table: Readonly<Record<K, string>>, key: K, what: string): string {
+  const text = table[key];
+  if (typeof text !== 'string' || text === '') {
+    throw new RangeError(`buildPrompt: ${what} không được hỗ trợ: ${String(key)}`);
+  }
+  return text;
+}
+
+function capitalize(text: string): string {
+  return text === '' ? text : `${text.charAt(0).toUpperCase()}${text.slice(1)}`;
+}
+
+/** Câu một mệnh đề: viết hoa chữ đầu và thêm dấu chấm cuối. */
+function sentence(text: string): string {
+  return `${capitalize(text)}.`;
+}
+
+function makePrompt(text: string, priority: SpeechPriority, supersedeKey: string, audioKey?: AudioKey): Prompt {
+  return audioKey === undefined ? { text, priority, supersedeKey } : { text, audioKey, priority, supersedeKey };
+}
+
+/**
+ * Kiểm tra kết quả nhất quán trước khi đọc: có tờ tiền, count khớp số mệnh giá, total khớp tổng các mệnh giá,
+ * mọi mệnh giá hợp lệ. Sai một chỗ là ném RangeError (Fail Safe: thà không đọc còn hơn đọc sai số tiền).
+ */
+function assertConsistent(result: RecognitionResult): void {
+  const { denominations } = result;
+  if (denominations.length === 0) throw new RangeError('buildPrompt: kết quả không có tờ tiền nào');
+  let sum = 0;
+  for (const d of denominations) {
+    if (!isDenomination(d)) throw new RangeError(`buildPrompt: mệnh giá không hợp lệ: ${String(d)}`);
+    sum += d;
+  }
+  if (result.count !== denominations.length) {
+    throw new RangeError(`buildPrompt: count (${String(result.count)}) khác số mệnh giá (${denominations.length})`);
+  }
+  if (result.total !== sum) {
+    throw new RangeError(`buildPrompt: total (${String(result.total)}) khác tổng các mệnh giá (${sum})`);
+  }
+}
+
+interface DenominationGroup {
+  denomination: Denomination;
+  count: number;
+}
+
+/** Nhóm các tờ cùng mệnh giá, theo thứ tự xuất hiện đầu tiên từ trái sang phải. */
+function groupByDenomination(denominations: readonly Denomination[]): DenominationGroup[] {
+  const groups: DenominationGroup[] = [];
+  for (const d of denominations) {
+    const existing = groups.find((g) => g.denomination === d);
+    if (existing === undefined) groups.push({ denomination: d, count: 1 });
+    else existing.count += 1;
+  }
+  return groups;
+}
+
+/** Dựng câu đọc kết quả theo độ chi tiết. Dùng chung cho RESULT và REPLAY. */
+function buildResultText(result: RecognitionResult, verbosity: Settings['verbosity']): string {
+  assertConsistent(result);
+  const [first] = result.denominations;
+
+  if (result.denominations.length === 1 && first !== undefined) {
+    return sentence(denominationToSpeech(first));
+  }
+  if (verbosity === 'BRIEF') {
+    return sentence(moneyToSpeech(result.total));
+  }
+
+  const parts = [sentence(`có ${numberToVietnameseWords(result.denominations.length)} tờ tiền`)];
+  for (const group of groupByDenomination(result.denominations)) {
+    parts.push(sentence(`${numberToVietnameseWords(group.count)} tờ ${denominationToSpeech(group.denomination)}`));
+  }
+  parts.push(sentence(`tổng cộng ${moneyToSpeech(result.total)}`), TOTAL_CAVEAT_TEXT);
+  return parts.join(' ');
+}
+
+/**
+ * Dựng câu nói cho một ý định nói.
+ * Ném RangeError khi dữ liệu không đủ tin cậy để đọc (kết quả không nhất quán, mã không có câu);
+ * nơi gọi phải bắt lỗi và KHÔNG đọc gì thay vì đoán.
+ */
+export function buildPrompt(intent: SpeechIntent, settings: Pick<Settings, 'verbosity'>): Prompt {
+  switch (intent.kind) {
+    case 'WELCOME':
+      return makePrompt(WELCOME_TEXT, SPEECH_PRIORITY.OTHER, 'WELCOME', 'welcome');
+    case 'PERMISSION_PRIMER':
+      return makePrompt(PERMISSION_PRIMER_TEXT, SPEECH_PRIORITY.OTHER, 'PERMISSION_PRIMER', 'permission-primer');
+    case 'CAMERA_READY':
+      return makePrompt(CAMERA_READY_TEXT, SPEECH_PRIORITY.OTHER, 'CAMERA_READY', 'camera-ready');
+    case 'GUIDANCE':
+      return makePrompt(
+        lookup(GUIDANCE_TEXT, intent.code, 'mã hướng dẫn'),
+        SPEECH_PRIORITY.GUIDANCE,
+        'GUIDANCE',
+        GUIDANCE_AUDIO[intent.code],
+      );
+    case 'RESULT':
+      return makePrompt(buildResultText(intent.result, settings.verbosity), SPEECH_PRIORITY.RESULT, 'RESULT');
+    case 'REPLAY':
+      return makePrompt(buildResultText(intent.result, settings.verbosity), SPEECH_PRIORITY.REPLAY, 'REPLAY');
+    case 'REPLAY_EMPTY':
+      return makePrompt(REPLAY_EMPTY_TEXT, SPEECH_PRIORITY.OTHER, 'REPLAY');
+    case 'ERROR':
+      return makePrompt(
+        lookup(ERROR_TEXT, intent.code, 'mã lỗi'),
+        SPEECH_PRIORITY.ERROR,
+        `ERROR:${intent.code}`,
+        ERROR_AUDIO[intent.code],
+      );
+    case 'SETTING_ACK':
+      return makePrompt(
+        lookup(SETTING_ACK_TEXT, intent.what, 'xác nhận cài đặt'),
+        SPEECH_PRIORITY.OTHER,
+        `SETTING_ACK:${lookup(SETTING_ACK_FAMILY, intent.what, 'xác nhận cài đặt')}`,
+      );
+    default: {
+      const unsupported: never = intent;
+      throw new RangeError(`buildPrompt: ý định không được hỗ trợ: ${JSON.stringify(unsupported)}`);
+    }
+  }
+}
+</file>
+
+<file path="src/voice/vietnamese-number.ts">
+import type { Denomination } from '../contracts';
+
+/** Số lớn nhất đọc được: 999.999.999.999 (chín trăm chín mươi chín tỷ ...). */
+export const MAX_SPEAKABLE_NUMBER = 999_999_999_999;
+
+const DIGIT_WORDS: readonly string[] = ['không', 'một', 'hai', 'ba', 'bốn', 'năm', 'sáu', 'bảy', 'tám', 'chín'];
+
+/** Tên từng nhóm ba chữ số, từ thấp lên cao: (đơn vị), nghìn, triệu, tỷ. Dùng "nghìn", không dùng "ngàn". */
+const GROUP_WORDS: readonly string[] = ['', 'nghìn', 'triệu', 'tỷ'];
+
+function digitWord(d: number): string {
+  const word = DIGIT_WORDS[d];
+  if (word === undefined) throw new RangeError(`Chữ số không hợp lệ: ${String(d)}`);
+  return word;
+}
+
+/** Hàng đơn vị đứng sau hàng chục từ "mười" trở lên: lăm (từ 15), mốt và tư (từ 21, 24). */
+function unitsAfterTens(tens: number, units: number): string {
+  if (units === 5) return 'lăm';
+  if (tens >= 2 && units === 1) return 'mốt';
+  if (tens >= 2 && units === 4) return 'tư';
+  return digitWord(units);
+}
+
+/**
+ * Đọc một nhóm ba chữ số (1..999).
+ * hasHigherGroup = true khi đã đọc một nhóm lớn hơn: lúc đó hàng trăm bằng 0 vẫn đọc "không trăm".
+ * Có hàng trăm (hoặc "không trăm") mà hàng chục bằng 0, hàng đơn vị khác 0 thì đọc "linh".
+ */
+function readGroup(value: number, hasHigherGroup: boolean): string {
+  if (value === 0) return '';
+  const hundreds = Math.floor(value / 100);
+  const tens = Math.floor((value % 100) / 10);
+  const units = value % 10;
+  const sayHundreds = hundreds > 0 || hasHigherGroup;
+  const words: string[] = [];
+
+  if (sayHundreds) words.push(digitWord(hundreds), 'trăm');
+  if (tens === 0) {
+    if (units > 0) {
+      if (sayHundreds) words.push('linh');
+      words.push(digitWord(units));
+    }
+  } else if (tens === 1) {
+    words.push('mười');
+    if (units > 0) words.push(unitsAfterTens(tens, units));
+  } else {
+    words.push(digitWord(tens), 'mươi');
+    if (units > 0) words.push(unitsAfterTens(tens, units));
+  }
+  return words.join(' ');
+}
+
+/**
+ * Đọc số nguyên 0..999.999.999.999 thành chữ tiếng Việt, ví dụ 105000 → "một trăm linh năm nghìn".
+ * Số âm, số thập phân, NaN, vô cực hoặc vượt giới hạn thì ném RangeError:
+ * thà không đọc còn hơn đọc sai số tiền.
+ */
+export function numberToVietnameseWords(n: number): string {
+  if (!Number.isSafeInteger(n) || n < 0 || n > MAX_SPEAKABLE_NUMBER) {
+    throw new RangeError(
+      `numberToVietnameseWords: cần số nguyên từ 0 đến ${MAX_SPEAKABLE_NUMBER}, nhận được ${String(n)}`,
+    );
+  }
+  if (n === 0) return digitWord(0);
+
+  // groups[0] là nhóm đơn vị, groups[1] là nghìn, groups[2] là triệu, groups[3] là tỷ.
+  const groups: number[] = [];
+  for (let rest = n; rest > 0; rest = Math.floor(rest / 1000)) groups.push(rest % 1000);
+
+  const words: string[] = [];
+  let spokeHigherGroup = false;
+  for (let g = groups.length - 1; g >= 0; g -= 1) {
+    const value = groups[g];
+    if (value === undefined || value === 0) continue;
+    words.push(readGroup(value, spokeHigherGroup));
+    const unit = GROUP_WORDS[g];
+    if (unit !== undefined && unit !== '') words.push(unit);
+    spokeHigherGroup = true;
+  }
+  return words.join(' ');
+}
+
+/** Đọc số tiền: thêm chữ "đồng" ở cuối, ví dụ 170000 → "một trăm bảy mươi nghìn đồng". */
+export function moneyToSpeech(n: number): string {
+  return `${numberToVietnameseWords(n)} đồng`;
+}
+
+/** Đọc một mệnh giá, ví dụ 50000 → "năm mươi nghìn đồng". */
+export function denominationToSpeech(d: Denomination): string {
+  return moneyToSpeech(d);
+}
+</file>
+
+<file path="tests/voice/haptic-service.test.ts">
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import type { HapticEvent, IHaptics } from '../../src/contracts';
+import { clearRecentLogs, setLogSink } from '../../src/utils/logger';
+import { createHaptics, createHapticService, HAPTIC_PATTERNS } from '../../src/voice/haptic-service';
+import type { HapticPort, HapticTimers, WebVibrate } from '../../src/voice/haptic-service';
+
+/** Hẹn giờ giả: thời gian chỉ trôi khi gọi advance. */
+class FakeTimers implements HapticTimers {
+  now = 0;
+  private nextId = 1;
+  private readonly tasks = new Map<number, { at: number; run: () => void }>();
+
+  get pendingCount(): number {
+    return this.tasks.size;
+  }
+
+  setTimeout(run: () => void, ms: number): unknown {
+    const id = this.nextId++;
+    this.tasks.set(id, { at: this.now + ms, run });
+    return id;
+  }
+
+  clearTimeout(handle: unknown): void {
+    this.tasks.delete(handle as number);
+  }
+
+  advance(ms: number): void {
+    const target = this.now + ms;
+    for (;;) {
+      const due = [...this.tasks].filter(([, t]) => t.at <= target).sort((a, b) => a[1].at - b[1].at)[0];
+      if (due === undefined) break;
+      this.tasks.delete(due[0]);
+      this.now = due[1].at;
+      due[1].run();
+    }
+    this.now = target;
+  }
+}
+
+type PortMode = 'ok' | 'false' | 'reject' | 'throw';
+interface Pulse { atMs: number; durationMs: number }
+
+/** Cổng rung giả: ghi từng nhịp kèm thời điểm; modeOf(i) quyết định nhịp thứ i thành công hay lỗi kiểu nào. */
+class FakePort implements HapticPort {
+  readonly pulses: Pulse[] = [];
+
+  constructor(
+    private readonly clock: () => number,
+    private readonly modeOf: (callIndex: number) => PortMode,
+  ) {}
+
+  vibrate(durationMs: number): Promise<boolean> {
+    const mode = this.modeOf(this.pulses.length);
+    this.pulses.push({ atMs: this.clock(), durationMs });
+    if (mode === 'throw') throw new Error('port ném đồng bộ');
+    if (mode === 'reject') return Promise.reject(new Error('port từ chối'));
+    return Promise.resolve(mode === 'ok');
+  }
+}
+
+interface Env {
+  timers: FakeTimers;
+  port: FakePort | null;
+  web: number[][];
+  service: IHaptics;
+  setEnabled(on: boolean): void;
+}
+
+function setup(o: { port?: boolean | ((i: number) => PortMode); web?: boolean } = {}): Env {
+  const timers = new FakeTimers();
+  const port = o.port ? new FakePort(() => timers.now, typeof o.port === 'function' ? o.port : () => 'ok') : null;
+  const web: number[][] = [];
+  const webVibrate: WebVibrate | null = o.web
+    ? (pattern) => {
+        web.push(pattern);
+        return true;
+      }
+    : null;
+  let enabled = true;
+  const service = createHapticService({ isEnabled: () => enabled, port, webVibrate, timers });
+  return {
+    timers, port, web, service,
+    setEnabled: (on) => {
+      enabled = on;
+    },
   };
 }
 
-/** Hàng của trạng thái khởi động: ghi cờ và nền/trở lại giữ nguyên; `own` thêm hoặc đè các cạnh riêng. */
-function startupRow(self: AppState, own: Row): Row {
-  return { MODEL_READY: self, CAMERA_READY: self, APP_BACKGROUNDED: self, APP_FOREGROUNDED: self, FAILURE: 'ERROR', ...own };
-}
+/** Cho các promise đang chờ chạy xong (kết quả của port được xử lý bất đồng bộ). */
+const settle = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
 
-/**
- * Bảng chuyển: TRANSITIONS[trạng thái hiện tại][nguyên nhân] = trạng thái kế tiếp; ô vắng = trái phép.
- * RESULT_READY là trạng thái dành riêng: engine công bố kết quả đi thẳng sang SPEAKING nên không dừng ở đó.
- * Hai quy tắc phụ nằm trong `transition`.
- */
-export const TRANSITIONS: Readonly<Record<AppState, Row>> = {
-  INITIALIZING: startupRow('INITIALIZING', { APP_STARTED: 'AWAITING_START' }),
-  AWAITING_START: startupRow('AWAITING_START', { GESTURE_UNLOCKED: 'LOADING_MODEL' }),
-  LOADING_MODEL: startupRow('LOADING_MODEL', { PERMISSION_REQUESTED: 'WAITING_PERMISSION' }),
-  WAITING_PERMISSION: startupRow('WAITING_PERMISSION', { CAMERA_READY: 'LOADING_MODEL' }),
-  READY: scanningRow('READY'),
-  NO_CANDIDATE: scanningRow('NO_CANDIDATE'),
-  DETECTING: scanningRow('DETECTING'),
-  UNCERTAIN: scanningRow('UNCERTAIN'),
-  OVERLAPPING: scanningRow('OVERLAPPING'),
-  STABILIZING: scanningRow('STABILIZING'),
-  RESULT_READY: scanningRow('RESULT_READY'),
-  SPEAKING: {
-    RESULT_SPEECH_ENDED: 'DETECTING', MODEL_READY: 'SPEAKING', CAMERA_READY: 'SPEAKING',
-    APP_BACKGROUNDED: 'SPEAKING', APP_FOREGROUNDED: 'DETECTING', FAILURE: 'ERROR',
-  },
-  ERROR: { APP_BACKGROUNDED: 'ERROR', APP_FOREGROUNDED: 'ERROR', FAILURE: 'ERROR' },
-};
+beforeEach(() => setLogSink(() => undefined));
+afterEach(() => {
+  setLogSink(null);
+  clearRecentLogs();
+});
 
-/** Giai đoạn của một trạng thái, suy ra từ bảng: trạng thái nhận kết quả phân tích là đang quét. */
-export function phaseOf(state: AppState): Phase {
-  if (state === 'ERROR' || state === 'SPEAKING') return state;
-  return TRANSITIONS[state].STEADY_SEEN === undefined ? 'STARTUP' : 'SCANNING';
-}
+describe('mẫu rung', () => {
+  it('khớp đặc tả', () => {
+    expect(HAPTIC_PATTERNS).toEqual({ START: [30], SUCCESS: [40, 60, 40], UNCERTAIN: [300], ERROR: [100, 80, 100, 80, 300] });
+  });
+});
 
-/**
- * Áp dụng một nguyên nhân lên ảnh chụp hiện tại (hàm thuần, không sửa đầu vào). Ngoài bảng có hai quy tắc:
- * 1. PERMISSION_REQUESTED bị bỏ qua khi camera đã sẵn sàng (quyền đã xong, không xin lại).
- * 2. Nếu đích là LOADING_MODEL hoặc WAITING_PERMISSION mà đã đủ MODEL_READY và CAMERA_READY thì đích là READY.
- *    Cờ được ghi từ mọi trạng thái khởi động, nhưng READY chỉ đạt được sau GESTURE_UNLOCKED
- *    (chưa có thao tác chạm thì chưa nói được).
- */
-export function transition(current: MachineSnapshot, trigger: StateTrigger): TransitionResult {
-  const target = TRANSITIONS[current.state][trigger];
-  if (target === undefined || (trigger === 'PERMISSION_REQUESTED' && current.cameraReady)) {
-    return {
-      accepted: false,
-      from: current.state,
-      to: current.state,
-      snapshot: current,
-      reasons: ['ILLEGAL_TRANSITION', `${trigger}@${current.state}`],
+describe('native qua port: chuỗi nhịp phát bằng hẹn giờ', () => {
+  it.each<[HapticEvent, Pulse[]]>([
+    ['START', [{ atMs: 0, durationMs: 30 }]],
+    ['SUCCESS', [{ atMs: 0, durationMs: 40 }, { atMs: 100, durationMs: 40 }]],
+    ['UNCERTAIN', [{ atMs: 0, durationMs: 300 }]],
+    ['ERROR', [{ atMs: 0, durationMs: 100 }, { atMs: 180, durationMs: 100 }, { atMs: 360, durationMs: 300 }]],
+  ])('%s', async (event, pulses) => {
+    const env = setup({ port: true, web: true });
+    env.service.play(event);
+    env.timers.advance(1000);
+    await settle();
+    expect(env.port?.pulses).toEqual(pulses);
+    expect(env.web).toEqual([]); // có port thì không dùng navigator.vibrate
+  });
+
+  it('nhịp đầu rung ngay, các nhịp sau chờ hẹn giờ', () => {
+    const env = setup({ port: true });
+    env.service.play('ERROR');
+    expect(env.port?.pulses).toEqual([{ atMs: 0, durationMs: 100 }]);
+    expect(env.timers.pendingCount).toBe(2);
+  });
+});
+
+describe('dự phòng navigator.vibrate khi không có port', () => {
+  it.each(Object.entries(HAPTIC_PATTERNS) as Array<[HapticEvent, number[]]>)('%s: gọi một lần với cả mẫu', (event, pattern) => {
+    const env = setup({ web: true });
+    env.service.play(event);
+    expect(env.web).toEqual([pattern]);
+    expect(env.timers.pendingCount).toBe(0);
+  });
+
+  it('không đưa mảng gốc cho trình duyệt', () => {
+    const env = setup({ web: true });
+    env.service.play('START');
+    env.web[0]?.push(999);
+    expect(HAPTIC_PATTERNS.START).toEqual([30]);
+  });
+});
+
+describe('supported', () => {
+  it.each<[string, boolean, boolean, boolean]>([
+    ['chỉ có port', true, false, true],
+    ['chỉ có navigator.vibrate', false, true, true],
+    ['không có gì', false, false, false],
+  ])('%s → %s', (_label, port, web, supported) => {
+    expect(setup({ port, web }).service.supported).toBe(supported);
+  });
+
+  it('không có gì thì play không làm gì và không ném lỗi', () => {
+    const env = setup();
+    expect(() => env.service.play('ERROR')).not.toThrow();
+    expect(env.timers.pendingCount).toBe(0);
+  });
+});
+
+describe('tôn trọng cài đặt rung', () => {
+  it('tắt rung thì không rung (native lẫn navigator.vibrate), bật lại thì rung', async () => {
+    const native = setup({ port: true });
+    const web = setup({ web: true });
+    for (const env of [native, web]) env.setEnabled(false);
+    native.service.play('SUCCESS');
+    web.service.play('SUCCESS');
+    native.timers.advance(1000);
+    await settle();
+    expect(native.port?.pulses).toEqual([]);
+    expect(web.web).toEqual([]);
+
+    web.setEnabled(true);
+    web.service.play('START');
+    expect(web.web).toEqual([[30]]);
+  });
+
+  it('tắt rung giữa chừng một chuỗi thì các nhịp còn lại bị bỏ', async () => {
+    const env = setup({ port: true });
+    env.service.play('ERROR');
+    env.timers.advance(100);
+    env.setEnabled(false);
+    env.timers.advance(1000);
+    await settle();
+    expect(env.port?.pulses).toEqual([{ atMs: 0, durationMs: 100 }]);
+  });
+
+  it('isEnabled ném lỗi thì coi như đã tắt, không ném ra ngoài', () => {
+    const timers = new FakeTimers();
+    const port = new FakePort(() => timers.now, () => 'ok');
+    const isEnabled = (): boolean => {
+      throw new Error('kho cài đặt hỏng');
     };
-  }
-  const modelReady = current.modelReady || trigger === 'MODEL_READY';
-  const cameraReady = current.cameraReady || trigger === 'CAMERA_READY';
-  const backgrounded = trigger === 'APP_BACKGROUNDED' ? true : trigger === 'APP_FOREGROUNDED' ? false : current.backgrounded;
-  const waiting = target === 'LOADING_MODEL' || target === 'WAITING_PERMISSION';
-  const to: AppState = waiting && modelReady && cameraReady ? 'READY' : target;
-  return { accepted: true, from: current.state, to, snapshot: { state: to, modelReady, cameraReady, backgrounded }, reasons: [] };
-}
-</file>
-
-<file path="tests/decision/decision-engine.lifecycle.test.ts">
-// Lượt 1: vòng đời (khởi động, FAILURE, USER_REPLAY, nền/trở lại, cổng chặn ANALYSIS).
-// Ca USER_REPLAY CÓ kết quả và các nhánh ANALYSIS 1..7 được kiểm ở lượt 2 (cần engine sinh được kết quả).
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { DEFAULT_CONFIG } from '../../src/config/app-config';
-import type { AppErrorCode, AppState, DecisionInput, DecisionOutput, IDecisionEngine, SpeechIntent, SystemEvent } from '../../src/contracts';
-import { createDecisionEngine } from '../../src/decision/decision-engine';
-import { TRANSITIONS } from '../../src/decision/state-manager';
-import { mulberry32 } from '../../src/utils/math';
-import { makeAnalysis } from '../fakes/factories';
-
-const sys = (event: SystemEvent, now = 0): DecisionInput => ({ type: 'SYSTEM', event, now });
-const fail = (code: AppErrorCode, now = 0): DecisionInput => ({ type: 'FAILURE', code, now });
-const replay = (now = 0): DecisionInput => ({ type: 'USER_REPLAY', now });
-const analyze = (now = 0): DecisionInput => ({ type: 'ANALYSIS', analysis: makeAnalysis(), now });
-const newEngine = (): IDecisionEngine => createDecisionEngine(DEFAULT_CONFIG.decision);
-
-type Startup = 'INITIALIZING' | 'AWAITING_START' | 'LOADING_MODEL' | 'WAITING_PERMISSION' | 'READY';
-/** Chuỗi sự kiện đưa engine mới tới từng trạng thái khởi động. */
-const PATH: Record<Startup, SystemEvent[]> = {
-  INITIALIZING: [],
-  AWAITING_START: ['APP_STARTED'],
-  LOADING_MODEL: ['APP_STARTED', 'GESTURE_UNLOCKED'],
-  WAITING_PERMISSION: ['APP_STARTED', 'GESTURE_UNLOCKED', 'PERMISSION_REQUESTED'],
-  READY: ['APP_STARTED', 'GESTURE_UNLOCKED', 'PERMISSION_REQUESTED', 'MODEL_READY', 'CAMERA_READY'],
-};
-const STARTUP = Object.keys(PATH) as Startup[];
-const SYSTEM_EVENTS: SystemEvent[] = [
-  'APP_STARTED', 'GESTURE_UNLOCKED', 'PERMISSION_REQUESTED', 'MODEL_READY', 'CAMERA_READY',
-  'RESULT_SPEECH_ENDED', 'APP_BACKGROUNDED', 'APP_FOREGROUNDED',
-];
-const ERROR_CODES: AppErrorCode[] = [
-  'UNSUPPORTED_BROWSER', 'CAMERA_PERMISSION_DENIED', 'CAMERA_NOT_FOUND', 'CAMERA_IN_USE', 'CAMERA_FAILED',
-  'MODEL_MISSING', 'MODEL_CORRUPT', 'MODEL_INIT_FAILED', 'INFERENCE_FAILED',
-  'TTS_UNAVAILABLE', 'TTS_NO_VIETNAMESE_VOICE', 'STORAGE_FAILED', 'OFFLINE_NOT_READY',
-];
-
-function drive(events: SystemEvent[]): IDecisionEngine {
-  const engine = newEngine();
-  for (const event of events) engine.handle(sys(event));
-  return engine;
-}
-
-/** Đầu ra không công bố kết quả: result null và không được tính tổng. */
-function expectNoResult(out: DecisionOutput): void {
-  expect(out.result).toBeNull();
-  expect(out.shouldCalculateTotal).toBe(false);
-}
-
-describe('khởi động theo sự kiện hệ thống', () => {
-  it('ban đầu ở INITIALIZING và chưa có kết quả', () => {
-    const engine = newEngine();
-    expect(engine.state).toBe('INITIALIZING');
-    expect(engine.lastResult).toBeNull();
-  });
-
-  it('đi đúng chuỗi trạng thái, lời nói và mã lý do', () => {
-    const steps: Array<{ event: SystemEvent; state: AppState; speech: SpeechIntent['kind'] | null; reasons: string[] }> = [
-      { event: 'APP_STARTED', state: 'AWAITING_START', speech: 'WELCOME', reasons: ['APP_STARTED'] },
-      { event: 'GESTURE_UNLOCKED', state: 'LOADING_MODEL', speech: null, reasons: ['GESTURE_UNLOCKED'] },
-      { event: 'PERMISSION_REQUESTED', state: 'WAITING_PERMISSION', speech: 'PERMISSION_PRIMER', reasons: ['PERMISSION_REQUESTED'] },
-      { event: 'MODEL_READY', state: 'WAITING_PERMISSION', speech: null, reasons: ['MODEL_READY', 'WAIT_CAMERA'] },
-      { event: 'CAMERA_READY', state: 'READY', speech: 'CAMERA_READY', reasons: ['CAMERA_READY', 'BOTH_READY'] },
-    ];
-    const engine = newEngine();
-    for (const step of steps) {
-      const out = engine.handle(sys(step.event));
-      expect([out.state, out.speech?.kind ?? null, out.reasons], step.event).toEqual([step.state, step.speech, step.reasons]);
-      expect(engine.state, step.event).toBe(step.state);
-      expect(out.status, step.event).toBeNull();
-      expectNoResult(out);
-    }
-  });
-
-  it('camera xong trước model: chờ model rồi mới READY', () => {
-    const engine = drive(PATH.WAITING_PERMISSION);
-    const camera = engine.handle(sys('CAMERA_READY'));
-    expect([camera.state, camera.speech, camera.reasons]).toEqual(['LOADING_MODEL', null, ['CAMERA_READY', 'WAIT_MODEL']]);
-    const model = engine.handle(sys('MODEL_READY'));
-    expect([model.state, model.speech]).toEqual(['READY', { kind: 'CAMERA_READY' }]);
-  });
-
-  it('model và camera đến trước cử chỉ: chỉ READY sau GESTURE_UNLOCKED', () => {
-    const engine = drive(PATH.AWAITING_START);
-    for (const event of ['MODEL_READY', 'CAMERA_READY'] as const) {
-      const out = engine.handle(sys(event));
-      expect([out.state, out.speech]).toEqual(['AWAITING_START', null]);
-    }
-    const gesture = engine.handle(sys('GESTURE_UNLOCKED'));
-    expect([gesture.state, gesture.speech, gesture.reasons]).toEqual(['READY', { kind: 'CAMERA_READY' }, ['GESTURE_UNLOCKED', 'BOTH_READY']]);
-  });
-
-  it('MODEL_READY và CAMERA_READY lặp lại khi đã READY thì im lặng, không đọc lại', () => {
-    const engine = drive(PATH.READY);
-    for (const event of ['MODEL_READY', 'CAMERA_READY'] as const) {
-      const out = engine.handle(sys(event));
-      expect([out.state, out.speech, out.reasons]).toEqual(['READY', null, [event]]);
-    }
+    const service = createHapticService({ isEnabled, port, timers });
+    expect(() => service.play('START')).not.toThrow();
+    expect(port.pulses).toEqual([]);
   });
 });
 
-describe('chuyển trái phép bị bỏ qua, không ném lỗi', () => {
-  it.each<{ name: string; at: Startup; event: SystemEvent }>([
-    { name: 'GESTURE_UNLOCKED khi chưa APP_STARTED', at: 'INITIALIZING', event: 'GESTURE_UNLOCKED' },
-    { name: 'PERMISSION_REQUESTED trước cử chỉ', at: 'AWAITING_START', event: 'PERMISSION_REQUESTED' },
-    { name: 'APP_STARTED lặp lại', at: 'AWAITING_START', event: 'APP_STARTED' },
-    { name: 'PERMISSION_REQUESTED lặp lại', at: 'WAITING_PERMISSION', event: 'PERMISSION_REQUESTED' },
-    { name: 'RESULT_SPEECH_ENDED khi không đọc gì', at: 'READY', event: 'RESULT_SPEECH_ENDED' },
-  ])('$name', ({ at, event }) => {
-    const engine = drive(PATH[at]);
-    const out = engine.handle(sys(event));
-    expect([out.state, engine.state, out.speech]).toEqual([at, at, null]);
-    expect(out.reasons).toEqual(['ILLEGAL_TRANSITION', `${event}@${at}`]);
-    expectNoResult(out);
+describe('chuỗi mới hủy chuỗi cũ', () => {
+  it('ERROR đang chạy bị START thay thế: hẹn giờ cũ bị hủy, nhịp cũ không bao giờ phát', async () => {
+    const env = setup({ port: true });
+    env.service.play('ERROR');
+    env.timers.advance(100);
+    expect(env.timers.pendingCount).toBe(2);
+    env.service.play('START');
+    expect(env.timers.pendingCount).toBe(0);
+    env.timers.advance(2000);
+    await settle();
+    expect(env.port?.pulses).toEqual([{ atMs: 0, durationMs: 100 }, { atMs: 100, durationMs: 30 }]);
   });
 
-  it('đầu vào hỏng (loại lạ, sự kiện lạ) không làm engine ném lỗi hay đổi trạng thái', () => {
-    const engine = drive(PATH.AWAITING_START);
-    expect(engine.handle({ type: 'NOPE', now: 0 } as unknown as DecisionInput).reasons).toEqual(['UNKNOWN_INPUT']);
-    expect(engine.handle(sys('NOPE' as SystemEvent)).reasons).toEqual(['ILLEGAL_TRANSITION', 'NOPE@AWAITING_START']);
-    expect(engine.state).toBe('AWAITING_START');
+  it('navigator.vibrate: hai lần play gọi theo thứ tự (trình duyệt tự hủy mẫu cũ)', () => {
+    const env = setup({ web: true });
+    env.service.play('ERROR');
+    env.service.play('START');
+    expect(env.web).toEqual([[100, 80, 100, 80, 300], [30]]);
   });
 });
 
-describe('FAILURE: ưu tiên cao nhất', () => {
-  it.each(STARTUP)('từ %s → ERROR kèm lời báo lỗi', (from) => {
-    const engine = drive(PATH[from]);
-    const out = engine.handle(fail('CAMERA_PERMISSION_DENIED'));
-    expect([out.state, engine.state]).toEqual(['ERROR', 'ERROR']);
-    expect(out.speech).toEqual({ kind: 'ERROR', code: 'CAMERA_PERMISSION_DENIED' });
-    expect(out.reasons).toEqual(['FAILURE', 'CAMERA_PERMISSION_DENIED']);
-    expectNoResult(out);
+describe('plugin native lỗi', () => {
+  it.each<[string, PortMode]>([
+    ['trả false', 'false'],
+    ['từ chối (reject)', 'reject'],
+    ['ném đồng bộ', 'throw'],
+  ])('%s → chuyển sang navigator.vibrate, các lần sau không gọi port nữa', async (_label, mode) => {
+    const env = setup({ port: () => mode, web: true });
+    env.service.play('SUCCESS');
+    await settle();
+    expect(env.web).toEqual([[40, 60, 40]]);
+    expect(env.service.supported).toBe(true);
+    env.service.play('START');
+    expect(env.web).toEqual([[40, 60, 40], [30]]);
+    expect(env.port?.pulses).toHaveLength(1);
   });
 
-  it('mọi mã lỗi đều được đọc đúng mã', () => {
-    for (const code of ERROR_CODES) expect(newEngine().handle(fail(code)).speech).toEqual({ kind: 'ERROR', code });
+  it('không có dự phòng thì supported thành false và play không làm gì thêm', async () => {
+    const env = setup({ port: () => 'reject' });
+    expect(env.service.supported).toBe(true);
+    env.service.play('START');
+    await settle();
+    expect(env.service.supported).toBe(false);
+    env.service.play('START');
+    expect(env.port?.pulses).toHaveLength(1);
   });
 
-  it('vẫn được xử lý khi app đang ở nền', () => {
-    const out = drive([...PATH.READY, 'APP_BACKGROUNDED']).handle(fail('CAMERA_FAILED'));
-    expect([out.state, out.speech]).toEqual(['ERROR', { kind: 'ERROR', code: 'CAMERA_FAILED' }]);
+  it('nhịp giữa chừng lỗi thì chỉ rung nốt phần còn lại bằng navigator.vibrate', async () => {
+    const env = setup({ port: (i) => (i === 2 ? 'false' : 'ok'), web: true });
+    env.service.play('ERROR');
+    env.timers.advance(1000);
+    await settle();
+    expect(env.port?.pulses).toHaveLength(3);
+    expect(env.web).toEqual([[300]]);
   });
 
-  it('lỗi trùng mã khi đã ở ERROR thì im lặng, lỗi khác mã thì đọc mã mới', () => {
-    const engine = drive(PATH.READY);
-    engine.handle(fail('CAMERA_FAILED'));
-    const same = engine.handle(fail('CAMERA_FAILED'));
-    expect([same.state, same.speech, same.reasons]).toEqual(['ERROR', null, ['FAILURE', 'CAMERA_FAILED', 'DUPLICATE']]);
-    expect(engine.handle(fail('MODEL_INIT_FAILED')).speech).toEqual({ kind: 'ERROR', code: 'MODEL_INIT_FAILED' });
-  });
-
-  it.each(SYSTEM_EVENTS.filter((e) => e !== 'APP_BACKGROUNDED' && e !== 'APP_FOREGROUNDED'))('ERROR khóa: %s bị bỏ qua', (event) => {
-    const engine = drive(PATH.READY);
-    engine.handle(fail('CAMERA_FAILED'));
-    const out = engine.handle(sys(event));
-    expect([out.state, out.speech, out.reasons]).toEqual(['ERROR', null, ['ILLEGAL_TRANSITION', `${event}@ERROR`]]);
-  });
-
-  it('ERROR khóa: phân tích khung hình bị bỏ qua', () => {
-    const engine = drive(PATH.READY);
-    engine.handle(fail('CAMERA_FAILED'));
-    const out = engine.handle(analyze());
-    expect([out.reasons, out.speech]).toEqual([['ANALYSIS_IGNORED', 'ERROR_STATE'], null]);
-    expectNoResult(out);
-  });
-
-  it('reset() thoát ERROR: khởi động lại từ đầu và cùng lỗi được đọc lại', () => {
-    const engine = drive(PATH.READY);
-    engine.handle(fail('CAMERA_FAILED'));
-    engine.reset();
-    expect(engine.state).toBe('INITIALIZING');
-    expect(engine.handle(sys('APP_STARTED')).speech).toEqual({ kind: 'WELCOME' });
-    expect(engine.handle(fail('CAMERA_FAILED')).speech).toEqual({ kind: 'ERROR', code: 'CAMERA_FAILED' });
+  it('lỗi về muộn của chuỗi cũ không làm hỏng chuỗi mới', async () => {
+    const env = setup({ port: () => 'false', web: true });
+    env.service.play('ERROR');
+    env.service.play('START'); // thay ngay trước khi kết quả lỗi của ERROR kịp về
+    await settle();
+    expect(env.web).toEqual([[30]]);
   });
 });
 
-describe('USER_REPLAY khi chưa có kết quả', () => {
-  it.each<Startup | 'ERROR'>([...STARTUP, 'ERROR'])('ở %s: đọc REPLAY_EMPTY, không đổi trạng thái', (at) => {
-    const engine = drive(at === 'ERROR' ? PATH.READY : PATH[at]);
-    if (at === 'ERROR') engine.handle(fail('CAMERA_FAILED'));
-    const out = engine.handle(replay());
-    expect([out.state, engine.state, out.speech, out.reasons]).toEqual([at, at, { kind: 'REPLAY_EMPTY' }, ['USER_REPLAY', 'NO_RESULT']]);
-    expect(out.status).toBeNull();
-    expectNoResult(out);
-    expect(engine.lastResult).toBeNull();
+describe('createHaptics (bản thật) trong Node', () => {
+  const original = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  const stubNavigator = (value: unknown): void => {
+    Object.defineProperty(globalThis, 'navigator', { value, configurable: true, writable: true });
+  };
+
+  afterEach(() => {
+    if (original !== undefined) Object.defineProperty(globalThis, 'navigator', original);
+    else delete (globalThis as unknown as Record<string, unknown>)['navigator'];
   });
 
-  it('không đổi logic quét: xen USER_REPLAY vào giữa không làm đổi các đầu ra khác', () => {
-    const plain = newEngine();
-    const withReplay = newEngine();
-    for (const event of PATH.READY) {
-      withReplay.handle(replay());
-      expect(withReplay.handle(sys(event))).toEqual(plain.handle(sys(event)));
-    }
-  });
-});
-
-describe('nền và trở lại', () => {
-  it('APP_BACKGROUNDED giữ trạng thái; phân tích bị bỏ qua cho tới khi trở lại', () => {
-    const engine = drive(PATH.READY);
-    const bg = engine.handle(sys('APP_BACKGROUNDED'));
-    expect([bg.state, bg.reasons, bg.speech]).toEqual(['READY', ['APP_BACKGROUNDED'], null]);
-    const ignored = engine.handle(analyze());
-    expect([ignored.state, ignored.reasons, ignored.speech]).toEqual(['READY', ['ANALYSIS_IGNORED', 'BACKGROUNDED'], null]);
-    expectNoResult(ignored);
+  it('không có Capacitor native và không có navigator.vibrate → supported false, play không ném lỗi', () => {
+    stubNavigator({});
+    const haptics = createHaptics({ isEnabled: () => true });
+    expect(haptics.supported).toBe(false);
+    expect(() => haptics.play('SUCCESS')).not.toThrow();
   });
 
-  it('APP_FOREGROUNDED xóa bộ nhớ ngắn hạn, về DETECTING và hết bỏ qua phân tích', () => {
-    const engine = drive([...PATH.READY, 'APP_BACKGROUNDED']);
-    const fg = engine.handle(sys('APP_FOREGROUNDED'));
-    expect([fg.state, fg.reasons, fg.speech]).toEqual(['DETECTING', ['APP_FOREGROUNDED', 'MEMORY_CLEARED'], null]);
-    expect(engine.handle(analyze()).reasons).not.toContain('BACKGROUNDED');
-  });
-
-  it('trở lại khi đang khởi động hoặc đang lỗi thì giữ nguyên trạng thái', () => {
-    expect(drive([...PATH.LOADING_MODEL, 'APP_BACKGROUNDED']).handle(sys('APP_FOREGROUNDED')).state).toBe('LOADING_MODEL');
-    const broken = drive(PATH.READY);
-    broken.handle(fail('CAMERA_FAILED'));
-    expect(broken.handle(sys('APP_FOREGROUNDED')).state).toBe('ERROR');
-  });
-});
-
-describe('phân tích khi chưa sẵn sàng', () => {
-  it.each(STARTUP.filter((s) => s !== 'READY'))('ở %s: bỏ qua, không nói, không có kết quả', (at) => {
-    const out = drive(PATH[at]).handle(analyze());
-    expect([out.state, out.reasons, out.speech]).toEqual([at, ['ANALYSIS_IGNORED', 'NOT_READY'], null]);
-    expectNoResult(out);
-  });
-});
-
-type Op = DecisionInput | 'RESET';
-
-/** Dãy thao tác ngẫu nhiên (đầu vào hoặc reset) dựng từ một seed. */
-function buildOps(seed: number, length: number): Op[] {
-  const random = mulberry32(seed);
-  const pick = <T>(items: readonly T[], fallback: T): T => items[Math.floor(random() * items.length)] ?? fallback;
-  return Array.from({ length }, (_, i): Op => {
-    const roll = random();
-    if (roll < 0.03) return 'RESET';
-    if (roll < 0.06) return fail(pick(ERROR_CODES, 'CAMERA_FAILED'), i * 100);
-    if (roll < 0.16) return replay(i * 100);
-    if (roll < 0.3) return analyze(i * 100);
-    return sys(pick(SYSTEM_EVENTS, 'APP_STARTED'), i * 100);
-  });
-}
-
-function play(ops: Op[]): Array<{ input: DecisionInput; out: DecisionOutput }> {
-  const engine = newEngine();
-  const log: Array<{ input: DecisionInput; out: DecisionOutput }> = [];
-  for (const op of ops) {
-    if (op === 'RESET') engine.reset();
-    else log.push({ input: op, out: engine.handle(op) });
-  }
-  return log;
-}
-
-describe('chuỗi đầu vào ngẫu nhiên (4000 thao tác)', () => {
-  const ops = buildOps(20241114, 4000);
-  const log = play(ops);
-
-  afterEach(() => vi.restoreAllMocks());
-
-  it('cùng chuỗi đầu vào cho cùng chuỗi đầu ra', () => {
-    expect(play(ops)).toEqual(log);
-  });
-
-  it('không đọc đồng hồ hệ thống (Date.now, performance.now)', () => {
-    const dateNow = vi.spyOn(Date, 'now');
-    const perfNow = vi.spyOn(performance, 'now');
-    play(ops);
-    expect(dateNow).not.toHaveBeenCalled();
-    expect(perfNow).not.toHaveBeenCalled();
-  });
-
-  it('mọi đầu ra có state hợp lệ và reasons là mảng mã không rỗng', () => {
-    for (const { out } of log) {
-      expect(Object.keys(TRANSITIONS)).toContain(out.state);
-      expect(out.reasons.length).toBeGreaterThan(0);
-      expect(out.reasons.every((r) => r.length > 0)).toBe(true);
-    }
-  });
-
-  it('đầu vào không phải ANALYSIS không bao giờ có status hay kết quả', () => {
-    for (const { input, out } of log) {
-      if (input.type === 'ANALYSIS') continue;
-      expect(out.status).toBeNull();
-      expectNoResult(out);
-    }
-  });
-
-  it('với khung không có tiền, engine không bao giờ công bố kết quả hay tính tổng', () => {
-    for (const { out } of log) expectNoResult(out);
-  });
-
-  it('dãy ngẫu nhiên đi qua đủ các trạng thái khởi động và ERROR (không phải kiểm thử rỗng)', () => {
-    const visited = new Set<AppState>(log.map(({ out }) => out.state));
-    for (const state of [...STARTUP, 'ERROR'] as const) expect(visited.has(state), state).toBe(true);
+  it('có navigator.vibrate → dùng nó với cả mẫu rung, và tôn trọng cài đặt', () => {
+    const calls: unknown[] = [];
+    stubNavigator({
+      vibrate: (pattern: unknown) => {
+        calls.push(pattern);
+        return true;
+      },
+    });
+    let enabled = true;
+    const haptics = createHaptics({ isEnabled: () => enabled });
+    expect(haptics.supported).toBe(true);
+    haptics.play('UNCERTAIN');
+    enabled = false;
+    haptics.play('ERROR');
+    expect(calls).toEqual([[300]]);
   });
 });
 </file>
 
-<file path="tests/decision/source-rules.test.ts">
-// Bảo đảm tĩnh cho nghiệm thu: module decision không chạm DOM, đồng hồ, I/O, không dùng any,
-// và chỉ import hợp đồng, cấu hình, tiện ích P00 hoặc file cùng thư mục.
-import { describe, expect, it } from 'vitest';
+<file path="tests/voice/haptics-adapter.test.ts">
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { clearRecentLogs, setLogSink } from '../../src/utils/logger';
+import { createCapacitorHapticPort } from '../../src/voice/haptics-adapter';
+import type { HapticsPluginLike } from '../../src/voice/haptics-adapter';
 
-const SOURCES = import.meta.glob<string>('../../src/decision/*.ts', { query: '?raw', import: 'default', eager: true });
-
-/** Bỏ chú thích để từ cấm nằm trong lời giải thích không gây báo nhầm. */
-const stripComments = (source: string): string => source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
-
-const FILES = Object.entries(SOURCES).map(([path, source]) => ({ name: path.split('/').at(-1) ?? path, code: stripComments(source) }));
-
-const FORBIDDEN: Array<{ name: string; pattern: RegExp }> = [
-  { name: 'đồng hồ hệ thống và bộ hẹn giờ', pattern: /\bDate\b|(?<![.\w])performance\b|\bsetTimeout\b|\bsetInterval\b|\brequestAnimationFrame\b/ },
-  { name: 'DOM và API trình duyệt', pattern: /(?<![.\w])(document|window|navigator|localStorage|sessionStorage|globalThis)\b|\bHTML\w*Element\b/ },
-  { name: 'I/O (mạng, console, worker)', pattern: /\bfetch\b|\bXMLHttpRequest\b|(?<![.\w])console\b|\bWorker\b/ },
-  { name: 'số ngẫu nhiên', pattern: /\bMath\.random\b/ },
-  { name: 'kiểu any', pattern: /:\s*any\b|\bas\s+any\b|<any>/ },
-  { name: 'import động', pattern: /\bimport\s*\(/ },
-];
-const ALLOWED_IMPORT = /^(\.\/[\w-]+|\.\.\/contracts|\.\.\/config\/[\w-]+|\.\.\/utils\/[\w-]+)$/;
-
-describe('quy tắc mã nguồn của src/decision', () => {
-  it('quét đủ các file của module', () => {
-    expect(FILES.map((f) => f.name)).toEqual(expect.arrayContaining(['decision-engine.ts', 'state-manager.ts', 'total-calculator.ts']));
-  });
-
-  describe.each(FILES)('$name', ({ code }) => {
-    it.each(FORBIDDEN)('không dùng $name', ({ pattern }) => {
-      expect(code).not.toMatch(pattern);
-    });
-
-    it('chỉ import hợp đồng, cấu hình, tiện ích P00 hoặc file cùng thư mục', () => {
-      for (const [, specifier = ''] of code.matchAll(/\bfrom\s+'([^']+)'/g)) expect(specifier).toMatch(ALLOWED_IMPORT);
-    });
-  });
-});
-</file>
-
-<file path="tests/decision/state-manager.test.ts">
-import { describe, expect, it } from 'vitest';
-import type { AppState } from '../../src/contracts';
-import { INITIAL_SNAPSHOT, TRANSITIONS, phaseOf, transition } from '../../src/decision/state-manager';
-import type { MachineSnapshot, StateTrigger } from '../../src/decision/state-manager';
-
-// Hai bản đồ bắt buộc đủ khóa (thiếu một khóa là lỗi biên dịch): đáp án độc lập với mã nguồn.
-const STATE_SET: Record<AppState, true> = {
-  INITIALIZING: true, AWAITING_START: true, WAITING_PERMISSION: true, LOADING_MODEL: true, READY: true,
-  NO_CANDIDATE: true, DETECTING: true, UNCERTAIN: true, OVERLAPPING: true, STABILIZING: true,
-  RESULT_READY: true, SPEAKING: true, ERROR: true,
-};
-const TRIGGER_SET: Record<StateTrigger, true> = {
-  APP_STARTED: true, GESTURE_UNLOCKED: true, PERMISSION_REQUESTED: true, MODEL_READY: true, CAMERA_READY: true,
-  RESULT_SPEECH_ENDED: true, APP_BACKGROUNDED: true, APP_FOREGROUNDED: true, FAILURE: true,
-  NO_MONEY_SEEN: true, UNCERTAIN_SEEN: true, OVERLAP_SEEN: true, UNSTABLE_SEEN: true, STEADY_SEEN: true, RESULT_PUBLISHED: true,
-};
-const ALL_STATES = Object.keys(STATE_SET) as AppState[];
-const ALL_TRIGGERS = Object.keys(TRIGGER_SET) as StateTrigger[];
-const STARTUP: AppState[] = ['INITIALIZING', 'AWAITING_START', 'LOADING_MODEL', 'WAITING_PERMISSION'];
-const SCANNING: AppState[] = ['READY', 'NO_CANDIDATE', 'DETECTING', 'UNCERTAIN', 'OVERLAPPING', 'STABILIZING', 'RESULT_READY'];
-
-const ANALYSIS_TARGET: Partial<Record<StateTrigger, AppState>> = {
-  NO_MONEY_SEEN: 'NO_CANDIDATE', UNCERTAIN_SEEN: 'UNCERTAIN', OVERLAP_SEEN: 'OVERLAPPING',
-  UNSTABLE_SEEN: 'STABILIZING', STEADY_SEEN: 'DETECTING', RESULT_PUBLISHED: 'SPEAKING',
-};
-/** Sự kiện chỉ hợp lệ ở đúng một trạng thái: [nguồn, đích]. */
-const SINGLE_EDGE: Partial<Record<StateTrigger, readonly [AppState, AppState]>> = {
-  APP_STARTED: ['INITIALIZING', 'AWAITING_START'], GESTURE_UNLOCKED: ['AWAITING_START', 'LOADING_MODEL'],
-  PERMISSION_REQUESTED: ['LOADING_MODEL', 'WAITING_PERMISSION'], RESULT_SPEECH_ENDED: ['SPEAKING', 'DETECTING'],
-};
-
-/** Kỳ vọng viết lại bằng QUY TẮC (cờ mặc định tắt nên chưa lên READY). null = chuyển trái phép. */
-function expectedNext(state: AppState, trigger: StateTrigger): AppState | null {
-  switch (trigger) {
-    case 'FAILURE': return 'ERROR';
-    case 'APP_BACKGROUNDED': return state;
-    case 'APP_FOREGROUNDED': return SCANNING.includes(state) || state === 'SPEAKING' ? 'DETECTING' : state;
-    case 'MODEL_READY': return state === 'ERROR' ? null : state;
-    case 'CAMERA_READY':
-      if (state === 'ERROR') return null;
-      return state === 'WAITING_PERMISSION' ? 'LOADING_MODEL' : state;
-    case 'APP_STARTED':
-    case 'GESTURE_UNLOCKED':
-    case 'PERMISSION_REQUESTED':
-    case 'RESULT_SPEECH_ENDED': {
-      const edge = SINGLE_EDGE[trigger];
-      return edge !== undefined && edge[0] === state ? edge[1] : null;
-    }
-    default: return SCANNING.includes(state) ? (ANALYSIS_TARGET[trigger] ?? null) : null;
-  }
-}
-
-const at = (state: AppState): MachineSnapshot => ({ ...INITIAL_SNAPSHOT, state });
-const run = (triggers: StateTrigger[]): MachineSnapshot =>
-  triggers.reduce<MachineSnapshot>((snap, trigger) => transition(snap, trigger).snapshot, INITIAL_SNAPSHOT);
-
-describe('bảng chuyển trạng thái', () => {
-  it('có đúng 13 hàng của hợp đồng', () => {
-    expect(Object.keys(TRANSITIONS).sort()).toEqual([...ALL_STATES].sort());
-  });
-
-  describe.each(ALL_STATES)('từ %s', (state) => {
-    it.each(ALL_TRIGGERS)('%s', (trigger) => {
-      const result = transition(at(state), trigger);
-      const expected = expectedNext(state, trigger);
-      expect(result.accepted).toBe(expected !== null);
-      expect(result.to).toBe(expected ?? state);
-      expect(result.snapshot.state).toBe(result.to);
-    });
-  });
-
-  it('chuyển trái phép giữ nguyên ảnh chụp và ghi lý do; chuyển hợp lệ không có lý do trái phép', () => {
-    const before = at('INITIALIZING');
-    const illegal = transition(before, 'GESTURE_UNLOCKED');
-    expect(illegal.snapshot).toBe(before);
-    expect(illegal.reasons).toEqual(['ILLEGAL_TRANSITION', 'GESTURE_UNLOCKED@INITIALIZING']);
-    expect(transition(before, 'APP_STARTED').reasons).toEqual([]);
-  });
-
-  it('không sửa ảnh chụp đầu vào', () => {
-    const frozen = Object.freeze(at('LOADING_MODEL'));
-    expect(() => transition(frozen, 'MODEL_READY')).not.toThrow();
-  });
+beforeEach(() => {
+  setLogSink(() => undefined);
 });
 
-describe('giai đoạn', () => {
+afterEach(() => {
+  setLogSink(null);
+  clearRecentLogs();
+});
+
+describe('createCapacitorHapticPort', () => {
+  it('gọi plugin với { duration } và trả true khi thành công', async () => {
+    const received: Array<{ duration: number }> = [];
+    const plugin: HapticsPluginLike = {
+      vibrate: (options) => {
+        received.push(options);
+        return Promise.resolve();
+      },
+    };
+    expect(await createCapacitorHapticPort(plugin).vibrate(250)).toBe(true);
+    expect(received).toEqual([{ duration: 250 }]);
+  });
+
   it.each([
-    ...STARTUP.map((state) => ({ state, phase: 'STARTUP' })),
-    ...SCANNING.map((state) => ({ state, phase: 'SCANNING' })),
-    { state: 'SPEAKING' as AppState, phase: 'SPEAKING' },
-    { state: 'ERROR' as AppState, phase: 'ERROR' },
-  ])('$state → $phase', ({ state, phase }) => {
-    expect(phaseOf(state)).toBe(phase);
-  });
-});
-
-describe('khởi động: thứ tự sự kiện', () => {
-  const GATE: StateTrigger[] = ['APP_STARTED', 'GESTURE_UNLOCKED'];
-
-  it.each<{ name: string; events: StateTrigger[]; beforeLast: AppState }>([
-    { name: 'xin quyền, model rồi camera', events: ['PERMISSION_REQUESTED', 'MODEL_READY', 'CAMERA_READY'], beforeLast: 'WAITING_PERMISSION' },
-    { name: 'xin quyền, camera rồi model', events: ['PERMISSION_REQUESTED', 'CAMERA_READY', 'MODEL_READY'], beforeLast: 'LOADING_MODEL' },
-    { name: 'quyền cấp sẵn, model rồi camera', events: ['MODEL_READY', 'CAMERA_READY'], beforeLast: 'LOADING_MODEL' },
-    { name: 'quyền cấp sẵn, camera rồi model', events: ['CAMERA_READY', 'MODEL_READY'], beforeLast: 'LOADING_MODEL' },
-    { name: 'model xong trước khi xin quyền', events: ['MODEL_READY', 'PERMISSION_REQUESTED', 'CAMERA_READY'], beforeLast: 'WAITING_PERMISSION' },
-  ])('$name: chỉ READY khi đủ cả hai', ({ events, beforeLast }) => {
-    expect(run([...GATE, ...events.slice(0, -1)]).state).toBe(beforeLast);
-    expect(run([...GATE, ...events]).state).toBe('READY');
-  });
-
-  it('camera đã sẵn sàng thì PERMISSION_REQUESTED muộn bị bỏ qua', () => {
-    const snap = run([...GATE, 'CAMERA_READY']);
-    expect(transition(snap, 'PERMISSION_REQUESTED').accepted).toBe(false);
-    expect(transition(snap, 'MODEL_READY').to).toBe('READY');
-  });
-
-  it('PERMISSION_REQUESTED lặp lại khi đang chờ quyền bị bỏ qua', () => {
-    expect(transition(run([...GATE, 'PERMISSION_REQUESTED']), 'PERMISSION_REQUESTED').accepted).toBe(false);
-  });
-
-  it('cờ đến sớm được ghi nhận nhưng chỉ lên READY sau GESTURE_UNLOCKED', () => {
-    expect(run(['MODEL_READY', 'CAMERA_READY', 'APP_STARTED'])).toMatchObject({ state: 'AWAITING_START', modelReady: true, cameraReady: true });
-    expect(run(['MODEL_READY', 'CAMERA_READY', 'APP_STARTED', 'GESTURE_UNLOCKED']).state).toBe('READY');
-  });
-});
-
-describe('nền và trở lại', () => {
-  it('APP_BACKGROUNDED bật cờ, APP_FOREGROUNDED tắt cờ', () => {
-    expect(run(['APP_BACKGROUNDED']).backgrounded).toBe(true);
-    expect(run(['APP_BACKGROUNDED', 'APP_FOREGROUNDED']).backgrounded).toBe(false);
+    {
+      label: 'plugin từ chối',
+      plugin: { vibrate: () => Promise.reject(new Error('không có quyền VIBRATE')) } satisfies HapticsPluginLike,
+    },
+    {
+      label: 'plugin ném đồng bộ',
+      plugin: {
+        vibrate: (): Promise<void> => {
+          throw new Error('chưa đăng ký plugin');
+        },
+      } satisfies HapticsPluginLike,
+    },
+  ])('$label → trả false, không ném lỗi', async ({ plugin }) => {
+    expect(await createCapacitorHapticPort(plugin).vibrate(100)).toBe(false);
   });
 });
 </file>
 
-<file path="tests/decision/total-calculator.test.ts">
+<file path="tests/voice/prompt-manager.test.ts">
+import { describe, expect, it } from 'vitest';
+import { DEFAULT_SETTINGS } from '../../src/config/app-config';
+import type {
+  AppErrorCode, Denomination, GuidanceCode, RecognitionResult, SettingAck, Settings, SpeechIntent,
+} from '../../src/contracts';
+import { AUDIO_KEYS, buildPrompt, SPEECH_PRIORITY } from '../../src/voice/prompt-manager';
+import type { AudioKey } from '../../src/voice/prompt-manager';
+
+const DETAILED: Settings = { ...DEFAULT_SETTINGS, verbosity: 'DETAILED' };
+const BRIEF: Settings = { ...DEFAULT_SETTINGS, verbosity: 'BRIEF' };
+const CAVEAT = 'Tổng này chỉ tính các tờ tôi nhìn thấy.';
+
+function makeResult(denominations: Denomination[], overrides: Partial<RecognitionResult> = {}): RecognitionResult {
+  const total = denominations.reduce((sum, d) => sum + d, 0);
+  return {
+    status: denominations.length === 1 ? 'CONFIDENT_SINGLE' : 'CONFIDENT_MULTI',
+    count: denominations.length, denominations, total, formattedTotal: `${total} đồng`, timestamp: 0, ...overrides,
+  };
+}
+
+/* Bảng kiểu Record: hợp đồng thêm mã mới mà bảng chưa có thì test lỗi biên dịch. */
+const GUIDANCE: Record<GuidanceCode, string> = {
+  NO_MONEY: 'Chưa nhận diện được tiền. Hãy đưa tiền đến trước camera.',
+  TOO_FAR: 'Hãy đưa tiền lại gần camera hơn.',
+  PARTIAL_IN_FRAME: 'Hãy đưa toàn bộ tờ tiền vào khung hình.',
+  BLUR: 'Hình ảnh chưa rõ. Hãy giữ điện thoại yên.',
+  LOW_LIGHT: 'Ánh sáng yếu. Hãy bật đèn hỗ trợ hoặc chuyển đến nơi sáng hơn.',
+  LOW_CONFIDENCE: 'Tôi chưa nhận dạng rõ tờ tiền. Hãy duỗi phẳng tờ tiền và đưa gần camera hơn.',
+  CLASS_CONFLICT: 'Tôi chưa phân biệt được mệnh giá. Hãy giữ tờ tiền thẳng và rõ hơn.',
+  OVERLAP: 'Các tờ tiền có vẻ đang chồng lên nhau. Hãy tách chúng ra.',
+  HOLD_STEADY: 'Hãy giữ tiền yên trước camera.',
+  MULTI_NOT_ALLOWED: 'Hãy đưa từng tờ một.',
+};
+const GUIDANCE_AUDIO: Partial<Record<GuidanceCode, AudioKey>> = { NO_MONEY: 'no-money', LOW_LIGHT: 'low-light', BLUR: 'blur' };
+const ERRORS: Record<AppErrorCode, AudioKey | undefined> = {
+  UNSUPPORTED_BROWSER: undefined, CAMERA_PERMISSION_DENIED: 'camera-error', CAMERA_NOT_FOUND: undefined,
+  CAMERA_IN_USE: undefined, CAMERA_FAILED: undefined, MODEL_MISSING: 'model-error', MODEL_CORRUPT: undefined,
+  MODEL_INIT_FAILED: undefined, INFERENCE_FAILED: undefined, TTS_UNAVAILABLE: undefined,
+  TTS_NO_VIETNAMESE_VOICE: 'no-vi-voice', STORAGE_FAILED: undefined, OFFLINE_NOT_READY: 'model-error',
+};
+const ACK_FAMILY: Record<SettingAck, string> = {
+  VOICE_ON: 'VOICE', VIBRATION_ON: 'VIBRATION', VIBRATION_OFF: 'VIBRATION', TORCH_ON: 'TORCH', TORCH_OFF: 'TORCH',
+  TORCH_UNSUPPORTED: 'TORCH', RATE_SLOW: 'RATE', RATE_NORMAL: 'RATE', RATE_FAST: 'RATE',
+  VERBOSITY_BRIEF: 'VERBOSITY', VERBOSITY_DETAILED: 'VERBOSITY',
+};
+const GUIDANCE_CODES = Object.keys(GUIDANCE) as GuidanceCode[];
+const ERROR_CODES = Object.keys(ERRORS) as AppErrorCode[];
+const ACK_CODES = Object.keys(ACK_FAMILY) as SettingAck[];
+
+describe('buildPrompt: câu cố định', () => {
+  it.each<[SpeechIntent, string, AudioKey | undefined]>([
+    [{ kind: 'WELCOME' }, 'Xin chào! Hãy đưa tiền đến trước camera.', 'welcome'],
+    [
+      { kind: 'PERMISSION_PRIMER' },
+      'Ứng dụng cần dùng camera để nhận dạng tiền. Hãy chọn Cho phép trên hộp thoại sắp hiện ra.',
+      'permission-primer',
+    ],
+    [{ kind: 'CAMERA_READY' }, 'Camera đã sẵn sàng, hãy đưa tiền vào trước camera.', 'camera-ready'],
+    [{ kind: 'REPLAY_EMPTY' }, 'Hiện tại tôi chưa nhận dạng được tờ tiền nào.', undefined],
+  ])('%j', (intent, text, audioKey) => {
+    const prompt = buildPrompt(intent, DETAILED);
+    expect(prompt.text).toBe(text);
+    expect(prompt.audioKey).toBe(audioKey);
+    expect(prompt.priority).toBe(0);
+  });
+});
+
+describe('buildPrompt: GUIDANCE (mọi mã đều có câu)', () => {
+  it.each(GUIDANCE_CODES.map((code): [GuidanceCode, string] => [code, GUIDANCE[code]]))('%s', (code, text) => {
+    const prompt = buildPrompt({ kind: 'GUIDANCE', code }, DETAILED);
+    expect(prompt.text).toBe(text);
+    expect(prompt.audioKey).toBe(GUIDANCE_AUDIO[code]);
+    expect(prompt.priority).toBe(1);
+    expect(prompt.supersedeKey).toBe('GUIDANCE'); // dùng chung để GUIDANCE mới thay GUIDANCE đang chờ
+  });
+
+  it('LOW_CONFIDENCE là lời hướng dẫn, không khẳng định tiền đang bị gấp', () => {
+    expect(GUIDANCE.LOW_CONFIDENCE).not.toMatch(/gấp|nhăn|nát/);
+  });
+});
+
+describe('buildPrompt: ERROR (mọi mã đều có câu nêu việc cần làm)', () => {
+  it.each<[AppErrorCode, string]>([
+    [
+      'CAMERA_PERMISSION_DENIED',
+      'Bạn chưa cấp quyền camera. Hãy mở Cài đặt của điện thoại, chọn Ứng dụng, chọn ứng dụng này rồi bật quyền Camera.',
+    ],
+    ['OFFLINE_NOT_READY', 'Ứng dụng thiếu dữ liệu nhận dạng. Hãy cài lại ứng dụng.'],
+    ['MODEL_MISSING', 'Ứng dụng thiếu dữ liệu nhận dạng. Hãy cài lại ứng dụng.'],
+    [
+      'TTS_NO_VIETNAMESE_VOICE',
+      'Điện thoại chưa có giọng đọc tiếng Việt. Hãy vào Cài đặt, Chuyển văn bản thành giọng nói, rồi tải dữ liệu giọng Tiếng Việt.',
+    ],
+  ])('%s khớp từng chữ với đặc tả', (code, text) => {
+    expect(buildPrompt({ kind: 'ERROR', code }, DETAILED).text).toBe(text);
+  });
+
+  it.each(ERROR_CODES)('%s: có việc cần làm, ưu tiên 3, audioKey đúng', (code) => {
+    const prompt = buildPrompt({ kind: 'ERROR', code }, DETAILED);
+    expect(prompt.text).toContain('Hãy');
+    expect(prompt.priority).toBe(3);
+    expect(prompt.audioKey).toBe(ERRORS[code]);
+  });
+
+  it('mỗi mã lỗi có supersedeKey riêng', () => {
+    const keys = ERROR_CODES.map((code) => buildPrompt({ kind: 'ERROR', code }, DETAILED).supersedeKey);
+    expect(new Set(keys).size).toBe(ERROR_CODES.length);
+  });
+});
+
+describe('buildPrompt: SETTING_ACK (mọi giá trị đều có câu)', () => {
+  it.each(ACK_CODES)('%s: ưu tiên 0, khóa thay thế theo từng cài đặt', (what) => {
+    const prompt = buildPrompt({ kind: 'SETTING_ACK', what }, DETAILED);
+    expect(prompt.text.length).toBeGreaterThan(5);
+    expect(prompt.priority).toBe(0);
+    expect(prompt.supersedeKey).toBe(`SETTING_ACK:${ACK_FAMILY[what]}`);
+  });
+});
+
+describe('buildPrompt: kết quả một tờ', () => {
+  it.each<[string, Settings]>([['DETAILED', DETAILED], ['BRIEF', BRIEF]])('%s: chỉ nói mệnh giá', (_name, settings) => {
+    const prompt = buildPrompt({ kind: 'RESULT', result: makeResult([50000]) }, settings);
+    expect(prompt.text).toBe('Năm mươi nghìn đồng.');
+    expect(prompt.priority).toBe(SPEECH_PRIORITY.RESULT);
+    expect(prompt.supersedeKey).toBe('RESULT');
+    expect(prompt.audioKey).toBeUndefined();
+  });
+});
+
+describe('buildPrompt: kết quả nhiều tờ', () => {
+  it.each<[string, Denomination[], string]>([
+    [
+      'đọc từng tờ khác mệnh giá',
+      [20000, 50000, 100000],
+      'Có ba tờ tiền. Một tờ hai mươi nghìn đồng. Một tờ năm mươi nghìn đồng. Một tờ một trăm nghìn đồng. ' +
+        `Tổng cộng một trăm bảy mươi nghìn đồng. ${CAVEAT}`,
+    ],
+    [
+      'nhóm các tờ cùng mệnh giá',
+      [10000, 10000, 50000],
+      `Có ba tờ tiền. Hai tờ mười nghìn đồng. Một tờ năm mươi nghìn đồng. Tổng cộng bảy mươi nghìn đồng. ${CAVEAT}`,
+    ],
+    [
+      'nhóm theo thứ tự xuất hiện đầu tiên từ trái sang phải',
+      [50000, 10000, 50000],
+      `Có ba tờ tiền. Hai tờ năm mươi nghìn đồng. Một tờ mười nghìn đồng. Tổng cộng một trăm mười nghìn đồng. ${CAVEAT}`,
+    ],
+  ])('DETAILED: %s', (_name, denominations, text) => {
+    expect(buildPrompt({ kind: 'RESULT', result: makeResult(denominations) }, DETAILED).text).toBe(text);
+  });
+
+  it('BRIEF: chỉ đọc tổng, không có câu lưu ý', () => {
+    const prompt = buildPrompt({ kind: 'RESULT', result: makeResult([20000, 50000, 100000]) }, BRIEF);
+    expect(prompt.text).toBe('Một trăm bảy mươi nghìn đồng.');
+  });
+});
+
+describe('buildPrompt: REPLAY', () => {
+  it.each<[string, Settings, Denomination[]]>([
+    ['một tờ DETAILED', DETAILED, [50000]],
+    ['một tờ BRIEF', BRIEF, [50000]],
+    ['nhiều tờ DETAILED', DETAILED, [10000, 10000, 50000]],
+    ['nhiều tờ BRIEF', BRIEF, [10000, 10000, 50000]],
+  ])('%s: cùng câu với RESULT, ưu tiên 2, khóa REPLAY', (_name, settings, ds) => {
+    const result = makeResult(ds);
+    const replay = buildPrompt({ kind: 'REPLAY', result }, settings);
+    expect(replay.text).toBe(buildPrompt({ kind: 'RESULT', result }, settings).text);
+    expect(replay.priority).toBe(2);
+    expect(replay.supersedeKey).toBe('REPLAY');
+  });
+
+  it('REPLAY_EMPTY dùng chung khóa REPLAY', () => {
+    expect(buildPrompt({ kind: 'REPLAY_EMPTY' }, DETAILED).supersedeKey).toBe('REPLAY');
+  });
+});
+
+describe('buildPrompt: Fail Safe', () => {
+  it.each<[string, RecognitionResult]>([
+    ['không có tờ nào', makeResult([], { count: 0, total: 0 })],
+    ['count lệch số mệnh giá', makeResult([20000, 50000], { count: 3 })],
+    ['total lệch tổng các mệnh giá', makeResult([20000, 50000], { total: 80000 })],
+    ['total là NaN', makeResult([20000], { total: Number.NaN })],
+    ['mệnh giá không hợp lệ', makeResult([30000 as unknown as Denomination])],
+  ])('kết quả không nhất quán (%s) → ném RangeError, không đọc gì', (_name, result) => {
+    expect(() => buildPrompt({ kind: 'RESULT', result }, DETAILED)).toThrow(RangeError);
+    expect(() => buildPrompt({ kind: 'REPLAY', result }, DETAILED)).toThrow(RangeError);
+  });
+
+  it.each([
+    { kind: 'GUIDANCE', code: 'KHONG_CO' },
+    { kind: 'ERROR', code: 'KHONG_CO' },
+    { kind: 'SETTING_ACK', what: 'KHONG_CO' },
+    { kind: 'KHONG_CO' },
+  ])('ý định lạ %j → ném RangeError, không bao giờ đọc chữ "undefined"', (intent) => {
+    expect(() => buildPrompt(intent as unknown as SpeechIntent, DETAILED)).toThrow(RangeError);
+  });
+});
+
+describe('buildPrompt: tính chất chung của mọi câu nói', () => {
+  const sample = makeResult([20000, 50000, 100000]);
+  const intents: SpeechIntent[] = [
+    { kind: 'WELCOME' }, { kind: 'PERMISSION_PRIMER' }, { kind: 'CAMERA_READY' }, { kind: 'REPLAY_EMPTY' },
+    { kind: 'RESULT', result: sample }, { kind: 'REPLAY', result: makeResult([50000]) },
+    ...GUIDANCE_CODES.map((code): SpeechIntent => ({ kind: 'GUIDANCE', code })),
+    ...ERROR_CODES.map((code): SpeechIntent => ({ kind: 'ERROR', code })),
+    ...ACK_CODES.map((what): SpeechIntent => ({ kind: 'SETTING_ACK', what })),
+  ];
+  const prompts = intents.map((intent) => buildPrompt(intent, DETAILED));
+
+  it('câu sạch: không thừa khoảng trắng, không còn chữ số, không "ngàn", kết thúc bằng dấu câu', () => {
+    for (const { text } of prompts) {
+      expect(text).toBe(text.trim());
+      expect(text).not.toContain('  ');
+      expect(text).not.toMatch(/\d/);
+      expect(text).not.toContain('ngàn');
+      expect(text).toMatch(/[.!?]$/);
+    }
+  });
+
+  it('chín khóa âm thanh đều được dùng cho đúng một câu cố định', () => {
+    const used = new Set(prompts.map((p) => p.audioKey).filter((k) => k !== undefined));
+    expect([...used].sort()).toEqual([...AUDIO_KEYS].sort());
+  });
+
+  it('ưu tiên: ERROR 3, RESULT và REPLAY 2, GUIDANCE 1, còn lại 0', () => {
+    expect(SPEECH_PRIORITY).toEqual({ ERROR: 3, RESULT: 2, REPLAY: 2, GUIDANCE: 1, OTHER: 0 });
+  });
+});
+</file>
+
+<file path="tests/voice/vietnamese-number.test.ts">
 import { describe, expect, it } from 'vitest';
 import { DENOMINATIONS } from '../../src/contracts';
 import type { Denomination } from '../../src/contracts';
-import { formatVND } from '../../src/config/denominations';
-import { calculateTotal } from '../../src/decision/total-calculator';
-import { mulberry32 } from '../../src/utils/math';
+import {
+  denominationToSpeech,
+  MAX_SPEAKABLE_NUMBER,
+  moneyToSpeech,
+  numberToVietnameseWords,
+} from '../../src/voice/vietnamese-number';
 
-describe('calculateTotal', () => {
-  it.each<{ name: string; input: Denomination[]; total: number; formatted: string }>([
-    { name: 'ba tờ khác mệnh giá', input: [20000, 50000, 100000], total: 170000, formatted: '170.000 đồng' },
-    { name: 'hai tờ cùng mệnh giá', input: [10000, 10000], total: 20000, formatted: '20.000 đồng' },
-    { name: 'một tờ nhỏ nhất', input: [1000], total: 1000, formatted: '1.000 đồng' },
-    { name: 'tổng vượt một triệu', input: [500000, 500000, 200000, 200000, 100000], total: 1500000, formatted: '1.500.000 đồng' },
-    { name: 'đủ 9 mệnh giá', input: [...DENOMINATIONS], total: 888000, formatted: '888.000 đồng' },
-  ])('$name', ({ input, total, formatted }) => {
-    expect(calculateTotal(input)).toEqual({ count: input.length, denominations: input, total, formattedTotal: formatted });
+describe('numberToVietnameseWords: các số theo yêu cầu nghiệm thu', () => {
+  it.each([
+    [1000, 'một nghìn'], [2000, 'hai nghìn'], [5000, 'năm nghìn'], [10000, 'mười nghìn'],
+    [15000, 'mười lăm nghìn'], [20000, 'hai mươi nghìn'], [21000, 'hai mươi mốt nghìn'],
+    [25000, 'hai mươi lăm nghìn'], [50000, 'năm mươi nghìn'], [100000, 'một trăm nghìn'],
+    [105000, 'một trăm linh năm nghìn'], [170000, 'một trăm bảy mươi nghìn'], [200000, 'hai trăm nghìn'],
+    [500000, 'năm trăm nghìn'], [1005000, 'một triệu không trăm linh năm nghìn'],
+    [1250000, 'một triệu hai trăm năm mươi nghìn'], [2000000, 'hai triệu'],
+  ])('%d → %s', (n, words) => {
+    expect(numberToVietnameseWords(n)).toBe(words);
+  });
+});
+
+describe('numberToVietnameseWords: mười, mươi, lăm, mốt, tư', () => {
+  it.each([
+    [0, 'không'], [1, 'một'], [4, 'bốn'], [5, 'năm'], [10, 'mười'], [11, 'mười một'], [14, 'mười bốn'],
+    [15, 'mười lăm'], [20, 'hai mươi'], [21, 'hai mươi mốt'], [24, 'hai mươi tư'], [25, 'hai mươi lăm'],
+    [34, 'ba mươi tư'], [55, 'năm mươi lăm'], [99, 'chín mươi chín'],
+  ])('%d → %s', (n, words) => {
+    expect(numberToVietnameseWords(n)).toBe(words);
+  });
+});
+
+describe('numberToVietnameseWords: linh, không trăm, đơn vị nhóm', () => {
+  it.each([
+    [101, 'một trăm linh một'], [105, 'một trăm linh năm'], [110, 'một trăm mười'], [115, 'một trăm mười lăm'],
+    [1001, 'một nghìn không trăm linh một'], [1010, 'một nghìn không trăm mười'], [1100, 'một nghìn một trăm'],
+    [1000005, 'một triệu không trăm linh năm'], [1001000, 'một triệu không trăm linh một nghìn'],
+    [1000000000, 'một tỷ'], [21000000005, 'hai mươi mốt tỷ không trăm linh năm'],
+    [
+      MAX_SPEAKABLE_NUMBER,
+      'chín trăm chín mươi chín tỷ chín trăm chín mươi chín triệu chín trăm chín mươi chín nghìn chín trăm chín mươi chín',
+    ],
+  ])('%d → %s', (n, words) => {
+    expect(numberToVietnameseWords(n)).toBe(words);
   });
 
-  it('giữ nguyên thứ tự, trả bản sao và không sửa mảng đầu vào', () => {
-    const input = Object.freeze<Denomination[]>([500000, 1000, 20000, 1000]) as Denomination[];
-    const result = calculateTotal(input);
-    expect(result.denominations).toEqual([500000, 1000, 20000, 1000]);
-    expect(result.denominations).not.toBe(input);
+  it('dùng "nghìn", không bao giờ dùng "ngàn"', () => {
+    expect(numberToVietnameseWords(1234567)).not.toContain('ngàn');
+  });
+});
+
+describe('numberToVietnameseWords: đầu vào không hợp lệ ném RangeError', () => {
+  it.each([
+    ['số âm', -1], ['số thập phân', 1.5], ['NaN', Number.NaN], ['vô cực', Number.POSITIVE_INFINITY],
+    ['vượt giới hạn', MAX_SPEAKABLE_NUMBER + 1], ['vượt số nguyên an toàn', Number.MAX_SAFE_INTEGER + 1],
+  ])('%s', (_label, n) => {
+    expect(() => numberToVietnameseWords(n)).toThrow(RangeError);
+  });
+});
+
+describe('moneyToSpeech và denominationToSpeech', () => {
+  it.each([
+    [0, 'không đồng'], [170000, 'một trăm bảy mươi nghìn đồng'], [1005000, 'một triệu không trăm linh năm nghìn đồng'],
+  ])('moneyToSpeech(%d) → %s', (n, speech) => {
+    expect(moneyToSpeech(n)).toBe(speech);
   });
 
-  it.each<{ name: string; input: unknown[] }>([
-    { name: 'danh sách rỗng', input: [] },
-    { name: 'mệnh giá không tồn tại', input: [15000] },
-    { name: 'số 0', input: [0] },
-    { name: 'số âm', input: [-20000] },
-    { name: 'NaN', input: [Number.NaN] },
-    { name: 'vô cực', input: [Number.POSITIVE_INFINITY] },
-    { name: 'số lẻ', input: [1000.5] },
-    { name: 'chuỗi số', input: ['20000'] },
-    { name: 'null', input: [null] },
-    { name: 'một giá trị lạ lẫn giữa các giá trị hợp lệ', input: [20000, 30000, 50000] },
-  ])('ném RangeError: $name', ({ input }) => {
-    expect(() => calculateTotal(input as Denomination[])).toThrow(RangeError);
+  it('moneyToSpeech ném RangeError với số không hợp lệ', () => {
+    expect(() => moneyToSpeech(-1000)).toThrow(RangeError);
   });
 
-  it('300 danh sách ngẫu nhiên: tổng, số tờ, thứ tự và định dạng đều khớp', () => {
-    const random = mulberry32(20241114);
-    for (let i = 0; i < 300; i++) {
-      const input = Array.from({ length: 1 + Math.floor(random() * 8) }, () => DENOMINATIONS[Math.floor(random() * DENOMINATIONS.length)] as Denomination);
-      const sum = input.reduce((acc, d) => acc + d, 0);
-      expect(calculateTotal(input)).toEqual({ count: input.length, denominations: input, total: sum, formattedTotal: formatVND(sum) });
-    }
+  const expected: Record<Denomination, string> = {
+    1000: 'một nghìn đồng', 2000: 'hai nghìn đồng', 5000: 'năm nghìn đồng', 10000: 'mười nghìn đồng',
+    20000: 'hai mươi nghìn đồng', 50000: 'năm mươi nghìn đồng', 100000: 'một trăm nghìn đồng',
+    200000: 'hai trăm nghìn đồng', 500000: 'năm trăm nghìn đồng',
+  };
+  it.each(DENOMINATIONS.map((d): [Denomination, string] => [d, expected[d]]))('denominationToSpeech(%d) → %s', (d, speech) => {
+    expect(denominationToSpeech(d)).toBe(speech);
   });
 });
 </file>
@@ -2574,168 +2983,121 @@ export function buildClassMap(c: ClassesJson): Denomination[] {
 }
 </file>
 
-<file path="src/decision/decision-engine.ts">
-// STUB P07 (lượt 1/2) — nhánh ANALYSIS chưa cài; lượt 2 sẽ ghi đè file này.
-import type {
-  AppConfig, AppErrorCode, DecisionInput, DecisionOutput, GuidanceCode, IDecisionEngine,
-  RecognitionResult, SpeechIntent, SystemEvent,
-} from '../contracts';
-import { INITIAL_SNAPSHOT, phaseOf, transition } from './state-manager';
-import type { StateTrigger, TransitionResult } from './state-manager';
+<file path="src/decision/state-manager.ts">
+import type { AppState, SystemEvent } from '../contracts';
 
-/** Bộ nhớ ngắn hạn của việc quét (nhánh ANALYSIS dùng ở lượt 2). Xóa khi APP_FOREGROUNDED và reset(). */
-interface ShortTermMemory {
-  /** Chữ ký (mệnh giá từ trái sang phải) của kết quả đã công bố; null = chưa có hoặc tiền đã rời khung. */
-  announcedSignature: string | null;
-  /** `now` của khung đầu chuỗi khung trống hiện tại; null = đang không trống. */
-  emptySince: number | null;
-  /** `now` của khung đầu chuỗi khung chưa ổn định hiện tại; null = đang ổn định. */
-  unstableSince: number | null;
-  /** `now` lần cuối phát mỗi mã guidance (cooldown tính riêng theo từng mã). */
-  guidanceAt: Partial<Record<GuidanceCode, number>>;
+/** Nguyên nhân chuyển trạng thái đến từ kết quả phân tích khung hình (nhánh ANALYSIS dùng ở lượt 2). */
+export type AnalysisTrigger =
+  | 'NO_MONEY_SEEN'      // khung không có tiền → NO_CANDIDATE
+  | 'UNCERTAIN_SEEN'     // chưa chắc, xung đột hoặc bị chặn → UNCERTAIN
+  | 'OVERLAP_SEEN'       // chồng lấn → OVERLAPPING
+  | 'UNSTABLE_SEEN'      // chắc nhưng chưa ổn định → STABILIZING
+  | 'STEADY_SEEN'        // ổn định, đã công bố, không có gì mới → DETECTING
+  | 'RESULT_PUBLISHED';  // công bố kết quả mới → SPEAKING
+
+/** Mọi nguyên nhân có thể làm đổi trạng thái. */
+export type StateTrigger = SystemEvent | 'FAILURE' | AnalysisTrigger;
+
+/** Giai đoạn: khởi động, đang quét, đang đọc kết quả, lỗi. */
+export type Phase = 'STARTUP' | 'SCANNING' | 'SPEAKING' | 'ERROR';
+
+/** Ảnh chụp bất biến của máy. Hai cờ model/camera được ghi ở mọi trạng thái khởi động để không mất sự kiện đến sớm. */
+export interface MachineSnapshot {
+  readonly state: AppState;
+  readonly modelReady: boolean;
+  readonly cameraReady: boolean;
+  readonly backgrounded: boolean;
 }
 
-const freshMemory = (): ShortTermMemory => ({ announcedSignature: null, emptySince: null, unstableSince: null, guidanceAt: {} });
-
-/** Sao chép để module khác không sửa nhầm bản engine giữ: đọc lại phải y hệt lần đã đọc. */
-const cloneResult = (r: RecognitionResult): RecognitionResult => ({ ...r, denominations: [...r.denominations] });
-
-/** Lời nói khi VÀO một trạng thái khởi động mới; null nếu trạng thái không đổi hoặc không có lời. */
-function entrySpeech(t: TransitionResult): SpeechIntent | null {
-  if (t.from === t.to) return null;
-  if (t.to === 'AWAITING_START') return { kind: 'WELCOME' };
-  if (t.to === 'WAITING_PERMISSION') return { kind: 'PERMISSION_PRIMER' };
-  if (t.to === 'READY') return { kind: 'CAMERA_READY' };
-  return null;
+export interface TransitionResult {
+  /** false = chuyển trái phép, bị bỏ qua. */
+  readonly accepted: boolean;
+  readonly from: AppState;
+  /** Bằng `from` khi bị bỏ qua hoặc không đổi. */
+  readonly to: AppState;
+  /** Ảnh chụp SAU khi áp dụng (chính ảnh đầu vào khi bị bỏ qua). */
+  readonly snapshot: MachineSnapshot;
+  /** [] khi hợp lệ; ['ILLEGAL_TRANSITION', 'NGUYÊN_NHÂN@TRẠNG_THÁI'] khi bị bỏ qua. */
+  readonly reasons: readonly string[];
 }
 
-/**
- * DecisionEngine (Module 6). XÁC ĐỊNH: cùng chuỗi đầu vào cho cùng chuỗi đầu ra; không đồng hồ, không DOM,
- * không I/O; thời gian chỉ đến từ trường `now` của đầu vào.
- *
- * Mã lý do (`reasons`): SYSTEM hợp lệ = [tên sự kiện, ...BOTH_READY | WAIT_CAMERA | WAIT_MODEL | MEMORY_CLEARED];
- * trái phép = ['ILLEGAL_TRANSITION', 'SỰ_KIỆN@TRẠNG_THÁI']; FAILURE = ['FAILURE', mã lỗi, ...DUPLICATE];
- * USER_REPLAY = ['USER_REPLAY', 'HAS_RESULT' | 'NO_RESULT']; ANALYSIS bị bỏ qua =
- * ['ANALYSIS_IGNORED', 'ERROR_STATE' | 'NOT_READY' | 'BACKGROUNDED'].
- *
- * ERROR là trạng thái cuối: mọi FAILURE dẫn tới đó; thoát bằng reset() rồi APP_STARTED.
- * Lượt 1 chỉ cài vòng đời: mọi đầu ra đều có result = null và shouldCalculateTotal = false.
- */
-export function createDecisionEngine(config: AppConfig['decision']): IDecisionEngine {
-  // `config` dùng ở lượt 2: mọi ngưỡng của nhánh ANALYSIS lấy từ đây.
-  let snapshot = INITIAL_SNAPSHOT;
-  let lastResult: RecognitionResult | null = null;
-  let memory = freshMemory();
-  let errorCode: AppErrorCode | null = null;
+export const INITIAL_SNAPSHOT: MachineSnapshot = Object.freeze({
+  state: 'INITIALIZING',
+  modelReady: false,
+  cameraReady: false,
+  backgrounded: false,
+});
 
-  function apply(trigger: StateTrigger): TransitionResult {
-    const t = transition(snapshot, trigger);
-    snapshot = t.snapshot;
-    return t;
-  }
+type Row = Readonly<Partial<Record<StateTrigger, AppState>>>;
 
-  /** Đầu ra không công bố kết quả: status null, result null, shouldCalculateTotal false. */
-  function outputOf(reasons: string[], speech: SpeechIntent | null = null): DecisionOutput {
-    return { state: snapshot.state, status: null, reasons, speech, result: null, shouldCalculateTotal: false };
-  }
-
-  function systemReasons(event: SystemEvent, t: TransitionResult): string[] {
-    const reasons: string[] = [event];
-    if (t.to === 'READY' && t.from !== 'READY') {
-      reasons.push('BOTH_READY');
-    } else if ((event === 'MODEL_READY' || event === 'CAMERA_READY') && phaseOf(t.to) === 'STARTUP') {
-      if (!snapshot.cameraReady) reasons.push('WAIT_CAMERA');
-      if (!snapshot.modelReady) reasons.push('WAIT_MODEL');
-    }
-    if (event === 'APP_FOREGROUNDED') reasons.push('MEMORY_CLEARED');
-    return reasons;
-  }
-
-  function onSystem(event: SystemEvent): DecisionOutput {
-    const t = apply(event);
-    if (!t.accepted) return outputOf([...t.reasons]);
-    if (event === 'APP_FOREGROUNDED') memory = freshMemory();
-    return outputOf(systemReasons(event, t), entrySpeech(t));
-  }
-
-  function onFailure(code: AppErrorCode): DecisionOutput {
-    apply('FAILURE'); // hợp lệ ở mọi trạng thái: ưu tiên cao nhất
-    if (errorCode === code) return outputOf(['FAILURE', code, 'DUPLICATE']);
-    errorCode = code;
-    return outputOf(['FAILURE', code], { kind: 'ERROR', code });
-  }
-
-  function onReplay(): DecisionOutput {
-    if (lastResult === null) return outputOf(['USER_REPLAY', 'NO_RESULT'], { kind: 'REPLAY_EMPTY' });
-    return outputOf(['USER_REPLAY', 'HAS_RESULT'], { kind: 'REPLAY', result: cloneResult(lastResult) });
-  }
-
-  function onAnalysis(): DecisionOutput {
-    const phase = phaseOf(snapshot.state);
-    if (phase === 'ERROR') return outputOf(['ANALYSIS_IGNORED', 'ERROR_STATE']);
-    if (phase === 'STARTUP') return outputOf(['ANALYSIS_IGNORED', 'NOT_READY']);
-    if (snapshot.backgrounded) return outputOf(['ANALYSIS_IGNORED', 'BACKGROUNDED']);
-    // Lượt 2: cổng SPEAKING và nhánh 1..7. Lượt 1 chưa công bố gì nên không bao giờ đọc nhầm.
-    return outputOf(['ANALYSIS_NOT_IMPLEMENTED']);
-  }
-
+/** Hàng chung của mọi trạng thái đang quét; trở lại từ nền thì về DETECTING. */
+function scanningRow(self: AppState): Row {
   return {
-    get state() {
-      return snapshot.state;
-    },
-    get lastResult() {
-      return lastResult === null ? null : cloneResult(lastResult);
-    },
-    handle(input: DecisionInput): DecisionOutput {
-      switch (input.type) {
-        case 'FAILURE': return onFailure(input.code);
-        case 'SYSTEM': return onSystem(input.event);
-        case 'USER_REPLAY': return onReplay();
-        case 'ANALYSIS': return onAnalysis();
-        default: return outputOf(['UNKNOWN_INPUT']);
-      }
-    },
-    reset(): void {
-      snapshot = INITIAL_SNAPSHOT;
-      lastResult = null;
-      memory = freshMemory();
-      errorCode = null;
-    },
+    NO_MONEY_SEEN: 'NO_CANDIDATE', UNCERTAIN_SEEN: 'UNCERTAIN', OVERLAP_SEEN: 'OVERLAPPING',
+    UNSTABLE_SEEN: 'STABILIZING', STEADY_SEEN: 'DETECTING', RESULT_PUBLISHED: 'SPEAKING',
+    MODEL_READY: self, CAMERA_READY: self, APP_BACKGROUNDED: self, APP_FOREGROUNDED: 'DETECTING', FAILURE: 'ERROR',
   };
 }
-</file>
 
-<file path="src/decision/total-calculator.ts">
-import type { Denomination } from '../contracts';
-import { formatVND, isDenomination } from '../config/denominations';
-
-/** Kết quả tính tổng một tập tờ tiền đã được xác nhận. */
-export interface TotalCalculation {
-  count: number;
-  denominations: Denomination[];
-  total: number;
-  formattedTotal: string;
+/** Hàng của trạng thái khởi động: ghi cờ và nền/trở lại giữ nguyên; `own` thêm hoặc đè các cạnh riêng. */
+function startupRow(self: AppState, own: Row): Row {
+  return { MODEL_READY: self, CAMERA_READY: self, APP_BACKGROUNDED: self, APP_FOREGROUNDED: self, FAILURE: 'ERROR', ...own };
 }
 
 /**
- * Tính tổng các tờ tiền đã được xác nhận (Module 7).
- * - `denominations` trả về là BẢN SAO, giữ nguyên thứ tự đầu vào (trái → phải); không sửa mảng đầu vào.
- * - Danh sách rỗng hoặc có giá trị ngoài 9 mệnh giá hợp lệ thì ném RangeError:
- *   thà dừng còn hơn đọc sai số tiền (Fail Safe).
- * - CHỈ DecisionEngine được gọi hàm này, và chỉ ở nhánh công bố kết quả.
+ * Bảng chuyển: TRANSITIONS[trạng thái hiện tại][nguyên nhân] = trạng thái kế tiếp; ô vắng = trái phép.
+ * RESULT_READY là trạng thái dành riêng: engine công bố kết quả đi thẳng sang SPEAKING nên không dừng ở đó.
+ * Hai quy tắc phụ nằm trong `transition`.
  */
-export function calculateTotal(d: Denomination[]): TotalCalculation {
-  if (d.length === 0) {
-    throw new RangeError('calculateTotal: danh sách mệnh giá rỗng');
+export const TRANSITIONS: Readonly<Record<AppState, Row>> = {
+  INITIALIZING: startupRow('INITIALIZING', { APP_STARTED: 'AWAITING_START' }),
+  AWAITING_START: startupRow('AWAITING_START', { GESTURE_UNLOCKED: 'LOADING_MODEL' }),
+  LOADING_MODEL: startupRow('LOADING_MODEL', { PERMISSION_REQUESTED: 'WAITING_PERMISSION' }),
+  WAITING_PERMISSION: startupRow('WAITING_PERMISSION', { CAMERA_READY: 'LOADING_MODEL' }),
+  READY: scanningRow('READY'),
+  NO_CANDIDATE: scanningRow('NO_CANDIDATE'),
+  DETECTING: scanningRow('DETECTING'),
+  UNCERTAIN: scanningRow('UNCERTAIN'),
+  OVERLAPPING: scanningRow('OVERLAPPING'),
+  STABILIZING: scanningRow('STABILIZING'),
+  RESULT_READY: scanningRow('RESULT_READY'),
+  SPEAKING: {
+    RESULT_SPEECH_ENDED: 'DETECTING', MODEL_READY: 'SPEAKING', CAMERA_READY: 'SPEAKING',
+    APP_BACKGROUNDED: 'SPEAKING', APP_FOREGROUNDED: 'DETECTING', FAILURE: 'ERROR',
+  },
+  ERROR: { APP_BACKGROUNDED: 'ERROR', APP_FOREGROUNDED: 'ERROR', FAILURE: 'ERROR' },
+};
+
+/** Giai đoạn của một trạng thái, suy ra từ bảng: trạng thái nhận kết quả phân tích là đang quét. */
+export function phaseOf(state: AppState): Phase {
+  if (state === 'ERROR' || state === 'SPEAKING') return state;
+  return TRANSITIONS[state].STEADY_SEEN === undefined ? 'STARTUP' : 'SCANNING';
+}
+
+/**
+ * Áp dụng một nguyên nhân lên ảnh chụp hiện tại (hàm thuần, không sửa đầu vào). Ngoài bảng có hai quy tắc:
+ * 1. PERMISSION_REQUESTED bị bỏ qua khi camera đã sẵn sàng (quyền đã xong, không xin lại).
+ * 2. Nếu đích là LOADING_MODEL hoặc WAITING_PERMISSION mà đã đủ MODEL_READY và CAMERA_READY thì đích là READY.
+ *    Cờ được ghi từ mọi trạng thái khởi động, nhưng READY chỉ đạt được sau GESTURE_UNLOCKED
+ *    (chưa có thao tác chạm thì chưa nói được).
+ */
+export function transition(current: MachineSnapshot, trigger: StateTrigger): TransitionResult {
+  const target = TRANSITIONS[current.state][trigger];
+  if (target === undefined || (trigger === 'PERMISSION_REQUESTED' && current.cameraReady)) {
+    return {
+      accepted: false,
+      from: current.state,
+      to: current.state,
+      snapshot: current,
+      reasons: ['ILLEGAL_TRANSITION', `${trigger}@${current.state}`],
+    };
   }
-  let total = 0;
-  for (const value of d) {
-    if (!isDenomination(value)) {
-      throw new RangeError(`calculateTotal: giá trị ngoài danh sách mệnh giá (${String(value)})`);
-    }
-    total += value;
-  }
-  return { count: d.length, denominations: [...d], total, formattedTotal: formatVND(total) };
+  const modelReady = current.modelReady || trigger === 'MODEL_READY';
+  const cameraReady = current.cameraReady || trigger === 'CAMERA_READY';
+  const backgrounded = trigger === 'APP_BACKGROUNDED' ? true : trigger === 'APP_FOREGROUNDED' ? false : current.backgrounded;
+  const waiting = target === 'LOADING_MODEL' || target === 'WAITING_PERMISSION';
+  const to: AppState = waiting && modelReady && cameraReady ? 'READY' : target;
+  return { accepted: true, from: current.state, to, snapshot: { state: to, modelReady, cameraReady, backgrounded }, reasons: [] };
 }
 </file>
 
@@ -3473,11 +3835,171 @@ export function createAudioClipEngine(o?: { baseUrl?: string }): ITtsEngine {
 </file>
 
 <file path="src/voice/haptic-service.ts">
-// STUB P08 — module thật sẽ GHI ĐÈ file này.
-import type { IHaptics } from '../contracts';
+import type { HapticEvent, IHaptics } from '../contracts';
+import { createLogger } from '../utils/logger';
+import { getPlatform } from '../utils/platform';
+import { createCapacitorHapticPort } from './haptics-adapter';
 
+const log = createLogger('haptics');
+
+/** Mẫu rung theo quy ước Web Vibration API: [rung, nghỉ, rung, nghỉ, ...], đơn vị mili-giây. */
+export const HAPTIC_PATTERNS: Readonly<Record<HapticEvent, readonly number[]>> = {
+  START: [30],
+  SUCCESS: [40, 60, 40],
+  UNCERTAIN: [300],
+  ERROR: [100, 80, 100, 80, 300],
+};
+
+/**
+ * Cổng nhỏ che plugin rung native. Plugin chỉ nhận MỘT khoảng rung liên tục,
+ * nên chuỗi nhiều nhịp do HapticService phát bằng hẹn giờ.
+ * Bản triển khai thật không được ném lỗi: không rung được thì trả false.
+ */
+export interface HapticPort {
+  vibrate(durationMs: number): Promise<boolean>;
+}
+
+/** Hàm rung của trình duyệt (navigator.vibrate): nhận cả mẫu và tự hủy mẫu đang chạy. */
+export type WebVibrate = (pattern: number[]) => boolean;
+
+/** Hẹn giờ được tiêm vào để test không phải chờ thật. */
+export interface HapticTimers {
+  setTimeout(handler: () => void, ms: number): unknown;
+  clearTimeout(handle: unknown): void;
+}
+
+export interface HapticServiceDeps {
+  isEnabled: () => boolean;
+  /** Cổng plugin native; bỏ trống hoặc null nếu không chạy trong APK. */
+  port?: HapticPort | null;
+  /** Dự phòng trình duyệt; bỏ trống hoặc null nếu không có navigator.vibrate. */
+  webVibrate?: WebVibrate | null;
+  timers?: HapticTimers;
+}
+
+const REAL_TIMERS: HapticTimers = {
+  setTimeout: (handler, ms) => globalThis.setTimeout(handler, ms),
+  clearTimeout: (handle) => globalThis.clearTimeout(handle as number),
+};
+
+/** Gọi cổng rung và gom MỌI kiểu thất bại (trả false, từ chối, ném đồng bộ) về false. */
+async function deliver(port: HapticPort, durationMs: number): Promise<boolean> {
+  try {
+    return (await port.vibrate(durationMs)) !== false;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Bộ rung với các thành phần được tiêm vào (dùng cho test và cho createHaptics).
+ * - Native: phát từng nhịp qua port bằng hẹn giờ; chuỗi mới hủy chuỗi cũ còn chờ.
+ * - Không native hoặc plugin lỗi: dùng navigator.vibrate nếu có.
+ * - Không có cả hai: supported = false và play không làm gì.
+ * - Cài đặt tắt rung được kiểm tra ở mọi nhịp, kể cả giữa chừng một chuỗi.
+ */
+export function createHapticService(deps: HapticServiceDeps): IHaptics {
+  const port = deps.port ?? null;
+  const webVibrate = deps.webVibrate ?? null;
+  const timers = deps.timers ?? REAL_TIMERS;
+  let portFailed = false;
+  let generation = 0;
+  let pending: unknown[] = [];
+
+  function enabled(): boolean {
+    try {
+      return deps.isEnabled();
+    } catch (e) {
+      log.warn('isEnabled ném lỗi, coi như đã tắt rung', e);
+      return false;
+    }
+  }
+
+  function cancelPending(): void {
+    for (const handle of pending) timers.clearTimeout(handle);
+    pending = [];
+  }
+
+  function playWeb(pattern: readonly number[]): void {
+    if (webVibrate === null) return;
+    try {
+      webVibrate([...pattern]);
+    } catch (e) {
+      log.warn('navigator.vibrate lỗi', e);
+    }
+  }
+
+  function onPortFailure(pattern: readonly number[], index: number, gen: number): void {
+    if (!portFailed) log.warn('Plugin rung native lỗi, chuyển sang navigator.vibrate nếu có');
+    portFailed = true;
+    if (gen !== generation) return; // chuỗi này đã bị thay, không được chạm vào chuỗi mới
+    cancelPending();
+    playWeb(pattern.slice(index)); // rung nốt phần còn lại của chuỗi bằng trình duyệt
+  }
+
+  function pulse(activePort: HapticPort, pattern: readonly number[], index: number, gen: number): void {
+    if (gen !== generation) return;
+    if (!enabled()) {
+      cancelPending();
+      return;
+    }
+    const duration = pattern[index];
+    if (duration === undefined) return;
+    void deliver(activePort, duration).then((ok) => {
+      if (!ok) onPortFailure(pattern, index, gen);
+    });
+  }
+
+  function playNative(activePort: HapticPort, pattern: readonly number[], gen: number): void {
+    let offset = 0;
+    for (let index = 0; index < pattern.length; index += 2) {
+      if (offset === 0) {
+        pulse(activePort, pattern, index, gen);
+      } else {
+        pending.push(timers.setTimeout(() => pulse(activePort, pattern, index, gen), offset));
+      }
+      offset += (pattern[index] ?? 0) + (pattern[index + 1] ?? 0);
+    }
+  }
+
+  function play(e: HapticEvent): void {
+    if (!enabled()) return;
+    const pattern = HAPTIC_PATTERNS[e];
+    if (pattern === undefined) return;
+    cancelPending();
+    generation += 1;
+    if (port !== null && !portFailed) playNative(port, pattern, generation);
+    else playWeb(pattern);
+  }
+
+  return {
+    get supported(): boolean {
+      return (port !== null && !portFailed) || webVibrate !== null;
+    },
+    play,
+  };
+}
+
+function detectWebVibrate(): WebVibrate | null {
+  try {
+    if (typeof navigator === 'undefined' || typeof navigator.vibrate !== 'function') return null;
+    return (pattern) => navigator.vibrate(pattern);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Bộ rung thật. Trong APK (android-native) dùng @capacitor/haptics qua adapter;
+ * ngoài APK dùng navigator.vibrate nếu trình duyệt có.
+ * isEnabled thường là () => settings.vibrationEnabled.
+ */
 export function createHaptics(o: { isEnabled: () => boolean }): IHaptics {
-  throw new Error('STUB: createHaptics chưa được cài (P08)');
+  return createHapticService({
+    isEnabled: o.isEnabled,
+    port: getPlatform() === 'android-native' ? createCapacitorHapticPort() : null,
+    webVibrate: detectWebVibrate(),
+  });
 }
 </file>
 
@@ -5792,6 +6314,533 @@ describe('buildClassMap', () => {
     const err = caught(() => buildClassMap(classes));
     expect(err).toBeInstanceOf(AppError);
     expect((err as AppError).code).toBe('MODEL_CORRUPT');
+  });
+});
+</file>
+
+<file path="tests/decision/decision-engine.lifecycle.test.ts">
+// Lượt 1: vòng đời (khởi động, FAILURE, USER_REPLAY, nền/trở lại, cổng chặn ANALYSIS).
+// Ca USER_REPLAY CÓ kết quả và các nhánh ANALYSIS 1..7 được kiểm ở lượt 2 (cần engine sinh được kết quả).
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { DEFAULT_CONFIG } from '../../src/config/app-config';
+import type { AppErrorCode, AppState, DecisionInput, DecisionOutput, IDecisionEngine, SpeechIntent, SystemEvent } from '../../src/contracts';
+import { createDecisionEngine } from '../../src/decision/decision-engine';
+import { TRANSITIONS } from '../../src/decision/state-manager';
+import { mulberry32 } from '../../src/utils/math';
+import { makeAnalysis } from '../fakes/factories';
+
+const sys = (event: SystemEvent, now = 0): DecisionInput => ({ type: 'SYSTEM', event, now });
+const fail = (code: AppErrorCode, now = 0): DecisionInput => ({ type: 'FAILURE', code, now });
+const replay = (now = 0): DecisionInput => ({ type: 'USER_REPLAY', now });
+const analyze = (now = 0): DecisionInput => ({ type: 'ANALYSIS', analysis: makeAnalysis(), now });
+const newEngine = (): IDecisionEngine => createDecisionEngine(DEFAULT_CONFIG.decision);
+
+type Startup = 'INITIALIZING' | 'AWAITING_START' | 'LOADING_MODEL' | 'WAITING_PERMISSION' | 'READY';
+/** Chuỗi sự kiện đưa engine mới tới từng trạng thái khởi động. */
+const PATH: Record<Startup, SystemEvent[]> = {
+  INITIALIZING: [],
+  AWAITING_START: ['APP_STARTED'],
+  LOADING_MODEL: ['APP_STARTED', 'GESTURE_UNLOCKED'],
+  WAITING_PERMISSION: ['APP_STARTED', 'GESTURE_UNLOCKED', 'PERMISSION_REQUESTED'],
+  READY: ['APP_STARTED', 'GESTURE_UNLOCKED', 'PERMISSION_REQUESTED', 'MODEL_READY', 'CAMERA_READY'],
+};
+const STARTUP = Object.keys(PATH) as Startup[];
+const SYSTEM_EVENTS: SystemEvent[] = [
+  'APP_STARTED', 'GESTURE_UNLOCKED', 'PERMISSION_REQUESTED', 'MODEL_READY', 'CAMERA_READY',
+  'RESULT_SPEECH_ENDED', 'APP_BACKGROUNDED', 'APP_FOREGROUNDED',
+];
+const ERROR_CODES: AppErrorCode[] = [
+  'UNSUPPORTED_BROWSER', 'CAMERA_PERMISSION_DENIED', 'CAMERA_NOT_FOUND', 'CAMERA_IN_USE', 'CAMERA_FAILED',
+  'MODEL_MISSING', 'MODEL_CORRUPT', 'MODEL_INIT_FAILED', 'INFERENCE_FAILED',
+  'TTS_UNAVAILABLE', 'TTS_NO_VIETNAMESE_VOICE', 'STORAGE_FAILED', 'OFFLINE_NOT_READY',
+];
+
+function drive(events: SystemEvent[]): IDecisionEngine {
+  const engine = newEngine();
+  for (const event of events) engine.handle(sys(event));
+  return engine;
+}
+
+/** Đầu ra không công bố kết quả: result null và không được tính tổng. */
+function expectNoResult(out: DecisionOutput): void {
+  expect(out.result).toBeNull();
+  expect(out.shouldCalculateTotal).toBe(false);
+}
+
+describe('khởi động theo sự kiện hệ thống', () => {
+  it('ban đầu ở INITIALIZING và chưa có kết quả', () => {
+    const engine = newEngine();
+    expect(engine.state).toBe('INITIALIZING');
+    expect(engine.lastResult).toBeNull();
+  });
+
+  it('đi đúng chuỗi trạng thái, lời nói và mã lý do', () => {
+    const steps: Array<{ event: SystemEvent; state: AppState; speech: SpeechIntent['kind'] | null; reasons: string[] }> = [
+      { event: 'APP_STARTED', state: 'AWAITING_START', speech: 'WELCOME', reasons: ['APP_STARTED'] },
+      { event: 'GESTURE_UNLOCKED', state: 'LOADING_MODEL', speech: null, reasons: ['GESTURE_UNLOCKED'] },
+      { event: 'PERMISSION_REQUESTED', state: 'WAITING_PERMISSION', speech: 'PERMISSION_PRIMER', reasons: ['PERMISSION_REQUESTED'] },
+      { event: 'MODEL_READY', state: 'WAITING_PERMISSION', speech: null, reasons: ['MODEL_READY', 'WAIT_CAMERA'] },
+      { event: 'CAMERA_READY', state: 'READY', speech: 'CAMERA_READY', reasons: ['CAMERA_READY', 'BOTH_READY'] },
+    ];
+    const engine = newEngine();
+    for (const step of steps) {
+      const out = engine.handle(sys(step.event));
+      expect([out.state, out.speech?.kind ?? null, out.reasons], step.event).toEqual([step.state, step.speech, step.reasons]);
+      expect(engine.state, step.event).toBe(step.state);
+      expect(out.status, step.event).toBeNull();
+      expectNoResult(out);
+    }
+  });
+
+  it('camera xong trước model: chờ model rồi mới READY', () => {
+    const engine = drive(PATH.WAITING_PERMISSION);
+    const camera = engine.handle(sys('CAMERA_READY'));
+    expect([camera.state, camera.speech, camera.reasons]).toEqual(['LOADING_MODEL', null, ['CAMERA_READY', 'WAIT_MODEL']]);
+    const model = engine.handle(sys('MODEL_READY'));
+    expect([model.state, model.speech]).toEqual(['READY', { kind: 'CAMERA_READY' }]);
+  });
+
+  it('model và camera đến trước cử chỉ: chỉ READY sau GESTURE_UNLOCKED', () => {
+    const engine = drive(PATH.AWAITING_START);
+    for (const event of ['MODEL_READY', 'CAMERA_READY'] as const) {
+      const out = engine.handle(sys(event));
+      expect([out.state, out.speech]).toEqual(['AWAITING_START', null]);
+    }
+    const gesture = engine.handle(sys('GESTURE_UNLOCKED'));
+    expect([gesture.state, gesture.speech, gesture.reasons]).toEqual(['READY', { kind: 'CAMERA_READY' }, ['GESTURE_UNLOCKED', 'BOTH_READY']]);
+  });
+
+  it('MODEL_READY và CAMERA_READY lặp lại khi đã READY thì im lặng, không đọc lại', () => {
+    const engine = drive(PATH.READY);
+    for (const event of ['MODEL_READY', 'CAMERA_READY'] as const) {
+      const out = engine.handle(sys(event));
+      expect([out.state, out.speech, out.reasons]).toEqual(['READY', null, [event]]);
+    }
+  });
+});
+
+describe('chuyển trái phép bị bỏ qua, không ném lỗi', () => {
+  it.each<{ name: string; at: Startup; event: SystemEvent }>([
+    { name: 'GESTURE_UNLOCKED khi chưa APP_STARTED', at: 'INITIALIZING', event: 'GESTURE_UNLOCKED' },
+    { name: 'PERMISSION_REQUESTED trước cử chỉ', at: 'AWAITING_START', event: 'PERMISSION_REQUESTED' },
+    { name: 'APP_STARTED lặp lại', at: 'AWAITING_START', event: 'APP_STARTED' },
+    { name: 'PERMISSION_REQUESTED lặp lại', at: 'WAITING_PERMISSION', event: 'PERMISSION_REQUESTED' },
+    { name: 'RESULT_SPEECH_ENDED khi không đọc gì', at: 'READY', event: 'RESULT_SPEECH_ENDED' },
+  ])('$name', ({ at, event }) => {
+    const engine = drive(PATH[at]);
+    const out = engine.handle(sys(event));
+    expect([out.state, engine.state, out.speech]).toEqual([at, at, null]);
+    expect(out.reasons).toEqual(['ILLEGAL_TRANSITION', `${event}@${at}`]);
+    expectNoResult(out);
+  });
+
+  it('đầu vào hỏng (loại lạ, sự kiện lạ) không làm engine ném lỗi hay đổi trạng thái', () => {
+    const engine = drive(PATH.AWAITING_START);
+    expect(engine.handle({ type: 'NOPE', now: 0 } as unknown as DecisionInput).reasons).toEqual(['UNKNOWN_INPUT']);
+    expect(engine.handle(sys('NOPE' as SystemEvent)).reasons).toEqual(['ILLEGAL_TRANSITION', 'NOPE@AWAITING_START']);
+    expect(engine.state).toBe('AWAITING_START');
+  });
+});
+
+describe('FAILURE: ưu tiên cao nhất', () => {
+  it.each(STARTUP)('từ %s → ERROR kèm lời báo lỗi', (from) => {
+    const engine = drive(PATH[from]);
+    const out = engine.handle(fail('CAMERA_PERMISSION_DENIED'));
+    expect([out.state, engine.state]).toEqual(['ERROR', 'ERROR']);
+    expect(out.speech).toEqual({ kind: 'ERROR', code: 'CAMERA_PERMISSION_DENIED' });
+    expect(out.reasons).toEqual(['FAILURE', 'CAMERA_PERMISSION_DENIED']);
+    expectNoResult(out);
+  });
+
+  it('mọi mã lỗi đều được đọc đúng mã', () => {
+    for (const code of ERROR_CODES) expect(newEngine().handle(fail(code)).speech).toEqual({ kind: 'ERROR', code });
+  });
+
+  it('vẫn được xử lý khi app đang ở nền', () => {
+    const out = drive([...PATH.READY, 'APP_BACKGROUNDED']).handle(fail('CAMERA_FAILED'));
+    expect([out.state, out.speech]).toEqual(['ERROR', { kind: 'ERROR', code: 'CAMERA_FAILED' }]);
+  });
+
+  it('lỗi trùng mã khi đã ở ERROR thì im lặng, lỗi khác mã thì đọc mã mới', () => {
+    const engine = drive(PATH.READY);
+    engine.handle(fail('CAMERA_FAILED'));
+    const same = engine.handle(fail('CAMERA_FAILED'));
+    expect([same.state, same.speech, same.reasons]).toEqual(['ERROR', null, ['FAILURE', 'CAMERA_FAILED', 'DUPLICATE']]);
+    expect(engine.handle(fail('MODEL_INIT_FAILED')).speech).toEqual({ kind: 'ERROR', code: 'MODEL_INIT_FAILED' });
+  });
+
+  it.each(SYSTEM_EVENTS.filter((e) => e !== 'APP_BACKGROUNDED' && e !== 'APP_FOREGROUNDED'))('ERROR khóa: %s bị bỏ qua', (event) => {
+    const engine = drive(PATH.READY);
+    engine.handle(fail('CAMERA_FAILED'));
+    const out = engine.handle(sys(event));
+    expect([out.state, out.speech, out.reasons]).toEqual(['ERROR', null, ['ILLEGAL_TRANSITION', `${event}@ERROR`]]);
+  });
+
+  it('ERROR khóa: phân tích khung hình bị bỏ qua', () => {
+    const engine = drive(PATH.READY);
+    engine.handle(fail('CAMERA_FAILED'));
+    const out = engine.handle(analyze());
+    expect([out.reasons, out.speech]).toEqual([['ANALYSIS_IGNORED', 'ERROR_STATE'], null]);
+    expectNoResult(out);
+  });
+
+  it('reset() thoát ERROR: khởi động lại từ đầu và cùng lỗi được đọc lại', () => {
+    const engine = drive(PATH.READY);
+    engine.handle(fail('CAMERA_FAILED'));
+    engine.reset();
+    expect(engine.state).toBe('INITIALIZING');
+    expect(engine.handle(sys('APP_STARTED')).speech).toEqual({ kind: 'WELCOME' });
+    expect(engine.handle(fail('CAMERA_FAILED')).speech).toEqual({ kind: 'ERROR', code: 'CAMERA_FAILED' });
+  });
+});
+
+describe('USER_REPLAY khi chưa có kết quả', () => {
+  it.each<Startup | 'ERROR'>([...STARTUP, 'ERROR'])('ở %s: đọc REPLAY_EMPTY, không đổi trạng thái', (at) => {
+    const engine = drive(at === 'ERROR' ? PATH.READY : PATH[at]);
+    if (at === 'ERROR') engine.handle(fail('CAMERA_FAILED'));
+    const out = engine.handle(replay());
+    expect([out.state, engine.state, out.speech, out.reasons]).toEqual([at, at, { kind: 'REPLAY_EMPTY' }, ['USER_REPLAY', 'NO_RESULT']]);
+    expect(out.status).toBeNull();
+    expectNoResult(out);
+    expect(engine.lastResult).toBeNull();
+  });
+
+  it('không đổi logic quét: xen USER_REPLAY vào giữa không làm đổi các đầu ra khác', () => {
+    const plain = newEngine();
+    const withReplay = newEngine();
+    for (const event of PATH.READY) {
+      withReplay.handle(replay());
+      expect(withReplay.handle(sys(event))).toEqual(plain.handle(sys(event)));
+    }
+  });
+});
+
+describe('nền và trở lại', () => {
+  it('APP_BACKGROUNDED giữ trạng thái; phân tích bị bỏ qua cho tới khi trở lại', () => {
+    const engine = drive(PATH.READY);
+    const bg = engine.handle(sys('APP_BACKGROUNDED'));
+    expect([bg.state, bg.reasons, bg.speech]).toEqual(['READY', ['APP_BACKGROUNDED'], null]);
+    const ignored = engine.handle(analyze());
+    expect([ignored.state, ignored.reasons, ignored.speech]).toEqual(['READY', ['ANALYSIS_IGNORED', 'BACKGROUNDED'], null]);
+    expectNoResult(ignored);
+  });
+
+  it('APP_FOREGROUNDED xóa bộ nhớ ngắn hạn, về DETECTING và hết bỏ qua phân tích', () => {
+    const engine = drive([...PATH.READY, 'APP_BACKGROUNDED']);
+    const fg = engine.handle(sys('APP_FOREGROUNDED'));
+    expect([fg.state, fg.reasons, fg.speech]).toEqual(['DETECTING', ['APP_FOREGROUNDED', 'MEMORY_CLEARED'], null]);
+    expect(engine.handle(analyze()).reasons).not.toContain('BACKGROUNDED');
+  });
+
+  it('trở lại khi đang khởi động hoặc đang lỗi thì giữ nguyên trạng thái', () => {
+    expect(drive([...PATH.LOADING_MODEL, 'APP_BACKGROUNDED']).handle(sys('APP_FOREGROUNDED')).state).toBe('LOADING_MODEL');
+    const broken = drive(PATH.READY);
+    broken.handle(fail('CAMERA_FAILED'));
+    expect(broken.handle(sys('APP_FOREGROUNDED')).state).toBe('ERROR');
+  });
+});
+
+describe('phân tích khi chưa sẵn sàng', () => {
+  it.each(STARTUP.filter((s) => s !== 'READY'))('ở %s: bỏ qua, không nói, không có kết quả', (at) => {
+    const out = drive(PATH[at]).handle(analyze());
+    expect([out.state, out.reasons, out.speech]).toEqual([at, ['ANALYSIS_IGNORED', 'NOT_READY'], null]);
+    expectNoResult(out);
+  });
+});
+
+type Op = DecisionInput | 'RESET';
+
+/** Dãy thao tác ngẫu nhiên (đầu vào hoặc reset) dựng từ một seed. */
+function buildOps(seed: number, length: number): Op[] {
+  const random = mulberry32(seed);
+  const pick = <T>(items: readonly T[], fallback: T): T => items[Math.floor(random() * items.length)] ?? fallback;
+  return Array.from({ length }, (_, i): Op => {
+    const roll = random();
+    if (roll < 0.03) return 'RESET';
+    if (roll < 0.06) return fail(pick(ERROR_CODES, 'CAMERA_FAILED'), i * 100);
+    if (roll < 0.16) return replay(i * 100);
+    if (roll < 0.3) return analyze(i * 100);
+    return sys(pick(SYSTEM_EVENTS, 'APP_STARTED'), i * 100);
+  });
+}
+
+function play(ops: Op[]): Array<{ input: DecisionInput; out: DecisionOutput }> {
+  const engine = newEngine();
+  const log: Array<{ input: DecisionInput; out: DecisionOutput }> = [];
+  for (const op of ops) {
+    if (op === 'RESET') engine.reset();
+    else log.push({ input: op, out: engine.handle(op) });
+  }
+  return log;
+}
+
+describe('chuỗi đầu vào ngẫu nhiên (4000 thao tác)', () => {
+  const ops = buildOps(20241114, 4000);
+  const log = play(ops);
+
+  afterEach(() => vi.restoreAllMocks());
+
+  it('cùng chuỗi đầu vào cho cùng chuỗi đầu ra', () => {
+    expect(play(ops)).toEqual(log);
+  });
+
+  it('không đọc đồng hồ hệ thống (Date.now, performance.now)', () => {
+    const dateNow = vi.spyOn(Date, 'now');
+    const perfNow = vi.spyOn(performance, 'now');
+    play(ops);
+    expect(dateNow).not.toHaveBeenCalled();
+    expect(perfNow).not.toHaveBeenCalled();
+  });
+
+  it('mọi đầu ra có state hợp lệ và reasons là mảng mã không rỗng', () => {
+    for (const { out } of log) {
+      expect(Object.keys(TRANSITIONS)).toContain(out.state);
+      expect(out.reasons.length).toBeGreaterThan(0);
+      expect(out.reasons.every((r) => r.length > 0)).toBe(true);
+    }
+  });
+
+  it('đầu vào không phải ANALYSIS không bao giờ có status hay kết quả', () => {
+    for (const { input, out } of log) {
+      if (input.type === 'ANALYSIS') continue;
+      expect(out.status).toBeNull();
+      expectNoResult(out);
+    }
+  });
+
+  it('với khung không có tiền, engine không bao giờ công bố kết quả hay tính tổng', () => {
+    for (const { out } of log) expectNoResult(out);
+  });
+
+  it('dãy ngẫu nhiên đi qua đủ các trạng thái khởi động và ERROR (không phải kiểm thử rỗng)', () => {
+    const visited = new Set<AppState>(log.map(({ out }) => out.state));
+    for (const state of [...STARTUP, 'ERROR'] as const) expect(visited.has(state), state).toBe(true);
+  });
+});
+</file>
+
+<file path="tests/decision/source-rules.test.ts">
+// Bảo đảm tĩnh cho nghiệm thu: module decision không chạm DOM, đồng hồ, I/O, không dùng any,
+// và chỉ import hợp đồng, cấu hình, tiện ích P00 hoặc file cùng thư mục.
+import { describe, expect, it } from 'vitest';
+
+const SOURCES = import.meta.glob<string>('../../src/decision/*.ts', { query: '?raw', import: 'default', eager: true });
+
+/** Bỏ chú thích để từ cấm nằm trong lời giải thích không gây báo nhầm. */
+const stripComments = (source: string): string => source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+
+const FILES = Object.entries(SOURCES).map(([path, source]) => ({ name: path.split('/').at(-1) ?? path, code: stripComments(source) }));
+
+const FORBIDDEN: Array<{ name: string; pattern: RegExp }> = [
+  { name: 'đồng hồ hệ thống và bộ hẹn giờ', pattern: /\bDate\b|(?<![.\w])performance\b|\bsetTimeout\b|\bsetInterval\b|\brequestAnimationFrame\b/ },
+  { name: 'DOM và API trình duyệt', pattern: /(?<![.\w])(document|window|navigator|localStorage|sessionStorage|globalThis)\b|\bHTML\w*Element\b/ },
+  { name: 'I/O (mạng, console, worker)', pattern: /\bfetch\b|\bXMLHttpRequest\b|(?<![.\w])console\b|\bWorker\b/ },
+  { name: 'số ngẫu nhiên', pattern: /\bMath\.random\b/ },
+  { name: 'kiểu any', pattern: /:\s*any\b|\bas\s+any\b|<any>/ },
+  { name: 'import động', pattern: /\bimport\s*\(/ },
+];
+const ALLOWED_IMPORT = /^(\.\/[\w-]+|\.\.\/contracts|\.\.\/config\/[\w-]+|\.\.\/utils\/[\w-]+)$/;
+
+describe('quy tắc mã nguồn của src/decision', () => {
+  it('quét đủ các file của module', () => {
+    expect(FILES.map((f) => f.name)).toEqual(expect.arrayContaining(['decision-engine.ts', 'state-manager.ts', 'total-calculator.ts']));
+  });
+
+  describe.each(FILES)('$name', ({ code }) => {
+    it.each(FORBIDDEN)('không dùng $name', ({ pattern }) => {
+      expect(code).not.toMatch(pattern);
+    });
+
+    it('chỉ import hợp đồng, cấu hình, tiện ích P00 hoặc file cùng thư mục', () => {
+      for (const [, specifier = ''] of code.matchAll(/\bfrom\s+'([^']+)'/g)) expect(specifier).toMatch(ALLOWED_IMPORT);
+    });
+  });
+});
+</file>
+
+<file path="tests/decision/state-manager.test.ts">
+import { describe, expect, it } from 'vitest';
+import type { AppState } from '../../src/contracts';
+import { INITIAL_SNAPSHOT, TRANSITIONS, phaseOf, transition } from '../../src/decision/state-manager';
+import type { MachineSnapshot, StateTrigger } from '../../src/decision/state-manager';
+
+// Hai bản đồ bắt buộc đủ khóa (thiếu một khóa là lỗi biên dịch): đáp án độc lập với mã nguồn.
+const STATE_SET: Record<AppState, true> = {
+  INITIALIZING: true, AWAITING_START: true, WAITING_PERMISSION: true, LOADING_MODEL: true, READY: true,
+  NO_CANDIDATE: true, DETECTING: true, UNCERTAIN: true, OVERLAPPING: true, STABILIZING: true,
+  RESULT_READY: true, SPEAKING: true, ERROR: true,
+};
+const TRIGGER_SET: Record<StateTrigger, true> = {
+  APP_STARTED: true, GESTURE_UNLOCKED: true, PERMISSION_REQUESTED: true, MODEL_READY: true, CAMERA_READY: true,
+  RESULT_SPEECH_ENDED: true, APP_BACKGROUNDED: true, APP_FOREGROUNDED: true, FAILURE: true,
+  NO_MONEY_SEEN: true, UNCERTAIN_SEEN: true, OVERLAP_SEEN: true, UNSTABLE_SEEN: true, STEADY_SEEN: true, RESULT_PUBLISHED: true,
+};
+const ALL_STATES = Object.keys(STATE_SET) as AppState[];
+const ALL_TRIGGERS = Object.keys(TRIGGER_SET) as StateTrigger[];
+const STARTUP: AppState[] = ['INITIALIZING', 'AWAITING_START', 'LOADING_MODEL', 'WAITING_PERMISSION'];
+const SCANNING: AppState[] = ['READY', 'NO_CANDIDATE', 'DETECTING', 'UNCERTAIN', 'OVERLAPPING', 'STABILIZING', 'RESULT_READY'];
+
+const ANALYSIS_TARGET: Partial<Record<StateTrigger, AppState>> = {
+  NO_MONEY_SEEN: 'NO_CANDIDATE', UNCERTAIN_SEEN: 'UNCERTAIN', OVERLAP_SEEN: 'OVERLAPPING',
+  UNSTABLE_SEEN: 'STABILIZING', STEADY_SEEN: 'DETECTING', RESULT_PUBLISHED: 'SPEAKING',
+};
+/** Sự kiện chỉ hợp lệ ở đúng một trạng thái: [nguồn, đích]. */
+const SINGLE_EDGE: Partial<Record<StateTrigger, readonly [AppState, AppState]>> = {
+  APP_STARTED: ['INITIALIZING', 'AWAITING_START'], GESTURE_UNLOCKED: ['AWAITING_START', 'LOADING_MODEL'],
+  PERMISSION_REQUESTED: ['LOADING_MODEL', 'WAITING_PERMISSION'], RESULT_SPEECH_ENDED: ['SPEAKING', 'DETECTING'],
+};
+
+/** Kỳ vọng viết lại bằng QUY TẮC (cờ mặc định tắt nên chưa lên READY). null = chuyển trái phép. */
+function expectedNext(state: AppState, trigger: StateTrigger): AppState | null {
+  switch (trigger) {
+    case 'FAILURE': return 'ERROR';
+    case 'APP_BACKGROUNDED': return state;
+    case 'APP_FOREGROUNDED': return SCANNING.includes(state) || state === 'SPEAKING' ? 'DETECTING' : state;
+    case 'MODEL_READY': return state === 'ERROR' ? null : state;
+    case 'CAMERA_READY':
+      if (state === 'ERROR') return null;
+      return state === 'WAITING_PERMISSION' ? 'LOADING_MODEL' : state;
+    case 'APP_STARTED':
+    case 'GESTURE_UNLOCKED':
+    case 'PERMISSION_REQUESTED':
+    case 'RESULT_SPEECH_ENDED': {
+      const edge = SINGLE_EDGE[trigger];
+      return edge !== undefined && edge[0] === state ? edge[1] : null;
+    }
+    default: return SCANNING.includes(state) ? (ANALYSIS_TARGET[trigger] ?? null) : null;
+  }
+}
+
+const at = (state: AppState): MachineSnapshot => ({ ...INITIAL_SNAPSHOT, state });
+const run = (triggers: StateTrigger[]): MachineSnapshot =>
+  triggers.reduce<MachineSnapshot>((snap, trigger) => transition(snap, trigger).snapshot, INITIAL_SNAPSHOT);
+
+describe('bảng chuyển trạng thái', () => {
+  it('có đúng 13 hàng của hợp đồng', () => {
+    expect(Object.keys(TRANSITIONS).sort()).toEqual([...ALL_STATES].sort());
+  });
+
+  describe.each(ALL_STATES)('từ %s', (state) => {
+    it.each(ALL_TRIGGERS)('%s', (trigger) => {
+      const result = transition(at(state), trigger);
+      const expected = expectedNext(state, trigger);
+      expect(result.accepted).toBe(expected !== null);
+      expect(result.to).toBe(expected ?? state);
+      expect(result.snapshot.state).toBe(result.to);
+    });
+  });
+
+  it('chuyển trái phép giữ nguyên ảnh chụp và ghi lý do; chuyển hợp lệ không có lý do trái phép', () => {
+    const before = at('INITIALIZING');
+    const illegal = transition(before, 'GESTURE_UNLOCKED');
+    expect(illegal.snapshot).toBe(before);
+    expect(illegal.reasons).toEqual(['ILLEGAL_TRANSITION', 'GESTURE_UNLOCKED@INITIALIZING']);
+    expect(transition(before, 'APP_STARTED').reasons).toEqual([]);
+  });
+
+  it('không sửa ảnh chụp đầu vào', () => {
+    const frozen = Object.freeze(at('LOADING_MODEL'));
+    expect(() => transition(frozen, 'MODEL_READY')).not.toThrow();
+  });
+});
+
+describe('giai đoạn', () => {
+  it.each([
+    ...STARTUP.map((state) => ({ state, phase: 'STARTUP' })),
+    ...SCANNING.map((state) => ({ state, phase: 'SCANNING' })),
+    { state: 'SPEAKING' as AppState, phase: 'SPEAKING' },
+    { state: 'ERROR' as AppState, phase: 'ERROR' },
+  ])('$state → $phase', ({ state, phase }) => {
+    expect(phaseOf(state)).toBe(phase);
+  });
+});
+
+describe('khởi động: thứ tự sự kiện', () => {
+  const GATE: StateTrigger[] = ['APP_STARTED', 'GESTURE_UNLOCKED'];
+
+  it.each<{ name: string; events: StateTrigger[]; beforeLast: AppState }>([
+    { name: 'xin quyền, model rồi camera', events: ['PERMISSION_REQUESTED', 'MODEL_READY', 'CAMERA_READY'], beforeLast: 'WAITING_PERMISSION' },
+    { name: 'xin quyền, camera rồi model', events: ['PERMISSION_REQUESTED', 'CAMERA_READY', 'MODEL_READY'], beforeLast: 'LOADING_MODEL' },
+    { name: 'quyền cấp sẵn, model rồi camera', events: ['MODEL_READY', 'CAMERA_READY'], beforeLast: 'LOADING_MODEL' },
+    { name: 'quyền cấp sẵn, camera rồi model', events: ['CAMERA_READY', 'MODEL_READY'], beforeLast: 'LOADING_MODEL' },
+    { name: 'model xong trước khi xin quyền', events: ['MODEL_READY', 'PERMISSION_REQUESTED', 'CAMERA_READY'], beforeLast: 'WAITING_PERMISSION' },
+  ])('$name: chỉ READY khi đủ cả hai', ({ events, beforeLast }) => {
+    expect(run([...GATE, ...events.slice(0, -1)]).state).toBe(beforeLast);
+    expect(run([...GATE, ...events]).state).toBe('READY');
+  });
+
+  it('camera đã sẵn sàng thì PERMISSION_REQUESTED muộn bị bỏ qua', () => {
+    const snap = run([...GATE, 'CAMERA_READY']);
+    expect(transition(snap, 'PERMISSION_REQUESTED').accepted).toBe(false);
+    expect(transition(snap, 'MODEL_READY').to).toBe('READY');
+  });
+
+  it('PERMISSION_REQUESTED lặp lại khi đang chờ quyền bị bỏ qua', () => {
+    expect(transition(run([...GATE, 'PERMISSION_REQUESTED']), 'PERMISSION_REQUESTED').accepted).toBe(false);
+  });
+
+  it('cờ đến sớm được ghi nhận nhưng chỉ lên READY sau GESTURE_UNLOCKED', () => {
+    expect(run(['MODEL_READY', 'CAMERA_READY', 'APP_STARTED'])).toMatchObject({ state: 'AWAITING_START', modelReady: true, cameraReady: true });
+    expect(run(['MODEL_READY', 'CAMERA_READY', 'APP_STARTED', 'GESTURE_UNLOCKED']).state).toBe('READY');
+  });
+});
+
+describe('nền và trở lại', () => {
+  it('APP_BACKGROUNDED bật cờ, APP_FOREGROUNDED tắt cờ', () => {
+    expect(run(['APP_BACKGROUNDED']).backgrounded).toBe(true);
+    expect(run(['APP_BACKGROUNDED', 'APP_FOREGROUNDED']).backgrounded).toBe(false);
+  });
+});
+</file>
+
+<file path="tests/decision/total-calculator.test.ts">
+import { describe, expect, it } from 'vitest';
+import { DENOMINATIONS } from '../../src/contracts';
+import type { Denomination } from '../../src/contracts';
+import { formatVND } from '../../src/config/denominations';
+import { calculateTotal } from '../../src/decision/total-calculator';
+import { mulberry32 } from '../../src/utils/math';
+
+describe('calculateTotal', () => {
+  it.each<{ name: string; input: Denomination[]; total: number; formatted: string }>([
+    { name: 'ba tờ khác mệnh giá', input: [20000, 50000, 100000], total: 170000, formatted: '170.000 đồng' },
+    { name: 'hai tờ cùng mệnh giá', input: [10000, 10000], total: 20000, formatted: '20.000 đồng' },
+    { name: 'một tờ nhỏ nhất', input: [1000], total: 1000, formatted: '1.000 đồng' },
+    { name: 'tổng vượt một triệu', input: [500000, 500000, 200000, 200000, 100000], total: 1500000, formatted: '1.500.000 đồng' },
+    { name: 'đủ 9 mệnh giá', input: [...DENOMINATIONS], total: 888000, formatted: '888.000 đồng' },
+  ])('$name', ({ input, total, formatted }) => {
+    expect(calculateTotal(input)).toEqual({ count: input.length, denominations: input, total, formattedTotal: formatted });
+  });
+
+  it('giữ nguyên thứ tự, trả bản sao và không sửa mảng đầu vào', () => {
+    const input = Object.freeze<Denomination[]>([500000, 1000, 20000, 1000]) as Denomination[];
+    const result = calculateTotal(input);
+    expect(result.denominations).toEqual([500000, 1000, 20000, 1000]);
+    expect(result.denominations).not.toBe(input);
+  });
+
+  it.each<{ name: string; input: unknown[] }>([
+    { name: 'danh sách rỗng', input: [] },
+    { name: 'mệnh giá không tồn tại', input: [15000] },
+    { name: 'số 0', input: [0] },
+    { name: 'số âm', input: [-20000] },
+    { name: 'NaN', input: [Number.NaN] },
+    { name: 'vô cực', input: [Number.POSITIVE_INFINITY] },
+    { name: 'số lẻ', input: [1000.5] },
+    { name: 'chuỗi số', input: ['20000'] },
+    { name: 'null', input: [null] },
+    { name: 'một giá trị lạ lẫn giữa các giá trị hợp lệ', input: [20000, 30000, 50000] },
+  ])('ném RangeError: $name', ({ input }) => {
+    expect(() => calculateTotal(input as Denomination[])).toThrow(RangeError);
+  });
+
+  it('300 danh sách ngẫu nhiên: tổng, số tờ, thứ tự và định dạng đều khớp', () => {
+    const random = mulberry32(20241114);
+    for (let i = 0; i < 300; i++) {
+      const input = Array.from({ length: 1 + Math.floor(random() * 8) }, () => DENOMINATIONS[Math.floor(random() * DENOMINATIONS.length)] as Denomination);
+      const sum = input.reduce((acc, d) => acc + d, 0);
+      expect(calculateTotal(input)).toEqual({ count: input.length, denominations: input, total: sum, formattedTotal: formatVND(sum) });
+    }
   });
 });
 </file>
@@ -10463,6 +11512,171 @@ export interface AppConfig {
     guidanceCooldownMs: number; guidancePriority: GuidanceCode[];
   };
   speech: { dedupeWindowMs: number; minGapMs: number; guidanceStaleMs: number; maxUtteranceMs: number };
+}
+</file>
+
+<file path="src/decision/decision-engine.ts">
+// STUB P07 (lượt 1/2) — nhánh ANALYSIS chưa cài; lượt 2 sẽ ghi đè file này.
+import type {
+  AppConfig, AppErrorCode, DecisionInput, DecisionOutput, GuidanceCode, IDecisionEngine,
+  RecognitionResult, SpeechIntent, SystemEvent,
+} from '../contracts';
+import { INITIAL_SNAPSHOT, phaseOf, transition } from './state-manager';
+import type { StateTrigger, TransitionResult } from './state-manager';
+
+/** Bộ nhớ ngắn hạn của việc quét (nhánh ANALYSIS dùng ở lượt 2). Xóa khi APP_FOREGROUNDED và reset(). */
+interface ShortTermMemory {
+  /** Chữ ký (mệnh giá từ trái sang phải) của kết quả đã công bố; null = chưa có hoặc tiền đã rời khung. */
+  announcedSignature: string | null;
+  /** `now` của khung đầu chuỗi khung trống hiện tại; null = đang không trống. */
+  emptySince: number | null;
+  /** `now` của khung đầu chuỗi khung chưa ổn định hiện tại; null = đang ổn định. */
+  unstableSince: number | null;
+  /** `now` lần cuối phát mỗi mã guidance (cooldown tính riêng theo từng mã). */
+  guidanceAt: Partial<Record<GuidanceCode, number>>;
+}
+
+const freshMemory = (): ShortTermMemory => ({ announcedSignature: null, emptySince: null, unstableSince: null, guidanceAt: {} });
+
+/** Sao chép để module khác không sửa nhầm bản engine giữ: đọc lại phải y hệt lần đã đọc. */
+const cloneResult = (r: RecognitionResult): RecognitionResult => ({ ...r, denominations: [...r.denominations] });
+
+/** Lời nói khi VÀO một trạng thái khởi động mới; null nếu trạng thái không đổi hoặc không có lời. */
+function entrySpeech(t: TransitionResult): SpeechIntent | null {
+  if (t.from === t.to) return null;
+  if (t.to === 'AWAITING_START') return { kind: 'WELCOME' };
+  if (t.to === 'WAITING_PERMISSION') return { kind: 'PERMISSION_PRIMER' };
+  if (t.to === 'READY') return { kind: 'CAMERA_READY' };
+  return null;
+}
+
+/**
+ * DecisionEngine (Module 6). XÁC ĐỊNH: cùng chuỗi đầu vào cho cùng chuỗi đầu ra; không đồng hồ, không DOM,
+ * không I/O; thời gian chỉ đến từ trường `now` của đầu vào.
+ *
+ * Mã lý do (`reasons`): SYSTEM hợp lệ = [tên sự kiện, ...BOTH_READY | WAIT_CAMERA | WAIT_MODEL | MEMORY_CLEARED];
+ * trái phép = ['ILLEGAL_TRANSITION', 'SỰ_KIỆN@TRẠNG_THÁI']; FAILURE = ['FAILURE', mã lỗi, ...DUPLICATE];
+ * USER_REPLAY = ['USER_REPLAY', 'HAS_RESULT' | 'NO_RESULT']; ANALYSIS bị bỏ qua =
+ * ['ANALYSIS_IGNORED', 'ERROR_STATE' | 'NOT_READY' | 'BACKGROUNDED'].
+ *
+ * ERROR là trạng thái cuối: mọi FAILURE dẫn tới đó; thoát bằng reset() rồi APP_STARTED.
+ * Lượt 1 chỉ cài vòng đời: mọi đầu ra đều có result = null và shouldCalculateTotal = false.
+ */
+export function createDecisionEngine(config: AppConfig['decision']): IDecisionEngine {
+  // `config` dùng ở lượt 2: mọi ngưỡng của nhánh ANALYSIS lấy từ đây.
+  let snapshot = INITIAL_SNAPSHOT;
+  let lastResult: RecognitionResult | null = null;
+  let memory = freshMemory();
+  let errorCode: AppErrorCode | null = null;
+
+  function apply(trigger: StateTrigger): TransitionResult {
+    const t = transition(snapshot, trigger);
+    snapshot = t.snapshot;
+    return t;
+  }
+
+  /** Đầu ra không công bố kết quả: status null, result null, shouldCalculateTotal false. */
+  function outputOf(reasons: string[], speech: SpeechIntent | null = null): DecisionOutput {
+    return { state: snapshot.state, status: null, reasons, speech, result: null, shouldCalculateTotal: false };
+  }
+
+  function systemReasons(event: SystemEvent, t: TransitionResult): string[] {
+    const reasons: string[] = [event];
+    if (t.to === 'READY' && t.from !== 'READY') {
+      reasons.push('BOTH_READY');
+    } else if ((event === 'MODEL_READY' || event === 'CAMERA_READY') && phaseOf(t.to) === 'STARTUP') {
+      if (!snapshot.cameraReady) reasons.push('WAIT_CAMERA');
+      if (!snapshot.modelReady) reasons.push('WAIT_MODEL');
+    }
+    if (event === 'APP_FOREGROUNDED') reasons.push('MEMORY_CLEARED');
+    return reasons;
+  }
+
+  function onSystem(event: SystemEvent): DecisionOutput {
+    const t = apply(event);
+    if (!t.accepted) return outputOf([...t.reasons]);
+    if (event === 'APP_FOREGROUNDED') memory = freshMemory();
+    return outputOf(systemReasons(event, t), entrySpeech(t));
+  }
+
+  function onFailure(code: AppErrorCode): DecisionOutput {
+    apply('FAILURE'); // hợp lệ ở mọi trạng thái: ưu tiên cao nhất
+    if (errorCode === code) return outputOf(['FAILURE', code, 'DUPLICATE']);
+    errorCode = code;
+    return outputOf(['FAILURE', code], { kind: 'ERROR', code });
+  }
+
+  function onReplay(): DecisionOutput {
+    if (lastResult === null) return outputOf(['USER_REPLAY', 'NO_RESULT'], { kind: 'REPLAY_EMPTY' });
+    return outputOf(['USER_REPLAY', 'HAS_RESULT'], { kind: 'REPLAY', result: cloneResult(lastResult) });
+  }
+
+  function onAnalysis(): DecisionOutput {
+    const phase = phaseOf(snapshot.state);
+    if (phase === 'ERROR') return outputOf(['ANALYSIS_IGNORED', 'ERROR_STATE']);
+    if (phase === 'STARTUP') return outputOf(['ANALYSIS_IGNORED', 'NOT_READY']);
+    if (snapshot.backgrounded) return outputOf(['ANALYSIS_IGNORED', 'BACKGROUNDED']);
+    // Lượt 2: cổng SPEAKING và nhánh 1..7. Lượt 1 chưa công bố gì nên không bao giờ đọc nhầm.
+    return outputOf(['ANALYSIS_NOT_IMPLEMENTED']);
+  }
+
+  return {
+    get state() {
+      return snapshot.state;
+    },
+    get lastResult() {
+      return lastResult === null ? null : cloneResult(lastResult);
+    },
+    handle(input: DecisionInput): DecisionOutput {
+      switch (input.type) {
+        case 'FAILURE': return onFailure(input.code);
+        case 'SYSTEM': return onSystem(input.event);
+        case 'USER_REPLAY': return onReplay();
+        case 'ANALYSIS': return onAnalysis();
+        default: return outputOf(['UNKNOWN_INPUT']);
+      }
+    },
+    reset(): void {
+      snapshot = INITIAL_SNAPSHOT;
+      lastResult = null;
+      memory = freshMemory();
+      errorCode = null;
+    },
+  };
+}
+</file>
+
+<file path="src/decision/total-calculator.ts">
+import type { Denomination } from '../contracts';
+import { formatVND, isDenomination } from '../config/denominations';
+
+/** Kết quả tính tổng một tập tờ tiền đã được xác nhận. */
+export interface TotalCalculation {
+  count: number;
+  denominations: Denomination[];
+  total: number;
+  formattedTotal: string;
+}
+
+/**
+ * Tính tổng các tờ tiền đã được xác nhận (Module 7).
+ * - `denominations` trả về là BẢN SAO, giữ nguyên thứ tự đầu vào (trái → phải); không sửa mảng đầu vào.
+ * - Danh sách rỗng hoặc có giá trị ngoài 9 mệnh giá hợp lệ thì ném RangeError:
+ *   thà dừng còn hơn đọc sai số tiền (Fail Safe).
+ * - CHỈ DecisionEngine được gọi hàm này, và chỉ ở nhánh công bố kết quả.
+ */
+export function calculateTotal(d: Denomination[]): TotalCalculation {
+  if (d.length === 0) {
+    throw new RangeError('calculateTotal: danh sách mệnh giá rỗng');
+  }
+  let total = 0;
+  for (const value of d) {
+    if (!isDenomination(value)) {
+      throw new RangeError(`calculateTotal: giá trị ngoài danh sách mệnh giá (${String(value)})`);
+    }
+    total += value;
+  }
+  return { count: d.length, denominations: [...d], total, formattedTotal: formatVND(total) };
 }
 </file>
 

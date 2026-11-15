@@ -95,6 +95,7 @@ src/
     index.ts
   decision/
     decision-engine.ts
+    state-manager.ts
     total-calculator.ts
   dev/
     golden-check.ts
@@ -145,6 +146,11 @@ tests/
     frame-capture.test.ts
   config/
     denominations.test.ts
+  decision/
+    decision-engine.lifecycle.test.ts
+    source-rules.test.ts
+    state-manager.test.ts
+    total-calculator.test.ts
   fakes/
     factories.ts
     fake-camera.ts
@@ -189,825 +195,647 @@ vite.config.ts
 <files>
 This section contains the contents of the repository's files.
 
-<file path="src/analyzer/temporal-stabilizer.ts">
-import type { AppConfig, BBox, Denomination, Detection, FrameAnalysis } from '../contracts';
-import { iou } from '../utils/geometry';
-import { mean } from '../utils/math';
+<file path="src/decision/state-manager.ts">
+import type { AppState, SystemEvent } from '../contracts';
 
-/** Cấu hình bộ ổn định, lấy từ config.analyzer.stabilizer. */
-export type StabilizerConfig = AppConfig['analyzer']['stabilizer'];
+/** Nguyên nhân chuyển trạng thái đến từ kết quả phân tích khung hình (nhánh ANALYSIS dùng ở lượt 2). */
+export type AnalysisTrigger =
+  | 'NO_MONEY_SEEN'      // khung không có tiền → NO_CANDIDATE
+  | 'UNCERTAIN_SEEN'     // chưa chắc, xung đột hoặc bị chặn → UNCERTAIN
+  | 'OVERLAP_SEEN'       // chồng lấn → OVERLAPPING
+  | 'UNSTABLE_SEEN'      // chắc nhưng chưa ổn định → STABILIZING
+  | 'STEADY_SEEN'        // ổn định, đã công bố, không có gì mới → DETECTING
+  | 'RESULT_PUBLISHED';  // công bố kết quả mới → SPEAKING
 
-/** Kết luận ổn định của một khung, đúng kiểu FrameAnalysis['stability']. */
-export type StabilityInfo = FrameAnalysis['stability'];
+/** Mọi nguyên nhân có thể làm đổi trạng thái. */
+export type StateTrigger = SystemEvent | 'FAILURE' | AnalysisTrigger;
 
-/** Phần tối thiểu của một hộp để ghép giữa hai khung: mệnh giá và vị trí (pixel, khung gốc). */
-export type MatchableBox = Pick<Detection, 'denomination' | 'bbox'>;
+/** Giai đoạn: khởi động, đang quét, đang đọc kết quả, lỗi. */
+export type Phase = 'STARTUP' | 'SCANNING' | 'SPEAKING' | 'ERROR';
 
-/** Một khung hình đưa vào bộ ổn định. */
-export interface StabilizerFrame {
-  /** Mốc thời gian chụp khung, mili-giây (FrameMeta.timestamp, cùng hệ quy chiếu performance.now()). */
-  timestamp: number;
-  /** Khung có hợp lệ để xét ổn định không (xem isFrameValid). */
-  valid: boolean;
-  /** Các detection CHẮC của khung, theo thứ tự trái → phải. */
-  sure: readonly Detection[];
+/** Ảnh chụp bất biến của máy. Hai cờ model/camera được ghi ở mọi trạng thái khởi động để không mất sự kiện đến sớm. */
+export interface MachineSnapshot {
+  readonly state: AppState;
+  readonly modelReady: boolean;
+  readonly cameraReady: boolean;
+  readonly backgrounded: boolean;
 }
 
-/** Bộ ổn định theo thời gian (Detection Tracker): giữ cửa sổ các khung gần nhất. */
-export interface TemporalStabilizer {
-  /** Ghi một khung mới vào cửa sổ rồi trả kết luận ổn định cho CHÍNH khung đó. */
-  push(frame: StabilizerFrame): StabilityInfo;
-  /** Xóa toàn bộ cửa sổ. */
-  reset(): void;
+export interface TransitionResult {
+  /** false = chuyển trái phép, bị bỏ qua. */
+  readonly accepted: boolean;
+  readonly from: AppState;
+  /** Bằng `from` khi bị bỏ qua hoặc không đổi. */
+  readonly to: AppState;
+  /** Ảnh chụp SAU khi áp dụng (chính ảnh đầu vào khi bị bỏ qua). */
+  readonly snapshot: MachineSnapshot;
+  /** [] khi hợp lệ; ['ILLEGAL_TRANSITION', 'NGUYÊN_NHÂN@TRẠNG_THÁI'] khi bị bỏ qua. */
+  readonly reasons: readonly string[];
 }
 
-/** Bản chụp một hộp chắc của khung cũ: tách khỏi đối tượng của người gọi để họ sửa sau này cũng không làm hỏng cửa sổ. */
-interface TrackedBox {
-  readonly denomination: Denomination;
-  readonly confidence: number;
-  readonly bbox: BBox;
+export const INITIAL_SNAPSHOT: MachineSnapshot = Object.freeze({
+  state: 'INITIALIZING',
+  modelReady: false,
+  cameraReady: false,
+  backgrounded: false,
+});
+
+type Row = Readonly<Partial<Record<StateTrigger, AppState>>>;
+
+/** Hàng chung của mọi trạng thái đang quét; trở lại từ nền thì về DETECTING. */
+function scanningRow(self: AppState): Row {
+  return {
+    NO_MONEY_SEEN: 'NO_CANDIDATE', UNCERTAIN_SEEN: 'UNCERTAIN', OVERLAP_SEEN: 'OVERLAPPING',
+    UNSTABLE_SEEN: 'STABILIZING', STEADY_SEEN: 'DETECTING', RESULT_PUBLISHED: 'SPEAKING',
+    MODEL_READY: self, CAMERA_READY: self, APP_BACKGROUNDED: self, APP_FOREGROUNDED: 'DETECTING', FAILURE: 'ERROR',
+  };
 }
 
-interface Entry {
-  readonly timestamp: number;
-  readonly valid: boolean;
-  readonly boxes: readonly TrackedBox[];
-}
-
-interface Agreeing {
-  readonly boxes: readonly TrackedBox[];
-  /** matchOf[i] = chỉ số trong `boxes` được ghép với hộp thứ i của khung mới nhất. */
-  readonly matchOf: readonly number[];
-}
-
-/**
- * Khung HỢP LỆ để xét ổn định khi: có ít nhất một tờ chắc, KHÔNG có tờ chưa chắc,
- * không chồng lấn và không xung đột lớp. Vị trí (quá nhỏ, chạm mép) và chất lượng ảnh (mờ, tối)
- * không nằm trong điều kiện này: việc chặn theo chúng thuộc về bộ ra quyết định.
- */
-export function isFrameValid(f: Pick<FrameAnalysis, 'sure' | 'unsure' | 'overlap' | 'conflict'>): boolean {
-  return f.sure.length > 0 && f.unsure.length === 0 && !f.overlap.detected && !f.conflict.detected;
-}
-
-/**
- * Ghép hộp của hai khung: mỗi hộp của `a` phải ghép được với ĐÚNG MỘT hộp của `b` (và ngược lại),
- * cùng mệnh giá và IoU ≥ matchIou, ghép tham lam theo IoU giảm dần (hòa thì theo chỉ số nhỏ trước).
- * Ghép đủ cặp kéo theo cùng số tờ và cùng đa tập mệnh giá nên không cần kiểm riêng.
- * Hộp suy biến có IoU 0 nên không bao giờ ghép được.
- *
- * @param a Hộp của khung thứ nhất, pixel khung gốc.
- * @param b Hộp của khung thứ hai, pixel khung gốc.
- * @param matchIou Ngưỡng IoU, không đơn vị trong (0, 1] (config.analyzer.stabilizer.matchIou).
- * @returns matchOf với matchOf[i] = chỉ số hộp của `b` ghép với a[i]; null nếu hai khung không đồng thuận.
- */
-export function matchDetections(
-  a: readonly MatchableBox[],
-  b: readonly MatchableBox[],
-  matchIou: number,
-): number[] | null {
-  if (a.length !== b.length) return null;
-
-  const candidates: Array<{ i: number; j: number; iou: number }> = [];
-  for (let i = 0; i < a.length; i++) {
-    const left = a[i];
-    if (left === undefined) continue;
-    for (let j = 0; j < b.length; j++) {
-      const right = b[j];
-      if (right === undefined || left.denomination !== right.denomination) continue;
-      const overlap = iou(left.bbox, right.bbox);
-      if (overlap >= matchIou) candidates.push({ i, j, iou: overlap });
-    }
-  }
-  candidates.sort((p, q) => q.iou - p.iou || p.i - q.i || p.j - q.j);
-
-  const matchOf: number[] = new Array<number>(a.length).fill(-1);
-  const taken: boolean[] = new Array<boolean>(b.length).fill(false);
-  let matched = 0;
-  for (const c of candidates) {
-    if (matchOf[c.i] !== -1 || taken[c.j] === true) continue;
-    matchOf[c.i] = c.j;
-    taken[c.j] = true;
-    matched++;
-  }
-  return matched === a.length ? matchOf : null;
-}
-
-function assertValidConfig(c: StabilizerConfig): void {
-  if (!Number.isInteger(c.windowSize) || c.windowSize < 1) {
-    throw new RangeError(`stabilizer.windowSize phải là số nguyên ≥ 1, nhận ${c.windowSize}`);
-  }
-  if (!Number.isInteger(c.minAgree) || c.minAgree < 1 || c.minAgree > c.windowSize) {
-    throw new RangeError(`stabilizer.minAgree phải là số nguyên trong [1, windowSize = ${c.windowSize}], nhận ${c.minAgree}`);
-  }
-  if (!(c.matchIou > 0 && c.matchIou <= 1)) {
-    throw new RangeError(`stabilizer.matchIou phải thuộc (0, 1], nhận ${c.matchIou}`);
-  }
-  if (!(c.maxAgeMs >= 0)) {
-    throw new RangeError(`stabilizer.maxAgeMs phải ≥ 0 (mili-giây), nhận ${c.maxAgeMs}`);
-  }
-}
-
-function snapshotBox(d: Detection): TrackedBox {
-  return { denomination: d.denomination, confidence: d.confidence, bbox: { ...d.bbox } };
-}
-
-function toEntry(frame: StabilizerFrame): Entry {
-  // Khung tự khai "hợp lệ" nhưng không có hộp chắc nào thì không thể làm bằng chứng ổn định.
-  const valid = frame.valid && frame.sure.length > 0;
-  return { timestamp: frame.timestamp, valid, boxes: valid ? frame.sure.map(snapshotBox) : [] };
-}
-
-/** Detection của khung mới nhất, confidence = trung bình confidence của hộp được ghép ở mọi khung đồng thuận (kể cả chính nó). */
-function buildConsensus(latest: readonly Detection[], agreeing: readonly Agreeing[]): Detection[] {
-  return latest.map((d, i) => {
-    const confidences = [d.confidence];
-    for (const a of agreeing) {
-      const j = a.matchOf[i];
-      const other = j === undefined ? undefined : a.boxes[j];
-      if (other !== undefined) confidences.push(other.confidence);
-    }
-    return { ...d, bbox: { ...d.bbox }, confidence: mean(confidences) };
-  });
+/** Hàng của trạng thái khởi động: ghi cờ và nền/trở lại giữ nguyên; `own` thêm hoặc đè các cạnh riêng. */
+function startupRow(self: AppState, own: Row): Row {
+  return { MODEL_READY: self, CAMERA_READY: self, APP_BACKGROUNDED: self, APP_FOREGROUNDED: self, FAILURE: 'ERROR', ...own };
 }
 
 /**
- * Tạo bộ ổn định theo thời gian.
- *
- * Cửa sổ giữ tối đa windowSize khung gần nhất (kể cả khung không hợp lệ). Mỗi lần push:
- * 1. Bỏ các mục cũ hơn maxAgeMs (mili-giây) so với mốc thời gian của khung hiện tại; mục có mốc SAU khung hiện tại
- *    (đồng hồ lùi) hoặc mốc không xác định (NaN) cũng bị bỏ, để bằng chứng cũ không sống sót qua một lần lùi đồng hồ.
- * 2. Thêm khung hiện tại rồi cắt còn windowSize mục mới nhất.
- * 3. Kết luận (Fail Safe): stable chỉ có thể true khi CHÍNH khung hiện tại hợp lệ. Khi đó
- *    agree = 1 + số khung hợp lệ khác trong cửa sổ ĐỒNG THUẬN với khung hiện tại (xem matchDetections);
- *    stable = agree ≥ minAgree. Khung hiện tại không hợp lệ cho stable false, agree 0.
- * 4. consensus chỉ khác null khi stable: các Detection (bản sao) của khung hiện tại, trái → phải,
- *    với confidence là trung bình mọi khung đồng thuận.
- * `window` trong kết quả luôn bằng windowSize (sức chứa), không phải số mục đang có.
- *
- * Bộ ổn định chụp lại dữ liệu hộp khi push nên người gọi sửa Detection sau đó không ảnh hưởng cửa sổ.
- * Ném RangeError nếu cấu hình không hợp lệ (windowSize, minAgree nguyên và 1 ≤ minAgree ≤ windowSize; 0 < matchIou ≤ 1; maxAgeMs ≥ 0).
- *
- * @param config config.analyzer.stabilizer: windowSize (khung), minAgree (khung), matchIou (không đơn vị), maxAgeMs (mili-giây).
+ * Bảng chuyển: TRANSITIONS[trạng thái hiện tại][nguyên nhân] = trạng thái kế tiếp; ô vắng = trái phép.
+ * RESULT_READY là trạng thái dành riêng: engine công bố kết quả đi thẳng sang SPEAKING nên không dừng ở đó.
+ * Hai quy tắc phụ nằm trong `transition`.
  */
-export function createTemporalStabilizer(config: StabilizerConfig): TemporalStabilizer {
-  assertValidConfig(config);
-  const { windowSize, minAgree, matchIou, maxAgeMs } = config;
-  let entries: Entry[] = [];
+export const TRANSITIONS: Readonly<Record<AppState, Row>> = {
+  INITIALIZING: startupRow('INITIALIZING', { APP_STARTED: 'AWAITING_START' }),
+  AWAITING_START: startupRow('AWAITING_START', { GESTURE_UNLOCKED: 'LOADING_MODEL' }),
+  LOADING_MODEL: startupRow('LOADING_MODEL', { PERMISSION_REQUESTED: 'WAITING_PERMISSION' }),
+  WAITING_PERMISSION: startupRow('WAITING_PERMISSION', { CAMERA_READY: 'LOADING_MODEL' }),
+  READY: scanningRow('READY'),
+  NO_CANDIDATE: scanningRow('NO_CANDIDATE'),
+  DETECTING: scanningRow('DETECTING'),
+  UNCERTAIN: scanningRow('UNCERTAIN'),
+  OVERLAPPING: scanningRow('OVERLAPPING'),
+  STABILIZING: scanningRow('STABILIZING'),
+  RESULT_READY: scanningRow('RESULT_READY'),
+  SPEAKING: {
+    RESULT_SPEECH_ENDED: 'DETECTING', MODEL_READY: 'SPEAKING', CAMERA_READY: 'SPEAKING',
+    APP_BACKGROUNDED: 'SPEAKING', APP_FOREGROUNDED: 'DETECTING', FAILURE: 'ERROR',
+  },
+  ERROR: { APP_BACKGROUNDED: 'ERROR', APP_FOREGROUNDED: 'ERROR', FAILURE: 'ERROR' },
+};
 
-  function push(frame: StabilizerFrame): StabilityInfo {
-    const now = frame.timestamp;
-    const fresh = entries.filter((e) => {
-      const age = now - e.timestamp;
-      return age >= 0 && age <= maxAgeMs;
-    });
-    const latest = toEntry(frame);
-    entries = [...fresh, latest].slice(-windowSize);
+/** Giai đoạn của một trạng thái, suy ra từ bảng: trạng thái nhận kết quả phân tích là đang quét. */
+export function phaseOf(state: AppState): Phase {
+  if (state === 'ERROR' || state === 'SPEAKING') return state;
+  return TRANSITIONS[state].STEADY_SEEN === undefined ? 'STARTUP' : 'SCANNING';
+}
 
-    if (!latest.valid) return { stable: false, agree: 0, window: windowSize, consensus: null };
-
-    const agreeing: Agreeing[] = [];
-    for (const e of entries) {
-      if (e === latest || !e.valid) continue;
-      const matchOf = matchDetections(latest.boxes, e.boxes, matchIou);
-      if (matchOf !== null) agreeing.push({ boxes: e.boxes, matchOf });
-    }
-    const agree = 1 + agreeing.length;
-    if (agree < minAgree) return { stable: false, agree, window: windowSize, consensus: null };
-    return { stable: true, agree, window: windowSize, consensus: buildConsensus(frame.sure, agreeing) };
+/**
+ * Áp dụng một nguyên nhân lên ảnh chụp hiện tại (hàm thuần, không sửa đầu vào). Ngoài bảng có hai quy tắc:
+ * 1. PERMISSION_REQUESTED bị bỏ qua khi camera đã sẵn sàng (quyền đã xong, không xin lại).
+ * 2. Nếu đích là LOADING_MODEL hoặc WAITING_PERMISSION mà đã đủ MODEL_READY và CAMERA_READY thì đích là READY.
+ *    Cờ được ghi từ mọi trạng thái khởi động, nhưng READY chỉ đạt được sau GESTURE_UNLOCKED
+ *    (chưa có thao tác chạm thì chưa nói được).
+ */
+export function transition(current: MachineSnapshot, trigger: StateTrigger): TransitionResult {
+  const target = TRANSITIONS[current.state][trigger];
+  if (target === undefined || (trigger === 'PERMISSION_REQUESTED' && current.cameraReady)) {
+    return {
+      accepted: false,
+      from: current.state,
+      to: current.state,
+      snapshot: current,
+      reasons: ['ILLEGAL_TRANSITION', `${trigger}@${current.state}`],
+    };
   }
-
-  function reset(): void {
-    entries = [];
-  }
-
-  return { push, reset };
+  const modelReady = current.modelReady || trigger === 'MODEL_READY';
+  const cameraReady = current.cameraReady || trigger === 'CAMERA_READY';
+  const backgrounded = trigger === 'APP_BACKGROUNDED' ? true : trigger === 'APP_FOREGROUNDED' ? false : current.backgrounded;
+  const waiting = target === 'LOADING_MODEL' || target === 'WAITING_PERMISSION';
+  const to: AppState = waiting && modelReady && cameraReady ? 'READY' : target;
+  return { accepted: true, from: current.state, to, snapshot: { state: to, modelReady, cameraReady, backgrounded }, reasons: [] };
 }
 </file>
 
-<file path="tests/analyzer/frame-analyzer.test.ts">
-import { describe, expect, it } from 'vitest';
-import { createFrameAnalyzer } from '../../src/analyzer/frame-analyzer';
+<file path="tests/decision/decision-engine.lifecycle.test.ts">
+// Lượt 1: vòng đời (khởi động, FAILURE, USER_REPLAY, nền/trở lại, cổng chặn ANALYSIS).
+// Ca USER_REPLAY CÓ kết quả và các nhánh ANALYSIS 1..7 được kiểm ở lượt 2 (cần engine sinh được kết quả).
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_CONFIG } from '../../src/config/app-config';
-import type { AppConfig, BBox, Denomination, Detection, FrameAnalysis, GrayImage, IFrameAnalyzer, InferenceResult } from '../../src/contracts';
-import { makeDetection, makeFrameMeta, makeGray, makeInferenceResult } from '../fakes';
+import type { AppErrorCode, AppState, DecisionInput, DecisionOutput, IDecisionEngine, SpeechIntent, SystemEvent } from '../../src/contracts';
+import { createDecisionEngine } from '../../src/decision/decision-engine';
+import { TRANSITIONS } from '../../src/decision/state-manager';
+import { mulberry32 } from '../../src/utils/math';
+import { makeAnalysis } from '../fakes/factories';
 
-const FRAME_STEP_MS = 333;
-const box = (x1: number, y1: number, x2: number, y2: number): BBox => ({ x1, y1, x2, y2 });
-/** Hộp 300 × 200 giữa khung 640 × 480: đủ lớn, không chạm mép. */
-const CENTER = box(100, 100, 400, 300);
-const LEFT = box(20, 100, 180, 300);
-const RIGHT = box(300, 100, 460, 300);
+const sys = (event: SystemEvent, now = 0): DecisionInput => ({ type: 'SYSTEM', event, now });
+const fail = (code: AppErrorCode, now = 0): DecisionInput => ({ type: 'FAILURE', code, now });
+const replay = (now = 0): DecisionInput => ({ type: 'USER_REPLAY', now });
+const analyze = (now = 0): DecisionInput => ({ type: 'ANALYSIS', analysis: makeAnalysis(), now });
+const newEngine = (): IDecisionEngine => createDecisionEngine(DEFAULT_CONFIG.decision);
 
-const det = (frameId: number, index: number, denomination: Denomination, confidence: number, bbox: BBox): Detection =>
-  makeDetection({ id: `${frameId}-${index}`, frameId, denomination, confidence, bbox: { ...bbox } });
+type Startup = 'INITIALIZING' | 'AWAITING_START' | 'LOADING_MODEL' | 'WAITING_PERMISSION' | 'READY';
+/** Chuỗi sự kiện đưa engine mới tới từng trạng thái khởi động. */
+const PATH: Record<Startup, SystemEvent[]> = {
+  INITIALIZING: [],
+  AWAITING_START: ['APP_STARTED'],
+  LOADING_MODEL: ['APP_STARTED', 'GESTURE_UNLOCKED'],
+  WAITING_PERMISSION: ['APP_STARTED', 'GESTURE_UNLOCKED', 'PERMISSION_REQUESTED'],
+  READY: ['APP_STARTED', 'GESTURE_UNLOCKED', 'PERMISSION_REQUESTED', 'MODEL_READY', 'CAMERA_READY'],
+};
+const STARTUP = Object.keys(PATH) as Startup[];
+const SYSTEM_EVENTS: SystemEvent[] = [
+  'APP_STARTED', 'GESTURE_UNLOCKED', 'PERMISSION_REQUESTED', 'MODEL_READY', 'CAMERA_READY',
+  'RESULT_SPEECH_ENDED', 'APP_BACKGROUNDED', 'APP_FOREGROUNDED',
+];
+const ERROR_CODES: AppErrorCode[] = [
+  'UNSUPPORTED_BROWSER', 'CAMERA_PERMISSION_DENIED', 'CAMERA_NOT_FOUND', 'CAMERA_IN_USE', 'CAMERA_FAILED',
+  'MODEL_MISSING', 'MODEL_CORRUPT', 'MODEL_INIT_FAILED', 'INFERENCE_FAILED',
+  'TTS_UNAVAILABLE', 'TTS_NO_VIETNAMESE_VOICE', 'STORAGE_FAILED', 'OFFLINE_NOT_READY',
+];
 
-/** Kết quả suy luận của khung thứ `frameId` (1, 2, ...), mốc thời gian cách nhau FRAME_STEP_MS. */
-const result = (frameId: number, detections: Detection[], gray: GrayImage = makeGray(), timestamp = (frameId - 1) * FRAME_STEP_MS): InferenceResult =>
-  makeInferenceResult({ meta: makeFrameMeta({ frameId, timestamp }), detections, gray });
-
-/** Khung có một tờ chắc ở giữa với độ tin cậy cho trước. */
-const singleFrame = (frameId: number, confidence = 0.9, denomination: Denomination = 20000): InferenceResult =>
-  result(frameId, [det(frameId, 0, denomination, confidence, CENTER)]);
-
-/** Ảnh xám bàn cờ đen trắng: rất nét, độ sáng trung bình 127,5. */
-function checkerGray(width: number, height: number, cell: number): GrayImage {
-  const data = new Uint8Array(width * height);
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) data[y * width + x] = (Math.floor(x / cell) + Math.floor(y / cell)) % 2 === 0 ? 0 : 255;
-  }
-  return { data, width, height };
+function drive(events: SystemEvent[]): IDecisionEngine {
+  const engine = newEngine();
+  for (const event of events) engine.handle(sys(event));
+  return engine;
 }
 
-interface ConfigPatch { inference?: Partial<AppConfig['inference']>; analyzer?: Partial<AppConfig['analyzer']> }
-const withConfig = (patch: ConfigPatch): AppConfig => ({
-  ...DEFAULT_CONFIG,
-  inference: { ...DEFAULT_CONFIG.inference, ...patch.inference },
-  analyzer: { ...DEFAULT_CONFIG.analyzer, ...patch.analyzer },
-});
-
-const run = (analyzer: IFrameAnalyzer, inputs: InferenceResult[]): FrameAnalysis[] => inputs.map((i) => analyzer.analyze(i));
-const lastOf = <T>(xs: readonly T[]): T | undefined => xs[xs.length - 1];
-
-function deepFreeze<T>(value: T): T {
-  if (typeof value === 'object' && value !== null && !ArrayBuffer.isView(value)) {
-    Object.values(value as Record<string, unknown>).forEach(deepFreeze);
-    Object.freeze(value);
-  }
-  return value;
+/** Đầu ra không công bố kết quả: result null và không được tính tổng. */
+function expectNoResult(out: DecisionOutput): void {
+  expect(out.result).toBeNull();
+  expect(out.shouldCalculateTotal).toBe(false);
 }
 
-describe('createFrameAnalyzer · lắp FrameAnalysis', () => {
-  it('lắp đủ mọi trường cho một khung có một tờ chắc', () => {
-    const d = det(1, 0, 20000, 0.95, CENTER);
-    const input = result(1, [d]);
-    expect(createFrameAnalyzer(DEFAULT_CONFIG).analyze(input)).toEqual<FrameAnalysis>({
-      meta: input.meta,
-      detections: [d],
-      sure: [d],
-      unsure: [],
-      overlap: { detected: false, maxRatio: 0, pairs: [] },
-      conflict: { detected: false, pairs: [] },
-      position: { tooSmall: false, partial: false },
-      quality: { blurScore: 0, blurry: true, brightness: 128, lowLight: false },
-      stability: { stable: false, agree: 1, window: 5, consensus: null },
-      emptyStreak: 0,
-    });
+describe('khởi động theo sự kiện hệ thống', () => {
+  it('ban đầu ở INITIALIZING và chưa có kết quả', () => {
+    const engine = newEngine();
+    expect(engine.state).toBe('INITIALIZING');
+    expect(engine.lastResult).toBeNull();
   });
 
-  it('khung không có tiền: các danh sách rỗng, vẫn đo chất lượng ảnh', () => {
-    const analysis = createFrameAnalyzer(DEFAULT_CONFIG).analyze(result(1, []));
-    expect(analysis).toMatchObject({
-      detections: [],
-      sure: [],
-      unsure: [],
-      overlap: { detected: false },
-      conflict: { detected: false },
-      position: { tooSmall: false, partial: false },
-      quality: { brightness: 128, lowLight: false },
-      stability: { stable: false, agree: 0, window: 5, consensus: null },
-      emptyStreak: 1,
-    });
+  it('đi đúng chuỗi trạng thái, lời nói và mã lý do', () => {
+    const steps: Array<{ event: SystemEvent; state: AppState; speech: SpeechIntent['kind'] | null; reasons: string[] }> = [
+      { event: 'APP_STARTED', state: 'AWAITING_START', speech: 'WELCOME', reasons: ['APP_STARTED'] },
+      { event: 'GESTURE_UNLOCKED', state: 'LOADING_MODEL', speech: null, reasons: ['GESTURE_UNLOCKED'] },
+      { event: 'PERMISSION_REQUESTED', state: 'WAITING_PERMISSION', speech: 'PERMISSION_PRIMER', reasons: ['PERMISSION_REQUESTED'] },
+      { event: 'MODEL_READY', state: 'WAITING_PERMISSION', speech: null, reasons: ['MODEL_READY', 'WAIT_CAMERA'] },
+      { event: 'CAMERA_READY', state: 'READY', speech: 'CAMERA_READY', reasons: ['CAMERA_READY', 'BOTH_READY'] },
+    ];
+    const engine = newEngine();
+    for (const step of steps) {
+      const out = engine.handle(sys(step.event));
+      expect([out.state, out.speech?.kind ?? null, out.reasons], step.event).toEqual([step.state, step.speech, step.reasons]);
+      expect(engine.state, step.event).toBe(step.state);
+      expect(out.status, step.event).toBeNull();
+      expectNoResult(out);
+    }
   });
 
-  it('tách sure, unsure và loại detection dưới confLow', () => {
-    const analysis = createFrameAnalyzer(DEFAULT_CONFIG).analyze(
-      result(1, [det(1, 0, 20000, 0.9, LEFT), det(1, 1, 50000, 0.5, RIGHT), det(1, 2, 10000, 0.1, box(500, 100, 620, 300))]),
-    );
-    expect(analysis.sure.map((d) => d.id)).toEqual(['1-0']);
-    expect(analysis.unsure.map((d) => d.id)).toEqual(['1-1']);
-    expect(analysis.detections.map((d) => d.id)).toEqual(['1-0', '1-1']);
+  it('camera xong trước model: chờ model rồi mới READY', () => {
+    const engine = drive(PATH.WAITING_PERMISSION);
+    const camera = engine.handle(sys('CAMERA_READY'));
+    expect([camera.state, camera.speech, camera.reasons]).toEqual(['LOADING_MODEL', null, ['CAMERA_READY', 'WAIT_MODEL']]);
+    const model = engine.handle(sys('MODEL_READY'));
+    expect([model.state, model.speech]).toEqual(['READY', { kind: 'CAMERA_READY' }]);
   });
 
-  it('sắp detection từ trái sang phải dù đầu vào lộn xộn', () => {
-    const analysis = createFrameAnalyzer(DEFAULT_CONFIG).analyze(
-      result(1, [det(1, 0, 50000, 0.9, box(400, 100, 560, 300)), det(1, 1, 20000, 0.9, box(20, 100, 180, 300)), det(1, 2, 10000, 0.9, box(210, 100, 370, 300))]),
-    );
-    const expected = ['1-1', '1-2', '1-0'];
-    expect(analysis.detections.map((d) => d.id)).toEqual(expected);
-    expect(analysis.sure.map((d) => d.id)).toEqual(expected);
+  it('model và camera đến trước cử chỉ: chỉ READY sau GESTURE_UNLOCKED', () => {
+    const engine = drive(PATH.AWAITING_START);
+    for (const event of ['MODEL_READY', 'CAMERA_READY'] as const) {
+      const out = engine.handle(sys(event));
+      expect([out.state, out.speech]).toEqual(['AWAITING_START', null]);
+    }
+    const gesture = engine.handle(sys('GESTURE_UNLOCKED'));
+    expect([gesture.state, gesture.speech, gesture.reasons]).toEqual(['READY', { kind: 'CAMERA_READY' }, ['GESTURE_UNLOCKED', 'BOTH_READY']]);
   });
 
-  it('hòa tâm x thì xếp theo tâm y', () => {
-    const analysis = createFrameAnalyzer(DEFAULT_CONFIG).analyze(
-      result(1, [det(1, 0, 20000, 0.9, box(100, 250, 200, 350)), det(1, 1, 50000, 0.9, box(100, 50, 200, 150))]),
-    );
-    expect(analysis.detections.map((d) => d.id)).toEqual(['1-1', '1-0']);
-  });
-
-  it('meta được sao chép và các mảng kết quả là mảng mới', () => {
-    const input = result(1, [det(1, 0, 20000, 0.9, CENTER)]);
-    const analysis = createFrameAnalyzer(DEFAULT_CONFIG).analyze(input);
-    expect(analysis.meta).toEqual(input.meta);
-    expect(analysis.meta).not.toBe(input.meta);
-    expect(analysis.detections).not.toBe(input.detections);
+  it('MODEL_READY và CAMERA_READY lặp lại khi đã READY thì im lặng, không đọc lại', () => {
+    const engine = drive(PATH.READY);
+    for (const event of ['MODEL_READY', 'CAMERA_READY'] as const) {
+      const out = engine.handle(sys(event));
+      expect([out.state, out.speech, out.reasons]).toEqual(['READY', null, [event]]);
+    }
   });
 });
 
-describe('createFrameAnalyzer · chất lượng và vị trí', () => {
-  it('ảnh xám nét thì không mờ, điểm vượt ngưỡng', () => {
-    const analysis = createFrameAnalyzer(DEFAULT_CONFIG).analyze(result(1, [det(1, 0, 20000, 0.9, CENTER)], checkerGray(64, 48, 4)));
-    expect(analysis.quality.blurry).toBe(false);
-    expect(analysis.quality.blurScore).toBeGreaterThan(DEFAULT_CONFIG.analyzer.blurThreshold);
-    expect(analysis.quality.brightness).toBeCloseTo(127.5, 9);
+describe('chuyển trái phép bị bỏ qua, không ném lỗi', () => {
+  it.each<{ name: string; at: Startup; event: SystemEvent }>([
+    { name: 'GESTURE_UNLOCKED khi chưa APP_STARTED', at: 'INITIALIZING', event: 'GESTURE_UNLOCKED' },
+    { name: 'PERMISSION_REQUESTED trước cử chỉ', at: 'AWAITING_START', event: 'PERMISSION_REQUESTED' },
+    { name: 'APP_STARTED lặp lại', at: 'AWAITING_START', event: 'APP_STARTED' },
+    { name: 'PERMISSION_REQUESTED lặp lại', at: 'WAITING_PERMISSION', event: 'PERMISSION_REQUESTED' },
+    { name: 'RESULT_SPEECH_ENDED khi không đọc gì', at: 'READY', event: 'RESULT_SPEECH_ENDED' },
+  ])('$name', ({ at, event }) => {
+    const engine = drive(PATH[at]);
+    const out = engine.handle(sys(event));
+    expect([out.state, engine.state, out.speech]).toEqual([at, at, null]);
+    expect(out.reasons).toEqual(['ILLEGAL_TRANSITION', `${event}@${at}`]);
+    expectNoResult(out);
   });
 
-  it('ảnh xám tối thì lowLight', () => {
-    const analysis = createFrameAnalyzer(DEFAULT_CONFIG).analyze(result(1, [det(1, 0, 20000, 0.9, CENTER)], makeGray(64, 48, 20)));
-    expect(analysis.quality).toMatchObject({ brightness: 20, lowLight: true });
-  });
-
-  it.each([
-    { name: 'tờ sát mép trái là partial', bbox: box(0, 100, 300, 300), position: { tooSmall: false, partial: true } },
-    { name: 'tờ quá nhỏ là tooSmall', bbox: box(300, 200, 340, 230), position: { tooSmall: true, partial: false } },
-    { name: 'tờ vừa và ở giữa thì ổn', bbox: CENTER, position: { tooSmall: false, partial: false } },
-  ])('$name', ({ bbox, position }) => {
-    expect(createFrameAnalyzer(DEFAULT_CONFIG).analyze(result(1, [det(1, 0, 20000, 0.9, bbox)])).position).toEqual(position);
-  });
-
-  it('tờ chưa chắc cũng tham gia phát hiện chồng lấn với tờ chắc', () => {
-    const analysis = createFrameAnalyzer(DEFAULT_CONFIG).analyze(
-      result(1, [det(1, 0, 20000, 0.9, box(20, 100, 180, 300)), det(1, 1, 50000, 0.5, box(132, 100, 292, 300))]),
-    );
-    expect(analysis.overlap.pairs).toEqual([['1-0', '1-1']]);
-  });
-
-  it('tờ chưa chắc cùng chỗ nhưng khác mệnh giá với tờ chắc cũng báo conflict', () => {
-    const analysis = createFrameAnalyzer(DEFAULT_CONFIG).analyze(result(1, [det(1, 0, 20000, 0.9, CENTER), det(1, 1, 50000, 0.5, CENTER)]));
-    expect(analysis.conflict).toEqual({ detected: true, pairs: [['1-0', '1-1']] });
-  });
-
-  it('độ mờ đo trong vùng hộp tờ tiền chứ không phải toàn ảnh', () => {
-    // Hộp CENTER quy về ảnh xám 64 × 48 là [10, 40) × [10, 30); mảnh phẳng rộng hơn một chút, quanh nó ảnh rất nét.
-    const data = checkerGray(64, 48, 4).data.slice();
-    for (let y = 8; y < 32; y++) for (let x = 8; x < 42; x++) data[y * 64 + x] = 128;
-    const analysis = createFrameAnalyzer(DEFAULT_CONFIG).analyze(result(1, [det(1, 0, 20000, 0.9, CENTER)], { data, width: 64, height: 48 }));
-    expect(analysis.quality).toMatchObject({ blurScore: 0, blurry: true });
-  });
-
-  it('kích thước khung lấy từ meta khi xét tờ quá nhỏ', () => {
-    const d = det(1, 0, 20000, 0.9, CENTER);
-    const small = makeInferenceResult({ meta: makeFrameMeta({ width: 1600, height: 1200 }), detections: [d] });
-    expect(createFrameAnalyzer(DEFAULT_CONFIG).analyze(small).position.tooSmall).toBe(true);
-    expect(createFrameAnalyzer(DEFAULT_CONFIG).analyze(result(1, [d])).position.tooSmall).toBe(false);
-  });
-
-  it('hai tờ chồng nhau thì báo overlap, hai tờ cùng chỗ khác mệnh giá thì báo conflict', () => {
-    const analyzer = createFrameAnalyzer(DEFAULT_CONFIG);
-    const overlapping = analyzer.analyze(result(1, [det(1, 0, 20000, 0.9, box(20, 100, 180, 300)), det(1, 1, 50000, 0.9, box(132, 100, 292, 300))]));
-    expect(overlapping.overlap).toEqual({ detected: true, maxRatio: expect.closeTo(0.3, 9), pairs: [['1-0', '1-1']] });
-    const conflicting = createFrameAnalyzer(DEFAULT_CONFIG).analyze(result(1, [det(1, 0, 20000, 0.9, CENTER), det(1, 1, 50000, 0.8, CENTER)]));
-    expect(conflicting.conflict).toEqual({ detected: true, pairs: [['1-0', '1-1']] });
+  it('đầu vào hỏng (loại lạ, sự kiện lạ) không làm engine ném lỗi hay đổi trạng thái', () => {
+    const engine = drive(PATH.AWAITING_START);
+    expect(engine.handle({ type: 'NOPE', now: 0 } as unknown as DecisionInput).reasons).toEqual(['UNKNOWN_INPUT']);
+    expect(engine.handle(sys('NOPE' as SystemEvent)).reasons).toEqual(['ILLEGAL_TRANSITION', 'NOPE@AWAITING_START']);
+    expect(engine.state).toBe('AWAITING_START');
   });
 });
 
-describe('createFrameAnalyzer · ngưỡng đọc từ config (cùng đầu vào, đổi config thì kết quả đổi)', () => {
-  const overlapInput = () => result(1, [det(1, 0, 20000, 0.9, box(20, 100, 180, 300)), det(1, 1, 50000, 0.9, box(132, 100, 292, 300))]);
-  const conflictInput = () => result(1, [det(1, 0, 20000, 0.9, box(100, 100, 400, 300)), det(1, 1, 50000, 0.9, box(100, 100, 400, 220))]);
-
-  it.each([
-    { name: 'inference.confSure', patch: { inference: { confSure: 0.95 } }, input: () => singleFrame(1, 0.9), pick: (a: FrameAnalysis) => a.sure.length, byDefault: 1, patched: 0 },
-    { name: 'inference.confLow', patch: { inference: { confLow: 0.6 } }, input: () => singleFrame(1, 0.5), pick: (a: FrameAnalysis) => a.detections.length, byDefault: 1, patched: 0 },
-    { name: 'analyzer.overlapRatio', patch: { analyzer: { overlapRatio: 0.5 } }, input: overlapInput, pick: (a: FrameAnalysis) => a.overlap.detected, byDefault: true, patched: false },
-    { name: 'analyzer.conflictIou', patch: { analyzer: { conflictIou: 0.8 } }, input: conflictInput, pick: (a: FrameAnalysis) => a.conflict.detected, byDefault: true, patched: false },
-    { name: 'analyzer.minAreaRatio', patch: { analyzer: { minAreaRatio: 0.5 } }, input: () => singleFrame(1), pick: (a: FrameAnalysis) => a.position.tooSmall, byDefault: false, patched: true },
-    { name: 'analyzer.edgeMarginRatio', patch: { analyzer: { edgeMarginRatio: 0.3 } }, input: () => singleFrame(1), pick: (a: FrameAnalysis) => a.position.partial, byDefault: false, patched: true },
-    { name: 'analyzer.blurThreshold', patch: { analyzer: { blurThreshold: 1e9 } }, input: () => result(1, [det(1, 0, 20000, 0.9, CENTER)], checkerGray(64, 48, 4)), pick: (a: FrameAnalysis) => a.quality.blurry, byDefault: false, patched: true },
-    { name: 'analyzer.lowLightMean', patch: { analyzer: { lowLightMean: 200 } }, input: () => singleFrame(1), pick: (a: FrameAnalysis) => a.quality.lowLight, byDefault: false, patched: true },
-    {
-      name: 'analyzer.stabilizer.minAgree',
-      patch: { analyzer: { stabilizer: { ...DEFAULT_CONFIG.analyzer.stabilizer, minAgree: 1 } } },
-      input: () => singleFrame(1),
-      pick: (a: FrameAnalysis) => a.stability.stable,
-      byDefault: false,
-      patched: true,
-    },
-  ])('$name', ({ patch, input, pick, byDefault, patched }) => {
-    expect(pick(createFrameAnalyzer(DEFAULT_CONFIG).analyze(input()))).toBe(byDefault);
-    expect(pick(createFrameAnalyzer(withConfig(patch)).analyze(input()))).toBe(patched);
+describe('FAILURE: ưu tiên cao nhất', () => {
+  it.each(STARTUP)('từ %s → ERROR kèm lời báo lỗi', (from) => {
+    const engine = drive(PATH[from]);
+    const out = engine.handle(fail('CAMERA_PERMISSION_DENIED'));
+    expect([out.state, engine.state]).toEqual(['ERROR', 'ERROR']);
+    expect(out.speech).toEqual({ kind: 'ERROR', code: 'CAMERA_PERMISSION_DENIED' });
+    expect(out.reasons).toEqual(['FAILURE', 'CAMERA_PERMISSION_DENIED']);
+    expectNoResult(out);
   });
 
-  it('cấu hình stabilizer không hợp lệ thì ném RangeError ngay khi tạo', () => {
-    const bad = withConfig({ analyzer: { stabilizer: { windowSize: 0, minAgree: 1, matchIou: 0.5, maxAgeMs: 2500 } } });
-    expect(() => createFrameAnalyzer(bad)).toThrow(RangeError);
-  });
-});
-
-describe('createFrameAnalyzer · ổn định theo thời gian (kịch bản nhiều khung)', () => {
-  it('bốn khung giống nhau thì ổn định ở khung thứ tư, consensus là trung bình độ tin cậy', () => {
-    const analyses = run(createFrameAnalyzer(DEFAULT_CONFIG), [0.8, 0.9, 0.85, 0.95].map((c, i) => singleFrame(i + 1, c)));
-    expect(analyses.map((a) => a.stability.stable)).toEqual([false, false, false, true]);
-    expect(analyses.map((a) => a.stability.agree)).toEqual([1, 2, 3, 4]);
-    const consensus = lastOf(analyses)?.stability.consensus;
-    expect(consensus?.[0]?.confidence).toBeCloseTo(0.875, 9);
-    expect(consensus?.[0]).toMatchObject({ id: '4-0', denomination: 20000 });
+  it('mọi mã lỗi đều được đọc đúng mã', () => {
+    for (const code of ERROR_CODES) expect(newEngine().handle(fail(code)).speech).toEqual({ kind: 'ERROR', code });
   });
 
-  it('hai tờ ổn định thì consensus giữ thứ tự trái → phải', () => {
-    const frames = [1, 2, 3, 4].map((f) => result(f, [det(f, 0, 50000, 0.9, RIGHT), det(f, 1, 20000, 0.9, LEFT)]));
-    const consensus = lastOf(run(createFrameAnalyzer(DEFAULT_CONFIG), frames))?.stability.consensus;
-    expect(consensus?.map((d) => d.denomination)).toEqual([20000, 50000]);
+  it('vẫn được xử lý khi app đang ở nền', () => {
+    const out = drive([...PATH.READY, 'APP_BACKGROUNDED']).handle(fail('CAMERA_FAILED'));
+    expect([out.state, out.speech]).toEqual(['ERROR', { kind: 'ERROR', code: 'CAMERA_FAILED' }]);
   });
 
-  it('khung hiện tại có thêm tờ chưa chắc thì không ổn định dù bốn khung trước đồng thuận', () => {
-    const analyzer = createFrameAnalyzer(DEFAULT_CONFIG);
-    run(analyzer, [1, 2, 3, 4].map((f) => singleFrame(f)));
-    const withExtra = analyzer.analyze(result(5, [det(5, 0, 20000, 0.9, LEFT), det(5, 1, 50000, 0.5, RIGHT)]));
-    expect(withExtra.stability).toEqual({ stable: false, agree: 0, window: 5, consensus: null });
+  it('lỗi trùng mã khi đã ở ERROR thì im lặng, lỗi khác mã thì đọc mã mới', () => {
+    const engine = drive(PATH.READY);
+    engine.handle(fail('CAMERA_FAILED'));
+    const same = engine.handle(fail('CAMERA_FAILED'));
+    expect([same.state, same.speech, same.reasons]).toEqual(['ERROR', null, ['FAILURE', 'CAMERA_FAILED', 'DUPLICATE']]);
+    expect(engine.handle(fail('MODEL_INIT_FAILED')).speech).toEqual({ kind: 'ERROR', code: 'MODEL_INIT_FAILED' });
   });
 
-  it.each([
-    {
-      name: 'chồng lấn',
-      detections: (f: number) => [det(f, 0, 20000, 0.9, box(20, 100, 180, 300)), det(f, 1, 50000, 0.9, box(132, 100, 292, 300))],
-      flag: (a: FrameAnalysis) => a.overlap.detected,
-    },
-    {
-      name: 'xung đột lớp',
-      detections: (f: number) => [det(f, 0, 20000, 0.9, CENTER), det(f, 1, 50000, 0.8, CENTER)],
-      flag: (a: FrameAnalysis) => a.conflict.detected,
-    },
-  ])('khung $name không bao giờ ổn định', ({ detections, flag }) => {
-    const analyses = run(createFrameAnalyzer(DEFAULT_CONFIG), [1, 2, 3, 4, 5, 6].map((f) => result(f, detections(f))));
-    expect(analyses.every(flag)).toBe(true);
-    expect(analyses.some((a) => a.stability.stable)).toBe(false);
-    expect(analyses.every((a) => a.stability.consensus === null)).toBe(true);
+  it.each(SYSTEM_EVENTS.filter((e) => e !== 'APP_BACKGROUNDED' && e !== 'APP_FOREGROUNDED'))('ERROR khóa: %s bị bỏ qua', (event) => {
+    const engine = drive(PATH.READY);
+    engine.handle(fail('CAMERA_FAILED'));
+    const out = engine.handle(sys(event));
+    expect([out.state, out.speech, out.reasons]).toEqual(['ERROR', null, ['ILLEGAL_TRANSITION', `${event}@ERROR`]]);
   });
 
-  it('khung cách nhau 1000 ms bị loại theo maxAgeMs; nới maxAgeMs trong config thì ổn định', () => {
-    const slow = () => [0, 1000, 2000, 3000].map((t, i) => result(i + 1, [det(i + 1, 0, 20000, 0.9, CENTER)], makeGray(), t));
-    const byDefault = lastOf(run(createFrameAnalyzer(DEFAULT_CONFIG), slow()));
-    expect(byDefault?.stability).toMatchObject({ stable: false, agree: 3 });
-    const relaxed = withConfig({ analyzer: { stabilizer: { ...DEFAULT_CONFIG.analyzer.stabilizer, maxAgeMs: 5000 } } });
-    expect(lastOf(run(createFrameAnalyzer(relaxed), slow()))?.stability).toMatchObject({ stable: true, agree: 4 });
+  it('ERROR khóa: phân tích khung hình bị bỏ qua', () => {
+    const engine = drive(PATH.READY);
+    engine.handle(fail('CAMERA_FAILED'));
+    const out = engine.handle(analyze());
+    expect([out.reasons, out.speech]).toEqual([['ANALYSIS_IGNORED', 'ERROR_STATE'], null]);
+    expectNoResult(out);
   });
 
-  it('đổi sang tờ khác: ổn định lại chỉ sau đủ bốn khung của tờ mới', () => {
-    const frames = [20000, 20000, 20000, 20000, 50000, 50000, 50000, 50000].map((d, i) => singleFrame(i + 1, 0.9, d as Denomination));
-    const analyses = run(createFrameAnalyzer(DEFAULT_CONFIG), frames);
-    expect(analyses.map((a) => a.stability.stable)).toEqual([false, false, false, true, false, false, false, true]);
-    expect(lastOf(analyses)?.stability.consensus?.map((d) => d.denomination)).toEqual([50000]);
-  });
-
-  it('rút tiền ra đủ cả cửa sổ khung trống rồi đưa lại thì phải đếm lại từ đầu', () => {
-    const analyzer = createFrameAnalyzer(DEFAULT_CONFIG);
-    run(analyzer, [1, 2, 3, 4].map((f) => singleFrame(f)));
-    run(analyzer, [5, 6, 7, 8, 9].map((f) => result(f, [])));
-    expect(analyzer.analyze(singleFrame(10)).stability).toMatchObject({ stable: false, agree: 1 });
-  });
-
-  it('reset xóa cửa sổ ổn định', () => {
-    const analyzer = createFrameAnalyzer(DEFAULT_CONFIG);
-    expect(lastOf(run(analyzer, [1, 2, 3, 4].map((f) => singleFrame(f))))?.stability.stable).toBe(true);
-    analyzer.reset();
-    expect(analyzer.analyze(singleFrame(5)).stability).toMatchObject({ stable: false, agree: 1 });
-  });
-
-  it('hai bộ phân tích tạo riêng không dùng chung trạng thái', () => {
-    const first = createFrameAnalyzer(DEFAULT_CONFIG);
-    const second = createFrameAnalyzer(DEFAULT_CONFIG);
-    run(first, [1, 2, 3, 4].map((f) => singleFrame(f)));
-    expect(second.analyze(singleFrame(5)).stability).toMatchObject({ stable: false, agree: 1 });
+  it('reset() thoát ERROR: khởi động lại từ đầu và cùng lỗi được đọc lại', () => {
+    const engine = drive(PATH.READY);
+    engine.handle(fail('CAMERA_FAILED'));
+    engine.reset();
+    expect(engine.state).toBe('INITIALIZING');
+    expect(engine.handle(sys('APP_STARTED')).speech).toEqual({ kind: 'WELCOME' });
+    expect(engine.handle(fail('CAMERA_FAILED')).speech).toEqual({ kind: 'ERROR', code: 'CAMERA_FAILED' });
   });
 });
 
-describe('createFrameAnalyzer · emptyStreak', () => {
-  it('tăng theo từng khung trống và về 0 khi có detection', () => {
-    const inputs = [[], [], [det(3, 0, 20000, 0.9, CENTER)], [], [det(5, 0, 20000, 0.9, CENTER)]].map((d, i) => result(i + 1, d));
-    expect(run(createFrameAnalyzer(DEFAULT_CONFIG), inputs).map((a) => a.emptyStreak)).toEqual([1, 2, 0, 1, 0]);
+describe('USER_REPLAY khi chưa có kết quả', () => {
+  it.each<Startup | 'ERROR'>([...STARTUP, 'ERROR'])('ở %s: đọc REPLAY_EMPTY, không đổi trạng thái', (at) => {
+    const engine = drive(at === 'ERROR' ? PATH.READY : PATH[at]);
+    if (at === 'ERROR') engine.handle(fail('CAMERA_FAILED'));
+    const out = engine.handle(replay());
+    expect([out.state, engine.state, out.speech, out.reasons]).toEqual([at, at, { kind: 'REPLAY_EMPTY' }, ['USER_REPLAY', 'NO_RESULT']]);
+    expect(out.status).toBeNull();
+    expectNoResult(out);
+    expect(engine.lastResult).toBeNull();
   });
 
-  it('khung chỉ có tờ chưa chắc không phải khung trống', () => {
-    const analysis = createFrameAnalyzer(DEFAULT_CONFIG).analyze(singleFrame(1, 0.5));
-    expect(analysis).toMatchObject({ sure: [], emptyStreak: 0 });
-    expect(analysis.unsure).toHaveLength(1);
-  });
-
-  it('chỉ có detection dưới confLow vẫn tính là khung trống', () => {
-    const analysis = createFrameAnalyzer(DEFAULT_CONFIG).analyze(singleFrame(1, 0.1));
-    expect(analysis.detections).toEqual([]);
-    expect(analysis.emptyStreak).toBe(1);
-  });
-
-  it('reset đưa emptyStreak về 0', () => {
-    const analyzer = createFrameAnalyzer(DEFAULT_CONFIG);
-    run(analyzer, [1, 2, 3].map((f) => result(f, [])));
-    analyzer.reset();
-    expect(analyzer.analyze(result(4, [])).emptyStreak).toBe(1);
+  it('không đổi logic quét: xen USER_REPLAY vào giữa không làm đổi các đầu ra khác', () => {
+    const plain = newEngine();
+    const withReplay = newEngine();
+    for (const event of PATH.READY) {
+      withReplay.handle(replay());
+      expect(withReplay.handle(sys(event))).toEqual(plain.handle(sys(event)));
+    }
   });
 });
 
-describe('createFrameAnalyzer · không đột biến đầu vào', () => {
-  it('đầu vào đóng băng sâu vẫn chạy được và không đổi', () => {
-    const detections = [det(1, 0, 20000, 0.9, LEFT), det(1, 1, 50000, 0.5, RIGHT), det(1, 2, 10000, 0.1, box(500, 100, 620, 300))].reverse();
-    const input = result(1, detections, checkerGray(64, 48, 4));
-    const before = structuredClone(input);
-    deepFreeze(input);
-    const analyzer = createFrameAnalyzer(DEFAULT_CONFIG);
-    expect(() => run(analyzer, [input, input, input, input])).not.toThrow();
-    expect(input).toEqual(before);
+describe('nền và trở lại', () => {
+  it('APP_BACKGROUNDED giữ trạng thái; phân tích bị bỏ qua cho tới khi trở lại', () => {
+    const engine = drive(PATH.READY);
+    const bg = engine.handle(sys('APP_BACKGROUNDED'));
+    expect([bg.state, bg.reasons, bg.speech]).toEqual(['READY', ['APP_BACKGROUNDED'], null]);
+    const ignored = engine.handle(analyze());
+    expect([ignored.state, ignored.reasons, ignored.speech]).toEqual(['READY', ['ANALYSIS_IGNORED', 'BACKGROUNDED'], null]);
+    expectNoResult(ignored);
   });
 
-  it('sửa các mảng kết quả không ảnh hưởng đầu vào', () => {
-    const input = result(1, [det(1, 0, 20000, 0.9, CENTER)]);
-    const analysis = createFrameAnalyzer(DEFAULT_CONFIG).analyze(input);
-    analysis.detections.length = 0;
-    analysis.sure.length = 0;
-    analysis.meta.frameId = 999;
-    expect(input.detections).toHaveLength(1);
-    expect(input.meta.frameId).toBe(1);
+  it('APP_FOREGROUNDED xóa bộ nhớ ngắn hạn, về DETECTING và hết bỏ qua phân tích', () => {
+    const engine = drive([...PATH.READY, 'APP_BACKGROUNDED']);
+    const fg = engine.handle(sys('APP_FOREGROUNDED'));
+    expect([fg.state, fg.reasons, fg.speech]).toEqual(['DETECTING', ['APP_FOREGROUNDED', 'MEMORY_CLEARED'], null]);
+    expect(engine.handle(analyze()).reasons).not.toContain('BACKGROUNDED');
+  });
+
+  it('trở lại khi đang khởi động hoặc đang lỗi thì giữ nguyên trạng thái', () => {
+    expect(drive([...PATH.LOADING_MODEL, 'APP_BACKGROUNDED']).handle(sys('APP_FOREGROUNDED')).state).toBe('LOADING_MODEL');
+    const broken = drive(PATH.READY);
+    broken.handle(fail('CAMERA_FAILED'));
+    expect(broken.handle(sys('APP_FOREGROUNDED')).state).toBe('ERROR');
+  });
+});
+
+describe('phân tích khi chưa sẵn sàng', () => {
+  it.each(STARTUP.filter((s) => s !== 'READY'))('ở %s: bỏ qua, không nói, không có kết quả', (at) => {
+    const out = drive(PATH[at]).handle(analyze());
+    expect([out.state, out.reasons, out.speech]).toEqual([at, ['ANALYSIS_IGNORED', 'NOT_READY'], null]);
+    expectNoResult(out);
+  });
+});
+
+type Op = DecisionInput | 'RESET';
+
+/** Dãy thao tác ngẫu nhiên (đầu vào hoặc reset) dựng từ một seed. */
+function buildOps(seed: number, length: number): Op[] {
+  const random = mulberry32(seed);
+  const pick = <T>(items: readonly T[], fallback: T): T => items[Math.floor(random() * items.length)] ?? fallback;
+  return Array.from({ length }, (_, i): Op => {
+    const roll = random();
+    if (roll < 0.03) return 'RESET';
+    if (roll < 0.06) return fail(pick(ERROR_CODES, 'CAMERA_FAILED'), i * 100);
+    if (roll < 0.16) return replay(i * 100);
+    if (roll < 0.3) return analyze(i * 100);
+    return sys(pick(SYSTEM_EVENTS, 'APP_STARTED'), i * 100);
+  });
+}
+
+function play(ops: Op[]): Array<{ input: DecisionInput; out: DecisionOutput }> {
+  const engine = newEngine();
+  const log: Array<{ input: DecisionInput; out: DecisionOutput }> = [];
+  for (const op of ops) {
+    if (op === 'RESET') engine.reset();
+    else log.push({ input: op, out: engine.handle(op) });
+  }
+  return log;
+}
+
+describe('chuỗi đầu vào ngẫu nhiên (4000 thao tác)', () => {
+  const ops = buildOps(20241114, 4000);
+  const log = play(ops);
+
+  afterEach(() => vi.restoreAllMocks());
+
+  it('cùng chuỗi đầu vào cho cùng chuỗi đầu ra', () => {
+    expect(play(ops)).toEqual(log);
+  });
+
+  it('không đọc đồng hồ hệ thống (Date.now, performance.now)', () => {
+    const dateNow = vi.spyOn(Date, 'now');
+    const perfNow = vi.spyOn(performance, 'now');
+    play(ops);
+    expect(dateNow).not.toHaveBeenCalled();
+    expect(perfNow).not.toHaveBeenCalled();
+  });
+
+  it('mọi đầu ra có state hợp lệ và reasons là mảng mã không rỗng', () => {
+    for (const { out } of log) {
+      expect(Object.keys(TRANSITIONS)).toContain(out.state);
+      expect(out.reasons.length).toBeGreaterThan(0);
+      expect(out.reasons.every((r) => r.length > 0)).toBe(true);
+    }
+  });
+
+  it('đầu vào không phải ANALYSIS không bao giờ có status hay kết quả', () => {
+    for (const { input, out } of log) {
+      if (input.type === 'ANALYSIS') continue;
+      expect(out.status).toBeNull();
+      expectNoResult(out);
+    }
+  });
+
+  it('với khung không có tiền, engine không bao giờ công bố kết quả hay tính tổng', () => {
+    for (const { out } of log) expectNoResult(out);
+  });
+
+  it('dãy ngẫu nhiên đi qua đủ các trạng thái khởi động và ERROR (không phải kiểm thử rỗng)', () => {
+    const visited = new Set<AppState>(log.map(({ out }) => out.state));
+    for (const state of [...STARTUP, 'ERROR'] as const) expect(visited.has(state), state).toBe(true);
   });
 });
 </file>
 
-<file path="tests/analyzer/temporal-stabilizer.test.ts">
+<file path="tests/decision/source-rules.test.ts">
+// Bảo đảm tĩnh cho nghiệm thu: module decision không chạm DOM, đồng hồ, I/O, không dùng any,
+// và chỉ import hợp đồng, cấu hình, tiện ích P00 hoặc file cùng thư mục.
 import { describe, expect, it } from 'vitest';
-import { createTemporalStabilizer, isFrameValid, matchDetections } from '../../src/analyzer/temporal-stabilizer';
-import type { MatchableBox, StabilizerConfig, StabilizerFrame, TemporalStabilizer } from '../../src/analyzer/temporal-stabilizer';
-import type { BBox, Denomination, Detection } from '../../src/contracts';
-import {
-  makeAnalysis,
-  makeConflictAnalysis,
-  makeDetection,
-  makeOverlapAnalysis,
-  makeSingleSureAnalysis,
-  makeUnsureAnalysis,
-} from '../fakes';
 
-const CONFIG: StabilizerConfig = { windowSize: 5, minAgree: 4, matchIou: 0.5, maxAgeMs: 2500 };
-const STEP_MS = 100;
+const SOURCES = import.meta.glob<string>('../../src/decision/*.ts', { query: '?raw', import: 'default', eager: true });
 
-const box = (x1: number, y1: number, x2: number, y2: number): BBox => ({ x1, y1, x2, y2 });
-const LEFT = box(20, 100, 180, 300);
-const RIGHT = box(200, 100, 360, 300);
+/** Bỏ chú thích để từ cấm nằm trong lời giải thích không gây báo nhầm. */
+const stripComments = (source: string): string => source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
 
-/** Detection chắc với bản sao riêng của hộp, để test sửa một Detection không lan sang hằng số dùng chung. */
-const sure = (denomination: Denomination = 20000, confidence = 0.9, bbox: BBox = LEFT, index = 0): Detection =>
-  makeDetection({ id: `1-${index}`, denomination, confidence, bbox: { ...bbox } });
-const frame = (timestamp: number, sureBoxes: Detection[], valid = true): StabilizerFrame => ({ timestamp, valid, sure: sureBoxes });
-const lastOf = <T>(xs: readonly T[]): T | undefined => xs[xs.length - 1];
+const FILES = Object.entries(SOURCES).map(([path, source]) => ({ name: path.split('/').at(-1) ?? path, code: stripComments(source) }));
 
-/** Mã mẫu: A = khung hợp lệ 20000đ, B = khung hợp lệ 50000đ, x = khung không hợp lệ; mỗi khung cách nhau STEP_MS. */
-function feedPattern(stabilizer: TemporalStabilizer, pattern: string) {
-  return [...pattern].map((code, index) =>
-    stabilizer.push(frame(index * STEP_MS, [sure(code === 'B' ? 50000 : 20000)], code !== 'x')),
-  );
+const FORBIDDEN: Array<{ name: string; pattern: RegExp }> = [
+  { name: 'đồng hồ hệ thống và bộ hẹn giờ', pattern: /\bDate\b|(?<![.\w])performance\b|\bsetTimeout\b|\bsetInterval\b|\brequestAnimationFrame\b/ },
+  { name: 'DOM và API trình duyệt', pattern: /(?<![.\w])(document|window|navigator|localStorage|sessionStorage|globalThis)\b|\bHTML\w*Element\b/ },
+  { name: 'I/O (mạng, console, worker)', pattern: /\bfetch\b|\bXMLHttpRequest\b|(?<![.\w])console\b|\bWorker\b/ },
+  { name: 'số ngẫu nhiên', pattern: /\bMath\.random\b/ },
+  { name: 'kiểu any', pattern: /:\s*any\b|\bas\s+any\b|<any>/ },
+  { name: 'import động', pattern: /\bimport\s*\(/ },
+];
+const ALLOWED_IMPORT = /^(\.\/[\w-]+|\.\.\/contracts|\.\.\/config\/[\w-]+|\.\.\/utils\/[\w-]+)$/;
+
+describe('quy tắc mã nguồn của src/decision', () => {
+  it('quét đủ các file của module', () => {
+    expect(FILES.map((f) => f.name)).toEqual(expect.arrayContaining(['decision-engine.ts', 'state-manager.ts', 'total-calculator.ts']));
+  });
+
+  describe.each(FILES)('$name', ({ code }) => {
+    it.each(FORBIDDEN)('không dùng $name', ({ pattern }) => {
+      expect(code).not.toMatch(pattern);
+    });
+
+    it('chỉ import hợp đồng, cấu hình, tiện ích P00 hoặc file cùng thư mục', () => {
+      for (const [, specifier = ''] of code.matchAll(/\bfrom\s+'([^']+)'/g)) expect(specifier).toMatch(ALLOWED_IMPORT);
+    });
+  });
+});
+</file>
+
+<file path="tests/decision/state-manager.test.ts">
+import { describe, expect, it } from 'vitest';
+import type { AppState } from '../../src/contracts';
+import { INITIAL_SNAPSHOT, TRANSITIONS, phaseOf, transition } from '../../src/decision/state-manager';
+import type { MachineSnapshot, StateTrigger } from '../../src/decision/state-manager';
+
+// Hai bản đồ bắt buộc đủ khóa (thiếu một khóa là lỗi biên dịch): đáp án độc lập với mã nguồn.
+const STATE_SET: Record<AppState, true> = {
+  INITIALIZING: true, AWAITING_START: true, WAITING_PERMISSION: true, LOADING_MODEL: true, READY: true,
+  NO_CANDIDATE: true, DETECTING: true, UNCERTAIN: true, OVERLAPPING: true, STABILIZING: true,
+  RESULT_READY: true, SPEAKING: true, ERROR: true,
+};
+const TRIGGER_SET: Record<StateTrigger, true> = {
+  APP_STARTED: true, GESTURE_UNLOCKED: true, PERMISSION_REQUESTED: true, MODEL_READY: true, CAMERA_READY: true,
+  RESULT_SPEECH_ENDED: true, APP_BACKGROUNDED: true, APP_FOREGROUNDED: true, FAILURE: true,
+  NO_MONEY_SEEN: true, UNCERTAIN_SEEN: true, OVERLAP_SEEN: true, UNSTABLE_SEEN: true, STEADY_SEEN: true, RESULT_PUBLISHED: true,
+};
+const ALL_STATES = Object.keys(STATE_SET) as AppState[];
+const ALL_TRIGGERS = Object.keys(TRIGGER_SET) as StateTrigger[];
+const STARTUP: AppState[] = ['INITIALIZING', 'AWAITING_START', 'LOADING_MODEL', 'WAITING_PERMISSION'];
+const SCANNING: AppState[] = ['READY', 'NO_CANDIDATE', 'DETECTING', 'UNCERTAIN', 'OVERLAPPING', 'STABILIZING', 'RESULT_READY'];
+
+const ANALYSIS_TARGET: Partial<Record<StateTrigger, AppState>> = {
+  NO_MONEY_SEEN: 'NO_CANDIDATE', UNCERTAIN_SEEN: 'UNCERTAIN', OVERLAP_SEEN: 'OVERLAPPING',
+  UNSTABLE_SEEN: 'STABILIZING', STEADY_SEEN: 'DETECTING', RESULT_PUBLISHED: 'SPEAKING',
+};
+/** Sự kiện chỉ hợp lệ ở đúng một trạng thái: [nguồn, đích]. */
+const SINGLE_EDGE: Partial<Record<StateTrigger, readonly [AppState, AppState]>> = {
+  APP_STARTED: ['INITIALIZING', 'AWAITING_START'], GESTURE_UNLOCKED: ['AWAITING_START', 'LOADING_MODEL'],
+  PERMISSION_REQUESTED: ['LOADING_MODEL', 'WAITING_PERMISSION'], RESULT_SPEECH_ENDED: ['SPEAKING', 'DETECTING'],
+};
+
+/** Kỳ vọng viết lại bằng QUY TẮC (cờ mặc định tắt nên chưa lên READY). null = chuyển trái phép. */
+function expectedNext(state: AppState, trigger: StateTrigger): AppState | null {
+  switch (trigger) {
+    case 'FAILURE': return 'ERROR';
+    case 'APP_BACKGROUNDED': return state;
+    case 'APP_FOREGROUNDED': return SCANNING.includes(state) || state === 'SPEAKING' ? 'DETECTING' : state;
+    case 'MODEL_READY': return state === 'ERROR' ? null : state;
+    case 'CAMERA_READY':
+      if (state === 'ERROR') return null;
+      return state === 'WAITING_PERMISSION' ? 'LOADING_MODEL' : state;
+    case 'APP_STARTED':
+    case 'GESTURE_UNLOCKED':
+    case 'PERMISSION_REQUESTED':
+    case 'RESULT_SPEECH_ENDED': {
+      const edge = SINGLE_EDGE[trigger];
+      return edge !== undefined && edge[0] === state ? edge[1] : null;
+    }
+    default: return SCANNING.includes(state) ? (ANALYSIS_TARGET[trigger] ?? null) : null;
+  }
 }
 
-/** Khung có `count` tờ: 1 → [20000 trái]; 2 → [20000 trái, 50000 phải]. */
-const notes = (count: 1 | 2): Detection[] =>
-  count === 1 ? [sure(20000, 0.9, LEFT, 0)] : [sure(20000, 0.9, LEFT, 0), sure(50000, 0.9, RIGHT, 1)];
+const at = (state: AppState): MachineSnapshot => ({ ...INITIAL_SNAPSHOT, state });
+const run = (triggers: StateTrigger[]): MachineSnapshot =>
+  triggers.reduce<MachineSnapshot>((snap, trigger) => transition(snap, trigger).snapshot, INITIAL_SNAPSHOT);
 
-describe('createTemporalStabilizer · đồng thuận theo số khung', () => {
+describe('bảng chuyển trạng thái', () => {
+  it('có đúng 13 hàng của hợp đồng', () => {
+    expect(Object.keys(TRANSITIONS).sort()).toEqual([...ALL_STATES].sort());
+  });
+
+  describe.each(ALL_STATES)('từ %s', (state) => {
+    it.each(ALL_TRIGGERS)('%s', (trigger) => {
+      const result = transition(at(state), trigger);
+      const expected = expectedNext(state, trigger);
+      expect(result.accepted).toBe(expected !== null);
+      expect(result.to).toBe(expected ?? state);
+      expect(result.snapshot.state).toBe(result.to);
+    });
+  });
+
+  it('chuyển trái phép giữ nguyên ảnh chụp và ghi lý do; chuyển hợp lệ không có lý do trái phép', () => {
+    const before = at('INITIALIZING');
+    const illegal = transition(before, 'GESTURE_UNLOCKED');
+    expect(illegal.snapshot).toBe(before);
+    expect(illegal.reasons).toEqual(['ILLEGAL_TRANSITION', 'GESTURE_UNLOCKED@INITIALIZING']);
+    expect(transition(before, 'APP_STARTED').reasons).toEqual([]);
+  });
+
+  it('không sửa ảnh chụp đầu vào', () => {
+    const frozen = Object.freeze(at('LOADING_MODEL'));
+    expect(() => transition(frozen, 'MODEL_READY')).not.toThrow();
+  });
+});
+
+describe('giai đoạn', () => {
   it.each([
-    { name: '5 khung đồng thuận', pattern: 'AAAAA', stable: true, agree: 5 },
-    { name: 'đủ minAgree đúng ranh (4 khung)', pattern: 'AAAA', stable: true, agree: 4 },
-    { name: '3 khung đồng thuận chưa đủ', pattern: 'AAA', stable: false, agree: 3 },
-    { name: '3 trong 5 khung hợp lệ (xen khung không hợp lệ)', pattern: 'AxAxA', stable: false, agree: 3 },
-    { name: 'khung xen kẽ đổi mệnh giá', pattern: 'ABABA', stable: false, agree: 3 },
-    { name: 'một khung lệch mệnh giá ở đầu cửa sổ vẫn ổn định', pattern: 'BAAAA', stable: true, agree: 4 },
-    { name: 'một khung không hợp lệ ở đầu cửa sổ không cản', pattern: 'xAAAA', stable: true, agree: 4 },
-    { name: 'khung mới nhất đổi mệnh giá', pattern: 'AAAAB', stable: false, agree: 1 },
-    { name: 'khung mới nhất không hợp lệ thì không ổn định dù 4 khung trước đồng thuận', pattern: 'AAAAx', stable: false, agree: 0 },
-    { name: 'cửa sổ trượt: chỉ tính 5 khung gần nhất', pattern: 'AAAAAAAAAA', stable: true, agree: 5 },
-  ])('$name', ({ pattern, stable, agree }) => {
-    const infos = feedPattern(createTemporalStabilizer(CONFIG), pattern);
-    expect(lastOf(infos)).toMatchObject({ stable, agree });
-  });
-
-  it('khung tự khai hợp lệ nhưng không có hộp chắc nào thì không bao giờ ổn định', () => {
-    const s = createTemporalStabilizer(CONFIG);
-    const infos = [0, 1, 2, 3, 4].map((i) => s.push(frame(i * STEP_MS, [])));
-    expect(infos.every((i) => !i.stable && i.agree === 0 && i.consensus === null)).toBe(true);
-  });
-
-  it('window luôn bằng windowSize (sức chứa), kể cả khi cửa sổ chưa đầy', () => {
-    const infos = feedPattern(createTemporalStabilizer(CONFIG), 'AA');
-    expect(infos.map((i) => i.window)).toEqual([5, 5]);
-  });
-
-  it('agree tăng dần theo từng khung đồng thuận', () => {
-    const infos = feedPattern(createTemporalStabilizer(CONFIG), 'AAAAA');
-    expect(infos.map((i) => i.agree)).toEqual([1, 2, 3, 4, 5]);
-    expect(infos.map((i) => i.stable)).toEqual([false, false, false, true, true]);
+    ...STARTUP.map((state) => ({ state, phase: 'STARTUP' })),
+    ...SCANNING.map((state) => ({ state, phase: 'SCANNING' })),
+    { state: 'SPEAKING' as AppState, phase: 'SPEAKING' },
+    { state: 'ERROR' as AppState, phase: 'ERROR' },
+  ])('$state → $phase', ({ state, phase }) => {
+    expect(phaseOf(state)).toBe(phase);
   });
 });
 
-describe('createTemporalStabilizer · đổi số tờ', () => {
-  it.each([
-    { name: 'ba khung một tờ rồi hai khung hai tờ', counts: [1, 1, 1, 2, 2] as const, stable: false, agree: 2 },
-    { name: 'một khung một tờ rồi bốn khung hai tờ (khung cũ lệch bị bỏ qua)', counts: [1, 2, 2, 2, 2] as const, stable: true, agree: 4 },
-    { name: 'bốn khung hai tờ rồi một khung một tờ', counts: [2, 2, 2, 2, 1] as const, stable: false, agree: 1 },
-  ])('$name', ({ counts, stable, agree }) => {
-    const s = createTemporalStabilizer(CONFIG);
-    const infos = counts.map((count, index) => s.push(frame(index * STEP_MS, notes(count))));
-    expect(lastOf(infos)).toMatchObject({ stable, agree });
+describe('khởi động: thứ tự sự kiện', () => {
+  const GATE: StateTrigger[] = ['APP_STARTED', 'GESTURE_UNLOCKED'];
+
+  it.each<{ name: string; events: StateTrigger[]; beforeLast: AppState }>([
+    { name: 'xin quyền, model rồi camera', events: ['PERMISSION_REQUESTED', 'MODEL_READY', 'CAMERA_READY'], beforeLast: 'WAITING_PERMISSION' },
+    { name: 'xin quyền, camera rồi model', events: ['PERMISSION_REQUESTED', 'CAMERA_READY', 'MODEL_READY'], beforeLast: 'LOADING_MODEL' },
+    { name: 'quyền cấp sẵn, model rồi camera', events: ['MODEL_READY', 'CAMERA_READY'], beforeLast: 'LOADING_MODEL' },
+    { name: 'quyền cấp sẵn, camera rồi model', events: ['CAMERA_READY', 'MODEL_READY'], beforeLast: 'LOADING_MODEL' },
+    { name: 'model xong trước khi xin quyền', events: ['MODEL_READY', 'PERMISSION_REQUESTED', 'CAMERA_READY'], beforeLast: 'WAITING_PERMISSION' },
+  ])('$name: chỉ READY khi đủ cả hai', ({ events, beforeLast }) => {
+    expect(run([...GATE, ...events.slice(0, -1)]).state).toBe(beforeLast);
+    expect(run([...GATE, ...events]).state).toBe('READY');
+  });
+
+  it('camera đã sẵn sàng thì PERMISSION_REQUESTED muộn bị bỏ qua', () => {
+    const snap = run([...GATE, 'CAMERA_READY']);
+    expect(transition(snap, 'PERMISSION_REQUESTED').accepted).toBe(false);
+    expect(transition(snap, 'MODEL_READY').to).toBe('READY');
+  });
+
+  it('PERMISSION_REQUESTED lặp lại khi đang chờ quyền bị bỏ qua', () => {
+    expect(transition(run([...GATE, 'PERMISSION_REQUESTED']), 'PERMISSION_REQUESTED').accepted).toBe(false);
+  });
+
+  it('cờ đến sớm được ghi nhận nhưng chỉ lên READY sau GESTURE_UNLOCKED', () => {
+    expect(run(['MODEL_READY', 'CAMERA_READY', 'APP_STARTED'])).toMatchObject({ state: 'AWAITING_START', modelReady: true, cameraReady: true });
+    expect(run(['MODEL_READY', 'CAMERA_READY', 'APP_STARTED', 'GESTURE_UNLOCKED']).state).toBe('READY');
   });
 });
 
-describe('createTemporalStabilizer · mục quá hạn', () => {
-  it.each([
-    { name: 'bốn khung trong hạn', times: [0, 500, 1000, 1500], stable: true, agree: 4 },
-    { name: 'khung cũ nhất già hơn maxAgeMs thì bị loại', times: [0, 500, 1000, 2600], stable: false, agree: 3 },
-    { name: 'đúng maxAgeMs thì còn giữ', times: [0, 100, 200, 2500], stable: true, agree: 4 },
-    { name: 'hơn maxAgeMs 1 ms thì bị loại', times: [0, 100, 200, 2501], stable: false, agree: 3 },
-    { name: 'đồng hồ lùi thì bỏ các mục "ở tương lai"', times: [1000, 1100, 1200, 500], stable: false, agree: 1 },
-    { name: 'mốc thời gian NaN thì bỏ mọi mục cũ', times: [0, 100, 200, Number.NaN], stable: false, agree: 1 },
-  ])('$name', ({ times, stable, agree }) => {
-    const s = createTemporalStabilizer(CONFIG);
-    const infos = times.map((t) => s.push(frame(t, [sure()])));
-    expect(lastOf(infos)).toMatchObject({ stable, agree });
+describe('nền và trở lại', () => {
+  it('APP_BACKGROUNDED bật cờ, APP_FOREGROUNDED tắt cờ', () => {
+    expect(run(['APP_BACKGROUNDED']).backgrounded).toBe(true);
+    expect(run(['APP_BACKGROUNDED', 'APP_FOREGROUNDED']).backgrounded).toBe(false);
   });
 });
+</file>
 
-describe('createTemporalStabilizer · reset', () => {
-  it('sau reset phải đủ minAgree khung mới mới ổn định lại', () => {
-    const s = createTemporalStabilizer(CONFIG);
-    expect(lastOf(feedPattern(s, 'AAAA'))?.stable).toBe(true);
-    s.reset();
-    const after = [0, 1, 2, 3].map((i) => s.push(frame(1000 + i * STEP_MS, [sure()])));
-    expect(after.map((i) => i.agree)).toEqual([1, 2, 3, 4]);
-    expect(after.map((i) => i.stable)).toEqual([false, false, false, true]);
-  });
-});
+<file path="tests/decision/total-calculator.test.ts">
+import { describe, expect, it } from 'vitest';
+import { DENOMINATIONS } from '../../src/contracts';
+import type { Denomination } from '../../src/contracts';
+import { formatVND } from '../../src/config/denominations';
+import { calculateTotal } from '../../src/decision/total-calculator';
+import { mulberry32 } from '../../src/utils/math';
 
-describe('createTemporalStabilizer · consensus', () => {
-  it('confidence là trung bình các khung đồng thuận, phần còn lại lấy từ khung mới nhất', () => {
-    const s = createTemporalStabilizer(CONFIG);
-    const confidences = [0.8, 0.9, 0.85, 0.95];
-    const infos = confidences.map((c, i) =>
-      s.push(frame(i * STEP_MS, [makeDetection({ id: `${i + 1}-0`, frameId: i + 1, timestamp: i * STEP_MS, confidence: c, bbox: LEFT })])),
-    );
-    const consensus = lastOf(infos)?.consensus;
-    expect(consensus).toHaveLength(1);
-    expect(consensus?.[0]?.confidence).toBeCloseTo(0.875, 9);
-    expect(consensus?.[0]).toMatchObject({ id: '4-0', frameId: 4, timestamp: 300, denomination: 20000, bbox: LEFT });
+describe('calculateTotal', () => {
+  it.each<{ name: string; input: Denomination[]; total: number; formatted: string }>([
+    { name: 'ba tờ khác mệnh giá', input: [20000, 50000, 100000], total: 170000, formatted: '170.000 đồng' },
+    { name: 'hai tờ cùng mệnh giá', input: [10000, 10000], total: 20000, formatted: '20.000 đồng' },
+    { name: 'một tờ nhỏ nhất', input: [1000], total: 1000, formatted: '1.000 đồng' },
+    { name: 'tổng vượt một triệu', input: [500000, 500000, 200000, 200000, 100000], total: 1500000, formatted: '1.500.000 đồng' },
+    { name: 'đủ 9 mệnh giá', input: [...DENOMINATIONS], total: 888000, formatted: '888.000 đồng' },
+  ])('$name', ({ input, total, formatted }) => {
+    expect(calculateTotal(input)).toEqual({ count: input.length, denominations: input, total, formattedTotal: formatted });
   });
 
-  it('hai tờ: mỗi tờ có trung bình riêng, giữ thứ tự trái → phải', () => {
-    const s = createTemporalStabilizer(CONFIG);
-    const rightConfidences = [0.7, 0.9, 0.7, 0.9];
-    const infos = rightConfidences.map((c, i) =>
-      s.push(frame(i * STEP_MS, [sure(20000, 0.8, LEFT, 0), sure(50000, c, RIGHT, 1)])),
-    );
-    const consensus = lastOf(infos)?.consensus ?? [];
-    expect(consensus.map((d) => d.denomination)).toEqual([20000, 50000]);
-    expect(consensus[0]?.confidence).toBeCloseTo(0.8, 9);
-    expect(consensus[1]?.confidence).toBeCloseTo(0.8, 9);
+  it('giữ nguyên thứ tự, trả bản sao và không sửa mảng đầu vào', () => {
+    const input = Object.freeze<Denomination[]>([500000, 1000, 20000, 1000]) as Denomination[];
+    const result = calculateTotal(input);
+    expect(result.denominations).toEqual([500000, 1000, 20000, 1000]);
+    expect(result.denominations).not.toBe(input);
   });
 
-  it('khung không hợp lệ trong cửa sổ không được tính vào trung bình', () => {
-    const s = createTemporalStabilizer(CONFIG);
-    s.push(frame(0, [sure(20000, 0.9)]));
-    s.push(frame(100, [sure(20000, 0.1)], false));
-    s.push(frame(200, [sure(20000, 0.8)]));
-    s.push(frame(300, [sure(20000, 0.8)]));
-    const info = s.push(frame(400, [sure(20000, 0.9)]));
-    expect(info.stable).toBe(true);
-    expect(info.consensus?.[0]?.confidence).toBeCloseTo(0.85, 9);
+  it.each<{ name: string; input: unknown[] }>([
+    { name: 'danh sách rỗng', input: [] },
+    { name: 'mệnh giá không tồn tại', input: [15000] },
+    { name: 'số 0', input: [0] },
+    { name: 'số âm', input: [-20000] },
+    { name: 'NaN', input: [Number.NaN] },
+    { name: 'vô cực', input: [Number.POSITIVE_INFINITY] },
+    { name: 'số lẻ', input: [1000.5] },
+    { name: 'chuỗi số', input: ['20000'] },
+    { name: 'null', input: [null] },
+    { name: 'một giá trị lạ lẫn giữa các giá trị hợp lệ', input: [20000, 30000, 50000] },
+  ])('ném RangeError: $name', ({ input }) => {
+    expect(() => calculateTotal(input as Denomination[])).toThrow(RangeError);
   });
 
-  it('hộp xê dịch nhẹ giữa các khung (IoU ≥ matchIou) vẫn đồng thuận, bbox lấy từ khung mới nhất', () => {
-    const s = createTemporalStabilizer(CONFIG);
-    const infos = [0, 5, 10, 15].map((dx, i) => s.push(frame(i * STEP_MS, [sure(20000, 0.9, box(20 + dx, 100, 180 + dx, 300))])));
-    const last = lastOf(infos);
-    expect(last?.stable).toBe(true);
-    expect(last?.consensus?.[0]?.bbox).toEqual(box(35, 100, 195, 300));
-  });
-
-  it('chưa ổn định hoặc khung mới nhất không hợp lệ thì consensus là null', () => {
-    const s = createTemporalStabilizer(CONFIG);
-    expect(s.push(frame(0, [sure()])).consensus).toBeNull();
-    expect(s.push(frame(100, [sure()], false)).consensus).toBeNull();
-  });
-
-  it('consensus là bản sao: sửa nó không làm đổi đầu vào', () => {
-    const s = createTemporalStabilizer({ ...CONFIG, minAgree: 1 });
-    const input = sure(20000, 0.9);
-    const consensus = s.push(frame(0, [input])).consensus;
-    expect(consensus).not.toBeNull();
-    const first = consensus?.[0];
-    if (first === undefined) return;
-    first.confidence = 0.1;
-    first.bbox.x1 = 999;
-    expect(input.confidence).toBe(0.9);
-    expect(input.bbox).toEqual(LEFT);
-  });
-});
-
-describe('createTemporalStabilizer · tính độc lập với đối tượng của người gọi', () => {
-  it('sửa Detection sau khi push không làm hỏng cửa sổ', () => {
-    const s = createTemporalStabilizer(CONFIG);
-    const first = sure(20000, 0.8);
-    s.push(frame(0, [first]));
-    first.confidence = 0.1;
-    first.bbox.x1 = 600;
-    first.bbox.x2 = 640;
-    const infos = [1, 2, 3].map((i) => s.push(frame(i * STEP_MS, [sure(20000, 0.8)])));
-    const last = lastOf(infos);
-    expect(last?.stable).toBe(true);
-    expect(last?.consensus?.[0]?.confidence).toBeCloseTo(0.8, 9);
-  });
-
-  it('đầu vào đóng băng vẫn chạy được', () => {
-    const s = createTemporalStabilizer(CONFIG);
-    const frozen = Object.freeze([Object.freeze(makeDetection({ id: '1-0', bbox: Object.freeze({ ...LEFT }) }))]);
-    expect(() => {
-      for (let i = 0; i < 4; i++) s.push({ timestamp: i * STEP_MS, valid: true, sure: frozen });
-    }).not.toThrow();
-  });
-});
-
-describe('createTemporalStabilizer · cấu hình', () => {
-  it.each([
-    { name: 'windowSize 0', patch: { windowSize: 0 } },
-    { name: 'windowSize không nguyên', patch: { windowSize: 2.5 } },
-    { name: 'minAgree 0', patch: { minAgree: 0 } },
-    { name: 'minAgree lớn hơn windowSize', patch: { minAgree: 6 } },
-    { name: 'minAgree không nguyên', patch: { minAgree: 3.5 } },
-    { name: 'matchIou 0', patch: { matchIou: 0 } },
-    { name: 'matchIou lớn hơn 1', patch: { matchIou: 1.2 } },
-    { name: 'maxAgeMs âm', patch: { maxAgeMs: -1 } },
-    { name: 'maxAgeMs NaN', patch: { maxAgeMs: Number.NaN } },
-  ])('ném RangeError khi $name', ({ patch }) => {
-    expect(() => createTemporalStabilizer({ ...CONFIG, ...patch })).toThrow(RangeError);
-  });
-
-  it.each([
-    { name: 'cửa sổ một khung, minAgree 1', config: { ...CONFIG, windowSize: 1, minAgree: 1 }, pattern: 'A', stable: true },
-    { name: 'maxAgeMs vô hạn tắt việc loại theo tuổi', config: { ...CONFIG, maxAgeMs: Number.POSITIVE_INFINITY }, pattern: 'AAAA', stable: true },
-    { name: 'minAgree 2 thì hai khung là đủ', config: { ...CONFIG, minAgree: 2 }, pattern: 'AA', stable: true },
-  ])('chấp nhận $name', ({ config, pattern, stable }) => {
-    expect(lastOf(feedPattern(createTemporalStabilizer(config), pattern))?.stable).toBe(stable);
-  });
-});
-
-describe('matchDetections · ghép hộp giữa hai khung', () => {
-  const m = (denomination: Denomination, bbox: BBox): MatchableBox => ({ denomination, bbox });
-  const base = box(0, 0, 100, 100);
-
-  it.each([
-    { name: 'hai hộp giống hệt', a: [m(20000, base)], b: [m(20000, base)], expected: [0] },
-    { name: 'IoU đúng ngưỡng 0,5 thì ghép được (so sánh ≥)', a: [m(20000, base)], b: [m(20000, box(0, 0, 100, 50))], expected: [0] },
-    { name: 'IoU 0,49 thì không ghép', a: [m(20000, base)], b: [m(20000, box(0, 0, 100, 49))], expected: null },
-    { name: 'khác mệnh giá', a: [m(20000, base)], b: [m(50000, base)], expected: null },
-    { name: 'khác số tờ', a: [m(20000, base)], b: [m(20000, base), m(20000, box(300, 0, 400, 100))], expected: null },
-    { name: 'cùng số tờ nhưng khác đa tập mệnh giá', a: [m(20000, LEFT), m(20000, RIGHT)], b: [m(20000, LEFT), m(50000, RIGHT)], expected: null },
-    { name: 'hai tờ đổi chỗ cho nhau thì không ghép được dù cùng đa tập', a: [m(20000, LEFT), m(50000, RIGHT)], b: [m(50000, LEFT), m(20000, RIGHT)], expected: null },
-    { name: 'thứ tự trong mảng khác nhau nhưng vị trí khớp', a: [m(20000, LEFT), m(50000, RIGHT)], b: [m(50000, RIGHT), m(20000, LEFT)], expected: [1, 0] },
-    { name: 'hộp suy biến không ghép được', a: [m(20000, box(5, 5, 5, 50))], b: [m(20000, box(5, 5, 5, 50))], expected: null },
-  ])('$name', ({ a, b, expected }) => {
-    expect(matchDetections(a, b, 0.5)).toEqual(expected);
-  });
-
-  it('một hộp cũ không thể được ghép cho hai hộp mới', () => {
-    const a = [m(20000, box(0, 0, 100, 100)), m(20000, box(60, 0, 160, 100))];
-    const b = [m(20000, box(30, 0, 130, 100)), m(20000, box(300, 0, 400, 100))];
-    expect(matchDetections(a, b, 0.5)).toBeNull();
-  });
-
-  it('ghép tham lam theo IoU giảm dần tìm đủ cặp mà ghép theo thứ tự chỉ số sẽ bỏ lỡ', () => {
-    // b[0] (x = 60) là lựa chọn duy nhất của a[1] (x = 62, IoU 0,96) nhưng cũng là ứng viên đầu tiên của a[0] (x = 32, IoU 0,56);
-    // b[1] (x = 0) chỉ vừa đủ cho a[0] (IoU 0,52). Phải ưu tiên cặp IoU cao nhất thì mới ghép đủ.
-    const a = [m(20000, box(32, 0, 132, 100)), m(20000, box(62, 0, 162, 100))];
-    const b = [m(20000, box(60, 0, 160, 100)), m(20000, box(0, 0, 100, 100))];
-    expect(matchDetections(a, b, 0.5)).toEqual([1, 0]);
-  });
-
-  it('ưu tiên cặp IoU cao nhất trước (giảm dần), không phải thấp nhất', () => {
-    // a[1] chỉ hợp b[1] (IoU 0,96); a[0] hợp b[0] (0,90) và b[1] (0,52). Ưu tiên IoU thấp trước sẽ để a[0] chiếm b[1] rồi bỏ lỡ a[1].
-    const a = [m(20000, box(5, 0, 105, 100)), m(20000, box(39, 0, 139, 100))];
-    const b = [m(20000, box(0, 0, 100, 100)), m(20000, box(37, 0, 137, 100))];
-    expect(matchDetections(a, b, 0.5)).toEqual([0, 1]);
-  });
-
-  it('không sửa đầu vào', () => {
-    const a = Object.freeze([Object.freeze(m(20000, Object.freeze(base)))]);
-    expect(() => matchDetections(a, a, 0.5)).not.toThrow();
-  });
-});
-
-describe('isFrameValid · điều kiện khung hợp lệ', () => {
-  it.each([
-    { name: 'một tờ chắc, không cờ nào', analysis: makeSingleSureAnalysis(), expected: true },
-    { name: 'không có tờ nào', analysis: makeAnalysis(), expected: false },
-    { name: 'chỉ có tờ chưa chắc', analysis: makeUnsureAnalysis(), expected: false },
-    {
-      name: 'có tờ chắc nhưng kèm một tờ chưa chắc',
-      analysis: makeSingleSureAnalysis(20000, { unsure: [makeDetection({ id: '1-1', confidence: 0.5 })] }),
-      expected: false,
-    },
-    { name: 'chồng lấn', analysis: makeOverlapAnalysis(), expected: false },
-    { name: 'xung đột lớp', analysis: makeConflictAnalysis(), expected: false },
-    {
-      name: 'quá nhỏ, chạm mép, mờ và tối không làm khung mất hợp lệ',
-      analysis: makeSingleSureAnalysis(20000, {
-        position: { tooSmall: true, partial: true },
-        quality: { blurScore: 1, blurry: true, brightness: 5, lowLight: true },
-      }),
-      expected: true,
-    },
-  ])('$name', ({ analysis, expected }) => {
-    expect(isFrameValid(analysis)).toBe(expected);
+  it('300 danh sách ngẫu nhiên: tổng, số tờ, thứ tự và định dạng đều khớp', () => {
+    const random = mulberry32(20241114);
+    for (let i = 0; i < 300; i++) {
+      const input = Array.from({ length: 1 + Math.floor(random() * 8) }, () => DENOMINATIONS[Math.floor(random() * DENOMINATIONS.length)] as Denomination);
+      const sum = input.reduce((acc, d) => acc + d, 0);
+      expect(calculateTotal(input)).toEqual({ count: input.length, denominations: input, total: sum, formattedTotal: formatVND(sum) });
+    }
   });
 });
 </file>
@@ -1828,84 +1656,6 @@ export function detectClassConflict(detections: readonly Detection[], conflictIo
 }
 </file>
 
-<file path="src/analyzer/frame-analyzer.ts">
-import type { AppConfig, Detection, FrameAnalysis, IFrameAnalyzer, InferenceResult } from '../contracts';
-import { center } from '../utils/geometry';
-import { measureBlur } from './blur-detector';
-import { measureBrightness } from './brightness-analyzer';
-import { splitByConfidence } from './confidence-analyzer';
-import { detectClassConflict } from './conflict-detector';
-import { detectOverlap } from './overlap-detector';
-import { analyzePosition } from './position-analyzer';
-import { createTemporalStabilizer, isFrameValid } from './temporal-stabilizer';
-
-/** Sắp từ trái sang phải (tâm x tăng dần, hòa thì theo tâm y), ổn định. Trả mảng mới, không sửa đầu vào. */
-function sortLeftToRight(detections: readonly Detection[]): Detection[] {
-  return [...detections].sort((a, b) => {
-    const ca = center(a.bbox);
-    const cb = center(b.bbox);
-    return ca.x - cb.x || ca.y - cb.y;
-  });
-}
-
-/**
- * Tạo bộ phân tích khung hình. Chỉ MÔ TẢ khung hình (chắc hay không, chồng lấn, xung đột, vị trí, mờ, tối, ổn định),
- * tuyệt đối không quyết định đọc hay không, không nói, không tính tổng.
- *
- * Mỗi lần analyze: sắp detection trái → phải, tách sure/unsure (A1), rồi chạy A2 đến A6 trên mọi detection có
- * độ tin cậy ≥ confLow (cả chắc lẫn chưa chắc), cuối cùng đưa khung vào bộ ổn định (A7).
- * Ngưỡng: confLow, confSure lấy từ config.inference; mọi ngưỡng còn lại từ config.analyzer. Không có hằng số ma thuật.
- * Trạng thái duy nhất giữ lại giữa các khung: cửa sổ của bộ ổn định và emptyStreak.
- * Không sửa InferenceResult đầu vào; kết quả dùng mảng mới (các đối tượng Detection được dùng chung với đầu vào).
- * Ném RangeError nếu config.analyzer.stabilizer không hợp lệ (xem createTemporalStabilizer).
- *
- * @param config Cấu hình ứng dụng (DEFAULT_CONFIG hoặc bản đã hiệu chỉnh).
- */
-export function createFrameAnalyzer(config: AppConfig): IFrameAnalyzer {
-  const { inference, analyzer } = config;
-  const stabilizer = createTemporalStabilizer(analyzer.stabilizer);
-  let emptyStreak = 0;
-
-  /** Phân tích một kết quả suy luận; meta.timestamp (mili-giây) là mốc thời gian cho cửa sổ ổn định. */
-  function analyze(r: InferenceResult): FrameAnalysis {
-    const { sure, unsure, kept } = splitByConfidence(sortLeftToRight(r.detections), inference.confLow, inference.confSure);
-    const overlap = detectOverlap(kept, analyzer.overlapRatio);
-    const conflict = detectClassConflict(kept, analyzer.conflictIou);
-    const position = analyzePosition(kept, r.meta, analyzer.minAreaRatio, analyzer.edgeMarginRatio);
-    const blur = measureBlur(r.gray, r.meta, kept.map((d) => d.bbox), analyzer.blurThreshold);
-    const brightness = measureBrightness(r.gray, analyzer.lowLightMean);
-
-    const stability = stabilizer.push({
-      timestamp: r.meta.timestamp,
-      valid: isFrameValid({ sure, unsure, overlap, conflict }),
-      sure,
-    });
-    emptyStreak = kept.length === 0 ? emptyStreak + 1 : 0;
-
-    return {
-      meta: { ...r.meta },
-      detections: kept,
-      sure,
-      unsure,
-      overlap,
-      conflict,
-      position,
-      quality: { ...blur, ...brightness },
-      stability,
-      emptyStreak,
-    };
-  }
-
-  /** Xóa cửa sổ ổn định và đưa emptyStreak về 0 (ví dụ khi camera tạm dừng rồi chạy lại). */
-  function reset(): void {
-    stabilizer.reset();
-    emptyStreak = 0;
-  }
-
-  return { analyze, reset };
-}
-</file>
-
 <file path="src/analyzer/overlap-detector.ts">
 import type { Detection, FrameAnalysis } from '../contracts';
 import { isValidBox, overlapOverMin } from '../utils/geometry';
@@ -1993,6 +1743,201 @@ export function analyzePosition(
     }
   }
   return { tooSmall, partial };
+}
+</file>
+
+<file path="src/analyzer/temporal-stabilizer.ts">
+import type { AppConfig, BBox, Denomination, Detection, FrameAnalysis } from '../contracts';
+import { iou } from '../utils/geometry';
+import { mean } from '../utils/math';
+
+/** Cấu hình bộ ổn định, lấy từ config.analyzer.stabilizer. */
+export type StabilizerConfig = AppConfig['analyzer']['stabilizer'];
+
+/** Kết luận ổn định của một khung, đúng kiểu FrameAnalysis['stability']. */
+export type StabilityInfo = FrameAnalysis['stability'];
+
+/** Phần tối thiểu của một hộp để ghép giữa hai khung: mệnh giá và vị trí (pixel, khung gốc). */
+export type MatchableBox = Pick<Detection, 'denomination' | 'bbox'>;
+
+/** Một khung hình đưa vào bộ ổn định. */
+export interface StabilizerFrame {
+  /** Mốc thời gian chụp khung, mili-giây (FrameMeta.timestamp, cùng hệ quy chiếu performance.now()). */
+  timestamp: number;
+  /** Khung có hợp lệ để xét ổn định không (xem isFrameValid). */
+  valid: boolean;
+  /** Các detection CHẮC của khung, theo thứ tự trái → phải. */
+  sure: readonly Detection[];
+}
+
+/** Bộ ổn định theo thời gian (Detection Tracker): giữ cửa sổ các khung gần nhất. */
+export interface TemporalStabilizer {
+  /** Ghi một khung mới vào cửa sổ rồi trả kết luận ổn định cho CHÍNH khung đó. */
+  push(frame: StabilizerFrame): StabilityInfo;
+  /** Xóa toàn bộ cửa sổ. */
+  reset(): void;
+}
+
+/** Bản chụp một hộp chắc của khung cũ: tách khỏi đối tượng của người gọi để họ sửa sau này cũng không làm hỏng cửa sổ. */
+interface TrackedBox {
+  readonly denomination: Denomination;
+  readonly confidence: number;
+  readonly bbox: BBox;
+}
+
+interface Entry {
+  readonly timestamp: number;
+  readonly valid: boolean;
+  readonly boxes: readonly TrackedBox[];
+}
+
+interface Agreeing {
+  readonly boxes: readonly TrackedBox[];
+  /** matchOf[i] = chỉ số trong `boxes` được ghép với hộp thứ i của khung mới nhất. */
+  readonly matchOf: readonly number[];
+}
+
+/**
+ * Khung HỢP LỆ để xét ổn định khi: có ít nhất một tờ chắc, KHÔNG có tờ chưa chắc,
+ * không chồng lấn và không xung đột lớp. Vị trí (quá nhỏ, chạm mép) và chất lượng ảnh (mờ, tối)
+ * không nằm trong điều kiện này: việc chặn theo chúng thuộc về bộ ra quyết định.
+ */
+export function isFrameValid(f: Pick<FrameAnalysis, 'sure' | 'unsure' | 'overlap' | 'conflict'>): boolean {
+  return f.sure.length > 0 && f.unsure.length === 0 && !f.overlap.detected && !f.conflict.detected;
+}
+
+/**
+ * Ghép hộp của hai khung: mỗi hộp của `a` phải ghép được với ĐÚNG MỘT hộp của `b` (và ngược lại),
+ * cùng mệnh giá và IoU ≥ matchIou, ghép tham lam theo IoU giảm dần (hòa thì theo chỉ số nhỏ trước).
+ * Ghép đủ cặp kéo theo cùng số tờ và cùng đa tập mệnh giá nên không cần kiểm riêng.
+ * Hộp suy biến có IoU 0 nên không bao giờ ghép được.
+ *
+ * @param a Hộp của khung thứ nhất, pixel khung gốc.
+ * @param b Hộp của khung thứ hai, pixel khung gốc.
+ * @param matchIou Ngưỡng IoU, không đơn vị trong (0, 1] (config.analyzer.stabilizer.matchIou).
+ * @returns matchOf với matchOf[i] = chỉ số hộp của `b` ghép với a[i]; null nếu hai khung không đồng thuận.
+ */
+export function matchDetections(
+  a: readonly MatchableBox[],
+  b: readonly MatchableBox[],
+  matchIou: number,
+): number[] | null {
+  if (a.length !== b.length) return null;
+
+  const candidates: Array<{ i: number; j: number; iou: number }> = [];
+  for (let i = 0; i < a.length; i++) {
+    const left = a[i];
+    if (left === undefined) continue;
+    for (let j = 0; j < b.length; j++) {
+      const right = b[j];
+      if (right === undefined || left.denomination !== right.denomination) continue;
+      const overlap = iou(left.bbox, right.bbox);
+      if (overlap >= matchIou) candidates.push({ i, j, iou: overlap });
+    }
+  }
+  candidates.sort((p, q) => q.iou - p.iou || p.i - q.i || p.j - q.j);
+
+  const matchOf: number[] = new Array<number>(a.length).fill(-1);
+  const taken: boolean[] = new Array<boolean>(b.length).fill(false);
+  let matched = 0;
+  for (const c of candidates) {
+    if (matchOf[c.i] !== -1 || taken[c.j] === true) continue;
+    matchOf[c.i] = c.j;
+    taken[c.j] = true;
+    matched++;
+  }
+  return matched === a.length ? matchOf : null;
+}
+
+function assertValidConfig(c: StabilizerConfig): void {
+  if (!Number.isInteger(c.windowSize) || c.windowSize < 1) {
+    throw new RangeError(`stabilizer.windowSize phải là số nguyên ≥ 1, nhận ${c.windowSize}`);
+  }
+  if (!Number.isInteger(c.minAgree) || c.minAgree < 1 || c.minAgree > c.windowSize) {
+    throw new RangeError(`stabilizer.minAgree phải là số nguyên trong [1, windowSize = ${c.windowSize}], nhận ${c.minAgree}`);
+  }
+  if (!(c.matchIou > 0 && c.matchIou <= 1)) {
+    throw new RangeError(`stabilizer.matchIou phải thuộc (0, 1], nhận ${c.matchIou}`);
+  }
+  if (!(c.maxAgeMs >= 0)) {
+    throw new RangeError(`stabilizer.maxAgeMs phải ≥ 0 (mili-giây), nhận ${c.maxAgeMs}`);
+  }
+}
+
+function snapshotBox(d: Detection): TrackedBox {
+  return { denomination: d.denomination, confidence: d.confidence, bbox: { ...d.bbox } };
+}
+
+function toEntry(frame: StabilizerFrame): Entry {
+  // Khung tự khai "hợp lệ" nhưng không có hộp chắc nào thì không thể làm bằng chứng ổn định.
+  const valid = frame.valid && frame.sure.length > 0;
+  return { timestamp: frame.timestamp, valid, boxes: valid ? frame.sure.map(snapshotBox) : [] };
+}
+
+/** Detection của khung mới nhất, confidence = trung bình confidence của hộp được ghép ở mọi khung đồng thuận (kể cả chính nó). */
+function buildConsensus(latest: readonly Detection[], agreeing: readonly Agreeing[]): Detection[] {
+  return latest.map((d, i) => {
+    const confidences = [d.confidence];
+    for (const a of agreeing) {
+      const j = a.matchOf[i];
+      const other = j === undefined ? undefined : a.boxes[j];
+      if (other !== undefined) confidences.push(other.confidence);
+    }
+    return { ...d, bbox: { ...d.bbox }, confidence: mean(confidences) };
+  });
+}
+
+/**
+ * Tạo bộ ổn định theo thời gian.
+ *
+ * Cửa sổ giữ tối đa windowSize khung gần nhất (kể cả khung không hợp lệ). Mỗi lần push:
+ * 1. Bỏ các mục cũ hơn maxAgeMs (mili-giây) so với mốc thời gian của khung hiện tại; mục có mốc SAU khung hiện tại
+ *    (đồng hồ lùi) hoặc mốc không xác định (NaN) cũng bị bỏ, để bằng chứng cũ không sống sót qua một lần lùi đồng hồ.
+ * 2. Thêm khung hiện tại rồi cắt còn windowSize mục mới nhất.
+ * 3. Kết luận (Fail Safe): stable chỉ có thể true khi CHÍNH khung hiện tại hợp lệ. Khi đó
+ *    agree = 1 + số khung hợp lệ khác trong cửa sổ ĐỒNG THUẬN với khung hiện tại (xem matchDetections);
+ *    stable = agree ≥ minAgree. Khung hiện tại không hợp lệ cho stable false, agree 0.
+ * 4. consensus chỉ khác null khi stable: các Detection (bản sao) của khung hiện tại, trái → phải,
+ *    với confidence là trung bình mọi khung đồng thuận.
+ * `window` trong kết quả luôn bằng windowSize (sức chứa), không phải số mục đang có.
+ *
+ * Bộ ổn định chụp lại dữ liệu hộp khi push nên người gọi sửa Detection sau đó không ảnh hưởng cửa sổ.
+ * Ném RangeError nếu cấu hình không hợp lệ (windowSize, minAgree nguyên và 1 ≤ minAgree ≤ windowSize; 0 < matchIou ≤ 1; maxAgeMs ≥ 0).
+ *
+ * @param config config.analyzer.stabilizer: windowSize (khung), minAgree (khung), matchIou (không đơn vị), maxAgeMs (mili-giây).
+ */
+export function createTemporalStabilizer(config: StabilizerConfig): TemporalStabilizer {
+  assertValidConfig(config);
+  const { windowSize, minAgree, matchIou, maxAgeMs } = config;
+  let entries: Entry[] = [];
+
+  function push(frame: StabilizerFrame): StabilityInfo {
+    const now = frame.timestamp;
+    const fresh = entries.filter((e) => {
+      const age = now - e.timestamp;
+      return age >= 0 && age <= maxAgeMs;
+    });
+    const latest = toEntry(frame);
+    entries = [...fresh, latest].slice(-windowSize);
+
+    if (!latest.valid) return { stable: false, agree: 0, window: windowSize, consensus: null };
+
+    const agreeing: Agreeing[] = [];
+    for (const e of entries) {
+      if (e === latest || !e.valid) continue;
+      const matchOf = matchDetections(latest.boxes, e.boxes, matchIou);
+      if (matchOf !== null) agreeing.push({ boxes: e.boxes, matchOf });
+    }
+    const agree = 1 + agreeing.length;
+    if (agree < minAgree) return { stable: false, agree, window: windowSize, consensus: null };
+    return { stable: true, agree, window: windowSize, consensus: buildConsensus(frame.sure, agreeing) };
+  }
+
+  function reset(): void {
+    entries = [];
+  }
+
+  return { push, reset };
 }
 </file>
 
@@ -2630,22 +2575,167 @@ export function buildClassMap(c: ClassesJson): Denomination[] {
 </file>
 
 <file path="src/decision/decision-engine.ts">
-// STUB P07 — module thật sẽ GHI ĐÈ file này.
-import type { AppConfig, IDecisionEngine } from '../contracts';
+// STUB P07 (lượt 1/2) — nhánh ANALYSIS chưa cài; lượt 2 sẽ ghi đè file này.
+import type {
+  AppConfig, AppErrorCode, DecisionInput, DecisionOutput, GuidanceCode, IDecisionEngine,
+  RecognitionResult, SpeechIntent, SystemEvent,
+} from '../contracts';
+import { INITIAL_SNAPSHOT, phaseOf, transition } from './state-manager';
+import type { StateTrigger, TransitionResult } from './state-manager';
 
+/** Bộ nhớ ngắn hạn của việc quét (nhánh ANALYSIS dùng ở lượt 2). Xóa khi APP_FOREGROUNDED và reset(). */
+interface ShortTermMemory {
+  /** Chữ ký (mệnh giá từ trái sang phải) của kết quả đã công bố; null = chưa có hoặc tiền đã rời khung. */
+  announcedSignature: string | null;
+  /** `now` của khung đầu chuỗi khung trống hiện tại; null = đang không trống. */
+  emptySince: number | null;
+  /** `now` của khung đầu chuỗi khung chưa ổn định hiện tại; null = đang ổn định. */
+  unstableSince: number | null;
+  /** `now` lần cuối phát mỗi mã guidance (cooldown tính riêng theo từng mã). */
+  guidanceAt: Partial<Record<GuidanceCode, number>>;
+}
+
+const freshMemory = (): ShortTermMemory => ({ announcedSignature: null, emptySince: null, unstableSince: null, guidanceAt: {} });
+
+/** Sao chép để module khác không sửa nhầm bản engine giữ: đọc lại phải y hệt lần đã đọc. */
+const cloneResult = (r: RecognitionResult): RecognitionResult => ({ ...r, denominations: [...r.denominations] });
+
+/** Lời nói khi VÀO một trạng thái khởi động mới; null nếu trạng thái không đổi hoặc không có lời. */
+function entrySpeech(t: TransitionResult): SpeechIntent | null {
+  if (t.from === t.to) return null;
+  if (t.to === 'AWAITING_START') return { kind: 'WELCOME' };
+  if (t.to === 'WAITING_PERMISSION') return { kind: 'PERMISSION_PRIMER' };
+  if (t.to === 'READY') return { kind: 'CAMERA_READY' };
+  return null;
+}
+
+/**
+ * DecisionEngine (Module 6). XÁC ĐỊNH: cùng chuỗi đầu vào cho cùng chuỗi đầu ra; không đồng hồ, không DOM,
+ * không I/O; thời gian chỉ đến từ trường `now` của đầu vào.
+ *
+ * Mã lý do (`reasons`): SYSTEM hợp lệ = [tên sự kiện, ...BOTH_READY | WAIT_CAMERA | WAIT_MODEL | MEMORY_CLEARED];
+ * trái phép = ['ILLEGAL_TRANSITION', 'SỰ_KIỆN@TRẠNG_THÁI']; FAILURE = ['FAILURE', mã lỗi, ...DUPLICATE];
+ * USER_REPLAY = ['USER_REPLAY', 'HAS_RESULT' | 'NO_RESULT']; ANALYSIS bị bỏ qua =
+ * ['ANALYSIS_IGNORED', 'ERROR_STATE' | 'NOT_READY' | 'BACKGROUNDED'].
+ *
+ * ERROR là trạng thái cuối: mọi FAILURE dẫn tới đó; thoát bằng reset() rồi APP_STARTED.
+ * Lượt 1 chỉ cài vòng đời: mọi đầu ra đều có result = null và shouldCalculateTotal = false.
+ */
 export function createDecisionEngine(config: AppConfig['decision']): IDecisionEngine {
-  throw new Error('STUB: createDecisionEngine chưa được cài (P07)');
+  // `config` dùng ở lượt 2: mọi ngưỡng của nhánh ANALYSIS lấy từ đây.
+  let snapshot = INITIAL_SNAPSHOT;
+  let lastResult: RecognitionResult | null = null;
+  let memory = freshMemory();
+  let errorCode: AppErrorCode | null = null;
+
+  function apply(trigger: StateTrigger): TransitionResult {
+    const t = transition(snapshot, trigger);
+    snapshot = t.snapshot;
+    return t;
+  }
+
+  /** Đầu ra không công bố kết quả: status null, result null, shouldCalculateTotal false. */
+  function outputOf(reasons: string[], speech: SpeechIntent | null = null): DecisionOutput {
+    return { state: snapshot.state, status: null, reasons, speech, result: null, shouldCalculateTotal: false };
+  }
+
+  function systemReasons(event: SystemEvent, t: TransitionResult): string[] {
+    const reasons: string[] = [event];
+    if (t.to === 'READY' && t.from !== 'READY') {
+      reasons.push('BOTH_READY');
+    } else if ((event === 'MODEL_READY' || event === 'CAMERA_READY') && phaseOf(t.to) === 'STARTUP') {
+      if (!snapshot.cameraReady) reasons.push('WAIT_CAMERA');
+      if (!snapshot.modelReady) reasons.push('WAIT_MODEL');
+    }
+    if (event === 'APP_FOREGROUNDED') reasons.push('MEMORY_CLEARED');
+    return reasons;
+  }
+
+  function onSystem(event: SystemEvent): DecisionOutput {
+    const t = apply(event);
+    if (!t.accepted) return outputOf([...t.reasons]);
+    if (event === 'APP_FOREGROUNDED') memory = freshMemory();
+    return outputOf(systemReasons(event, t), entrySpeech(t));
+  }
+
+  function onFailure(code: AppErrorCode): DecisionOutput {
+    apply('FAILURE'); // hợp lệ ở mọi trạng thái: ưu tiên cao nhất
+    if (errorCode === code) return outputOf(['FAILURE', code, 'DUPLICATE']);
+    errorCode = code;
+    return outputOf(['FAILURE', code], { kind: 'ERROR', code });
+  }
+
+  function onReplay(): DecisionOutput {
+    if (lastResult === null) return outputOf(['USER_REPLAY', 'NO_RESULT'], { kind: 'REPLAY_EMPTY' });
+    return outputOf(['USER_REPLAY', 'HAS_RESULT'], { kind: 'REPLAY', result: cloneResult(lastResult) });
+  }
+
+  function onAnalysis(): DecisionOutput {
+    const phase = phaseOf(snapshot.state);
+    if (phase === 'ERROR') return outputOf(['ANALYSIS_IGNORED', 'ERROR_STATE']);
+    if (phase === 'STARTUP') return outputOf(['ANALYSIS_IGNORED', 'NOT_READY']);
+    if (snapshot.backgrounded) return outputOf(['ANALYSIS_IGNORED', 'BACKGROUNDED']);
+    // Lượt 2: cổng SPEAKING và nhánh 1..7. Lượt 1 chưa công bố gì nên không bao giờ đọc nhầm.
+    return outputOf(['ANALYSIS_NOT_IMPLEMENTED']);
+  }
+
+  return {
+    get state() {
+      return snapshot.state;
+    },
+    get lastResult() {
+      return lastResult === null ? null : cloneResult(lastResult);
+    },
+    handle(input: DecisionInput): DecisionOutput {
+      switch (input.type) {
+        case 'FAILURE': return onFailure(input.code);
+        case 'SYSTEM': return onSystem(input.event);
+        case 'USER_REPLAY': return onReplay();
+        case 'ANALYSIS': return onAnalysis();
+        default: return outputOf(['UNKNOWN_INPUT']);
+      }
+    },
+    reset(): void {
+      snapshot = INITIAL_SNAPSHOT;
+      lastResult = null;
+      memory = freshMemory();
+      errorCode = null;
+    },
+  };
 }
 </file>
 
 <file path="src/decision/total-calculator.ts">
-// STUB P07 — module thật sẽ GHI ĐÈ file này.
 import type { Denomination } from '../contracts';
+import { formatVND, isDenomination } from '../config/denominations';
 
-export function calculateTotal(
-  d: Denomination[],
-): { count: number; denominations: Denomination[]; total: number; formattedTotal: string } {
-  throw new Error('STUB: calculateTotal chưa được cài (P07)');
+/** Kết quả tính tổng một tập tờ tiền đã được xác nhận. */
+export interface TotalCalculation {
+  count: number;
+  denominations: Denomination[];
+  total: number;
+  formattedTotal: string;
+}
+
+/**
+ * Tính tổng các tờ tiền đã được xác nhận (Module 7).
+ * - `denominations` trả về là BẢN SAO, giữ nguyên thứ tự đầu vào (trái → phải); không sửa mảng đầu vào.
+ * - Danh sách rỗng hoặc có giá trị ngoài 9 mệnh giá hợp lệ thì ném RangeError:
+ *   thà dừng còn hơn đọc sai số tiền (Fail Safe).
+ * - CHỈ DecisionEngine được gọi hàm này, và chỉ ở nhánh công bố kết quả.
+ */
+export function calculateTotal(d: Denomination[]): TotalCalculation {
+  if (d.length === 0) {
+    throw new RangeError('calculateTotal: danh sách mệnh giá rỗng');
+  }
+  let total = 0;
+  for (const value of d) {
+    if (!isDenomination(value)) {
+      throw new RangeError(`calculateTotal: giá trị ngoài danh sách mệnh giá (${String(value)})`);
+    }
+    total += value;
+  }
+  return { count: d.length, denominations: [...d], total, formattedTotal: formatVND(total) };
 }
 </file>
 
@@ -3856,6 +3946,341 @@ describe('detectClassConflict · không đột biến đầu vào', () => {
 });
 </file>
 
+<file path="tests/analyzer/frame-analyzer.test.ts">
+import { describe, expect, it } from 'vitest';
+import { createFrameAnalyzer } from '../../src/analyzer/frame-analyzer';
+import { DEFAULT_CONFIG } from '../../src/config/app-config';
+import type { AppConfig, BBox, Denomination, Detection, FrameAnalysis, GrayImage, IFrameAnalyzer, InferenceResult } from '../../src/contracts';
+import { makeDetection, makeFrameMeta, makeGray, makeInferenceResult } from '../fakes';
+
+const FRAME_STEP_MS = 333;
+const box = (x1: number, y1: number, x2: number, y2: number): BBox => ({ x1, y1, x2, y2 });
+/** Hộp 300 × 200 giữa khung 640 × 480: đủ lớn, không chạm mép. */
+const CENTER = box(100, 100, 400, 300);
+const LEFT = box(20, 100, 180, 300);
+const RIGHT = box(300, 100, 460, 300);
+
+const det = (frameId: number, index: number, denomination: Denomination, confidence: number, bbox: BBox): Detection =>
+  makeDetection({ id: `${frameId}-${index}`, frameId, denomination, confidence, bbox: { ...bbox } });
+
+/** Kết quả suy luận của khung thứ `frameId` (1, 2, ...), mốc thời gian cách nhau FRAME_STEP_MS. */
+const result = (frameId: number, detections: Detection[], gray: GrayImage = makeGray(), timestamp = (frameId - 1) * FRAME_STEP_MS): InferenceResult =>
+  makeInferenceResult({ meta: makeFrameMeta({ frameId, timestamp }), detections, gray });
+
+/** Khung có một tờ chắc ở giữa với độ tin cậy cho trước. */
+const singleFrame = (frameId: number, confidence = 0.9, denomination: Denomination = 20000): InferenceResult =>
+  result(frameId, [det(frameId, 0, denomination, confidence, CENTER)]);
+
+/** Ảnh xám bàn cờ đen trắng: rất nét, độ sáng trung bình 127,5. */
+function checkerGray(width: number, height: number, cell: number): GrayImage {
+  const data = new Uint8Array(width * height);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) data[y * width + x] = (Math.floor(x / cell) + Math.floor(y / cell)) % 2 === 0 ? 0 : 255;
+  }
+  return { data, width, height };
+}
+
+interface ConfigPatch { inference?: Partial<AppConfig['inference']>; analyzer?: Partial<AppConfig['analyzer']> }
+const withConfig = (patch: ConfigPatch): AppConfig => ({
+  ...DEFAULT_CONFIG,
+  inference: { ...DEFAULT_CONFIG.inference, ...patch.inference },
+  analyzer: { ...DEFAULT_CONFIG.analyzer, ...patch.analyzer },
+});
+
+const run = (analyzer: IFrameAnalyzer, inputs: InferenceResult[]): FrameAnalysis[] => inputs.map((i) => analyzer.analyze(i));
+const lastOf = <T>(xs: readonly T[]): T | undefined => xs[xs.length - 1];
+
+function deepFreeze<T>(value: T): T {
+  if (typeof value === 'object' && value !== null && !ArrayBuffer.isView(value)) {
+    Object.values(value as Record<string, unknown>).forEach(deepFreeze);
+    Object.freeze(value);
+  }
+  return value;
+}
+
+describe('createFrameAnalyzer · lắp FrameAnalysis', () => {
+  it('lắp đủ mọi trường cho một khung có một tờ chắc', () => {
+    const d = det(1, 0, 20000, 0.95, CENTER);
+    const input = result(1, [d]);
+    expect(createFrameAnalyzer(DEFAULT_CONFIG).analyze(input)).toEqual<FrameAnalysis>({
+      meta: input.meta,
+      detections: [d],
+      sure: [d],
+      unsure: [],
+      overlap: { detected: false, maxRatio: 0, pairs: [] },
+      conflict: { detected: false, pairs: [] },
+      position: { tooSmall: false, partial: false },
+      quality: { blurScore: 0, blurry: true, brightness: 128, lowLight: false },
+      stability: { stable: false, agree: 1, window: 5, consensus: null },
+      emptyStreak: 0,
+    });
+  });
+
+  it('khung không có tiền: các danh sách rỗng, vẫn đo chất lượng ảnh', () => {
+    const analysis = createFrameAnalyzer(DEFAULT_CONFIG).analyze(result(1, []));
+    expect(analysis).toMatchObject({
+      detections: [],
+      sure: [],
+      unsure: [],
+      overlap: { detected: false },
+      conflict: { detected: false },
+      position: { tooSmall: false, partial: false },
+      quality: { brightness: 128, lowLight: false },
+      stability: { stable: false, agree: 0, window: 5, consensus: null },
+      emptyStreak: 1,
+    });
+  });
+
+  it('tách sure, unsure và loại detection dưới confLow', () => {
+    const analysis = createFrameAnalyzer(DEFAULT_CONFIG).analyze(
+      result(1, [det(1, 0, 20000, 0.9, LEFT), det(1, 1, 50000, 0.5, RIGHT), det(1, 2, 10000, 0.1, box(500, 100, 620, 300))]),
+    );
+    expect(analysis.sure.map((d) => d.id)).toEqual(['1-0']);
+    expect(analysis.unsure.map((d) => d.id)).toEqual(['1-1']);
+    expect(analysis.detections.map((d) => d.id)).toEqual(['1-0', '1-1']);
+  });
+
+  it('sắp detection từ trái sang phải dù đầu vào lộn xộn', () => {
+    const analysis = createFrameAnalyzer(DEFAULT_CONFIG).analyze(
+      result(1, [det(1, 0, 50000, 0.9, box(400, 100, 560, 300)), det(1, 1, 20000, 0.9, box(20, 100, 180, 300)), det(1, 2, 10000, 0.9, box(210, 100, 370, 300))]),
+    );
+    const expected = ['1-1', '1-2', '1-0'];
+    expect(analysis.detections.map((d) => d.id)).toEqual(expected);
+    expect(analysis.sure.map((d) => d.id)).toEqual(expected);
+  });
+
+  it('hòa tâm x thì xếp theo tâm y', () => {
+    const analysis = createFrameAnalyzer(DEFAULT_CONFIG).analyze(
+      result(1, [det(1, 0, 20000, 0.9, box(100, 250, 200, 350)), det(1, 1, 50000, 0.9, box(100, 50, 200, 150))]),
+    );
+    expect(analysis.detections.map((d) => d.id)).toEqual(['1-1', '1-0']);
+  });
+
+  it('meta được sao chép và các mảng kết quả là mảng mới', () => {
+    const input = result(1, [det(1, 0, 20000, 0.9, CENTER)]);
+    const analysis = createFrameAnalyzer(DEFAULT_CONFIG).analyze(input);
+    expect(analysis.meta).toEqual(input.meta);
+    expect(analysis.meta).not.toBe(input.meta);
+    expect(analysis.detections).not.toBe(input.detections);
+  });
+});
+
+describe('createFrameAnalyzer · chất lượng và vị trí', () => {
+  it('ảnh xám nét thì không mờ, điểm vượt ngưỡng', () => {
+    const analysis = createFrameAnalyzer(DEFAULT_CONFIG).analyze(result(1, [det(1, 0, 20000, 0.9, CENTER)], checkerGray(64, 48, 4)));
+    expect(analysis.quality.blurry).toBe(false);
+    expect(analysis.quality.blurScore).toBeGreaterThan(DEFAULT_CONFIG.analyzer.blurThreshold);
+    expect(analysis.quality.brightness).toBeCloseTo(127.5, 9);
+  });
+
+  it('ảnh xám tối thì lowLight', () => {
+    const analysis = createFrameAnalyzer(DEFAULT_CONFIG).analyze(result(1, [det(1, 0, 20000, 0.9, CENTER)], makeGray(64, 48, 20)));
+    expect(analysis.quality).toMatchObject({ brightness: 20, lowLight: true });
+  });
+
+  it.each([
+    { name: 'tờ sát mép trái là partial', bbox: box(0, 100, 300, 300), position: { tooSmall: false, partial: true } },
+    { name: 'tờ quá nhỏ là tooSmall', bbox: box(300, 200, 340, 230), position: { tooSmall: true, partial: false } },
+    { name: 'tờ vừa và ở giữa thì ổn', bbox: CENTER, position: { tooSmall: false, partial: false } },
+  ])('$name', ({ bbox, position }) => {
+    expect(createFrameAnalyzer(DEFAULT_CONFIG).analyze(result(1, [det(1, 0, 20000, 0.9, bbox)])).position).toEqual(position);
+  });
+
+  it('tờ chưa chắc cũng tham gia phát hiện chồng lấn với tờ chắc', () => {
+    const analysis = createFrameAnalyzer(DEFAULT_CONFIG).analyze(
+      result(1, [det(1, 0, 20000, 0.9, box(20, 100, 180, 300)), det(1, 1, 50000, 0.5, box(132, 100, 292, 300))]),
+    );
+    expect(analysis.overlap.pairs).toEqual([['1-0', '1-1']]);
+  });
+
+  it('tờ chưa chắc cùng chỗ nhưng khác mệnh giá với tờ chắc cũng báo conflict', () => {
+    const analysis = createFrameAnalyzer(DEFAULT_CONFIG).analyze(result(1, [det(1, 0, 20000, 0.9, CENTER), det(1, 1, 50000, 0.5, CENTER)]));
+    expect(analysis.conflict).toEqual({ detected: true, pairs: [['1-0', '1-1']] });
+  });
+
+  it('độ mờ đo trong vùng hộp tờ tiền chứ không phải toàn ảnh', () => {
+    // Hộp CENTER quy về ảnh xám 64 × 48 là [10, 40) × [10, 30); mảnh phẳng rộng hơn một chút, quanh nó ảnh rất nét.
+    const data = checkerGray(64, 48, 4).data.slice();
+    for (let y = 8; y < 32; y++) for (let x = 8; x < 42; x++) data[y * 64 + x] = 128;
+    const analysis = createFrameAnalyzer(DEFAULT_CONFIG).analyze(result(1, [det(1, 0, 20000, 0.9, CENTER)], { data, width: 64, height: 48 }));
+    expect(analysis.quality).toMatchObject({ blurScore: 0, blurry: true });
+  });
+
+  it('kích thước khung lấy từ meta khi xét tờ quá nhỏ', () => {
+    const d = det(1, 0, 20000, 0.9, CENTER);
+    const small = makeInferenceResult({ meta: makeFrameMeta({ width: 1600, height: 1200 }), detections: [d] });
+    expect(createFrameAnalyzer(DEFAULT_CONFIG).analyze(small).position.tooSmall).toBe(true);
+    expect(createFrameAnalyzer(DEFAULT_CONFIG).analyze(result(1, [d])).position.tooSmall).toBe(false);
+  });
+
+  it('hai tờ chồng nhau thì báo overlap, hai tờ cùng chỗ khác mệnh giá thì báo conflict', () => {
+    const analyzer = createFrameAnalyzer(DEFAULT_CONFIG);
+    const overlapping = analyzer.analyze(result(1, [det(1, 0, 20000, 0.9, box(20, 100, 180, 300)), det(1, 1, 50000, 0.9, box(132, 100, 292, 300))]));
+    expect(overlapping.overlap).toEqual({ detected: true, maxRatio: expect.closeTo(0.3, 9), pairs: [['1-0', '1-1']] });
+    const conflicting = createFrameAnalyzer(DEFAULT_CONFIG).analyze(result(1, [det(1, 0, 20000, 0.9, CENTER), det(1, 1, 50000, 0.8, CENTER)]));
+    expect(conflicting.conflict).toEqual({ detected: true, pairs: [['1-0', '1-1']] });
+  });
+});
+
+describe('createFrameAnalyzer · ngưỡng đọc từ config (cùng đầu vào, đổi config thì kết quả đổi)', () => {
+  const overlapInput = () => result(1, [det(1, 0, 20000, 0.9, box(20, 100, 180, 300)), det(1, 1, 50000, 0.9, box(132, 100, 292, 300))]);
+  const conflictInput = () => result(1, [det(1, 0, 20000, 0.9, box(100, 100, 400, 300)), det(1, 1, 50000, 0.9, box(100, 100, 400, 220))]);
+
+  it.each([
+    { name: 'inference.confSure', patch: { inference: { confSure: 0.95 } }, input: () => singleFrame(1, 0.9), pick: (a: FrameAnalysis) => a.sure.length, byDefault: 1, patched: 0 },
+    { name: 'inference.confLow', patch: { inference: { confLow: 0.6 } }, input: () => singleFrame(1, 0.5), pick: (a: FrameAnalysis) => a.detections.length, byDefault: 1, patched: 0 },
+    { name: 'analyzer.overlapRatio', patch: { analyzer: { overlapRatio: 0.5 } }, input: overlapInput, pick: (a: FrameAnalysis) => a.overlap.detected, byDefault: true, patched: false },
+    { name: 'analyzer.conflictIou', patch: { analyzer: { conflictIou: 0.8 } }, input: conflictInput, pick: (a: FrameAnalysis) => a.conflict.detected, byDefault: true, patched: false },
+    { name: 'analyzer.minAreaRatio', patch: { analyzer: { minAreaRatio: 0.5 } }, input: () => singleFrame(1), pick: (a: FrameAnalysis) => a.position.tooSmall, byDefault: false, patched: true },
+    { name: 'analyzer.edgeMarginRatio', patch: { analyzer: { edgeMarginRatio: 0.3 } }, input: () => singleFrame(1), pick: (a: FrameAnalysis) => a.position.partial, byDefault: false, patched: true },
+    { name: 'analyzer.blurThreshold', patch: { analyzer: { blurThreshold: 1e9 } }, input: () => result(1, [det(1, 0, 20000, 0.9, CENTER)], checkerGray(64, 48, 4)), pick: (a: FrameAnalysis) => a.quality.blurry, byDefault: false, patched: true },
+    { name: 'analyzer.lowLightMean', patch: { analyzer: { lowLightMean: 200 } }, input: () => singleFrame(1), pick: (a: FrameAnalysis) => a.quality.lowLight, byDefault: false, patched: true },
+    {
+      name: 'analyzer.stabilizer.minAgree',
+      patch: { analyzer: { stabilizer: { ...DEFAULT_CONFIG.analyzer.stabilizer, minAgree: 1 } } },
+      input: () => singleFrame(1),
+      pick: (a: FrameAnalysis) => a.stability.stable,
+      byDefault: false,
+      patched: true,
+    },
+  ])('$name', ({ patch, input, pick, byDefault, patched }) => {
+    expect(pick(createFrameAnalyzer(DEFAULT_CONFIG).analyze(input()))).toBe(byDefault);
+    expect(pick(createFrameAnalyzer(withConfig(patch)).analyze(input()))).toBe(patched);
+  });
+
+  it('cấu hình stabilizer không hợp lệ thì ném RangeError ngay khi tạo', () => {
+    const bad = withConfig({ analyzer: { stabilizer: { windowSize: 0, minAgree: 1, matchIou: 0.5, maxAgeMs: 2500 } } });
+    expect(() => createFrameAnalyzer(bad)).toThrow(RangeError);
+  });
+});
+
+describe('createFrameAnalyzer · ổn định theo thời gian (kịch bản nhiều khung)', () => {
+  it('bốn khung giống nhau thì ổn định ở khung thứ tư, consensus là trung bình độ tin cậy', () => {
+    const analyses = run(createFrameAnalyzer(DEFAULT_CONFIG), [0.8, 0.9, 0.85, 0.95].map((c, i) => singleFrame(i + 1, c)));
+    expect(analyses.map((a) => a.stability.stable)).toEqual([false, false, false, true]);
+    expect(analyses.map((a) => a.stability.agree)).toEqual([1, 2, 3, 4]);
+    const consensus = lastOf(analyses)?.stability.consensus;
+    expect(consensus?.[0]?.confidence).toBeCloseTo(0.875, 9);
+    expect(consensus?.[0]).toMatchObject({ id: '4-0', denomination: 20000 });
+  });
+
+  it('hai tờ ổn định thì consensus giữ thứ tự trái → phải', () => {
+    const frames = [1, 2, 3, 4].map((f) => result(f, [det(f, 0, 50000, 0.9, RIGHT), det(f, 1, 20000, 0.9, LEFT)]));
+    const consensus = lastOf(run(createFrameAnalyzer(DEFAULT_CONFIG), frames))?.stability.consensus;
+    expect(consensus?.map((d) => d.denomination)).toEqual([20000, 50000]);
+  });
+
+  it('khung hiện tại có thêm tờ chưa chắc thì không ổn định dù bốn khung trước đồng thuận', () => {
+    const analyzer = createFrameAnalyzer(DEFAULT_CONFIG);
+    run(analyzer, [1, 2, 3, 4].map((f) => singleFrame(f)));
+    const withExtra = analyzer.analyze(result(5, [det(5, 0, 20000, 0.9, LEFT), det(5, 1, 50000, 0.5, RIGHT)]));
+    expect(withExtra.stability).toEqual({ stable: false, agree: 0, window: 5, consensus: null });
+  });
+
+  it.each([
+    {
+      name: 'chồng lấn',
+      detections: (f: number) => [det(f, 0, 20000, 0.9, box(20, 100, 180, 300)), det(f, 1, 50000, 0.9, box(132, 100, 292, 300))],
+      flag: (a: FrameAnalysis) => a.overlap.detected,
+    },
+    {
+      name: 'xung đột lớp',
+      detections: (f: number) => [det(f, 0, 20000, 0.9, CENTER), det(f, 1, 50000, 0.8, CENTER)],
+      flag: (a: FrameAnalysis) => a.conflict.detected,
+    },
+  ])('khung $name không bao giờ ổn định', ({ detections, flag }) => {
+    const analyses = run(createFrameAnalyzer(DEFAULT_CONFIG), [1, 2, 3, 4, 5, 6].map((f) => result(f, detections(f))));
+    expect(analyses.every(flag)).toBe(true);
+    expect(analyses.some((a) => a.stability.stable)).toBe(false);
+    expect(analyses.every((a) => a.stability.consensus === null)).toBe(true);
+  });
+
+  it('khung cách nhau 1000 ms bị loại theo maxAgeMs; nới maxAgeMs trong config thì ổn định', () => {
+    const slow = () => [0, 1000, 2000, 3000].map((t, i) => result(i + 1, [det(i + 1, 0, 20000, 0.9, CENTER)], makeGray(), t));
+    const byDefault = lastOf(run(createFrameAnalyzer(DEFAULT_CONFIG), slow()));
+    expect(byDefault?.stability).toMatchObject({ stable: false, agree: 3 });
+    const relaxed = withConfig({ analyzer: { stabilizer: { ...DEFAULT_CONFIG.analyzer.stabilizer, maxAgeMs: 5000 } } });
+    expect(lastOf(run(createFrameAnalyzer(relaxed), slow()))?.stability).toMatchObject({ stable: true, agree: 4 });
+  });
+
+  it('đổi sang tờ khác: ổn định lại chỉ sau đủ bốn khung của tờ mới', () => {
+    const frames = [20000, 20000, 20000, 20000, 50000, 50000, 50000, 50000].map((d, i) => singleFrame(i + 1, 0.9, d as Denomination));
+    const analyses = run(createFrameAnalyzer(DEFAULT_CONFIG), frames);
+    expect(analyses.map((a) => a.stability.stable)).toEqual([false, false, false, true, false, false, false, true]);
+    expect(lastOf(analyses)?.stability.consensus?.map((d) => d.denomination)).toEqual([50000]);
+  });
+
+  it('rút tiền ra đủ cả cửa sổ khung trống rồi đưa lại thì phải đếm lại từ đầu', () => {
+    const analyzer = createFrameAnalyzer(DEFAULT_CONFIG);
+    run(analyzer, [1, 2, 3, 4].map((f) => singleFrame(f)));
+    run(analyzer, [5, 6, 7, 8, 9].map((f) => result(f, [])));
+    expect(analyzer.analyze(singleFrame(10)).stability).toMatchObject({ stable: false, agree: 1 });
+  });
+
+  it('reset xóa cửa sổ ổn định', () => {
+    const analyzer = createFrameAnalyzer(DEFAULT_CONFIG);
+    expect(lastOf(run(analyzer, [1, 2, 3, 4].map((f) => singleFrame(f))))?.stability.stable).toBe(true);
+    analyzer.reset();
+    expect(analyzer.analyze(singleFrame(5)).stability).toMatchObject({ stable: false, agree: 1 });
+  });
+
+  it('hai bộ phân tích tạo riêng không dùng chung trạng thái', () => {
+    const first = createFrameAnalyzer(DEFAULT_CONFIG);
+    const second = createFrameAnalyzer(DEFAULT_CONFIG);
+    run(first, [1, 2, 3, 4].map((f) => singleFrame(f)));
+    expect(second.analyze(singleFrame(5)).stability).toMatchObject({ stable: false, agree: 1 });
+  });
+});
+
+describe('createFrameAnalyzer · emptyStreak', () => {
+  it('tăng theo từng khung trống và về 0 khi có detection', () => {
+    const inputs = [[], [], [det(3, 0, 20000, 0.9, CENTER)], [], [det(5, 0, 20000, 0.9, CENTER)]].map((d, i) => result(i + 1, d));
+    expect(run(createFrameAnalyzer(DEFAULT_CONFIG), inputs).map((a) => a.emptyStreak)).toEqual([1, 2, 0, 1, 0]);
+  });
+
+  it('khung chỉ có tờ chưa chắc không phải khung trống', () => {
+    const analysis = createFrameAnalyzer(DEFAULT_CONFIG).analyze(singleFrame(1, 0.5));
+    expect(analysis).toMatchObject({ sure: [], emptyStreak: 0 });
+    expect(analysis.unsure).toHaveLength(1);
+  });
+
+  it('chỉ có detection dưới confLow vẫn tính là khung trống', () => {
+    const analysis = createFrameAnalyzer(DEFAULT_CONFIG).analyze(singleFrame(1, 0.1));
+    expect(analysis.detections).toEqual([]);
+    expect(analysis.emptyStreak).toBe(1);
+  });
+
+  it('reset đưa emptyStreak về 0', () => {
+    const analyzer = createFrameAnalyzer(DEFAULT_CONFIG);
+    run(analyzer, [1, 2, 3].map((f) => result(f, [])));
+    analyzer.reset();
+    expect(analyzer.analyze(result(4, [])).emptyStreak).toBe(1);
+  });
+});
+
+describe('createFrameAnalyzer · không đột biến đầu vào', () => {
+  it('đầu vào đóng băng sâu vẫn chạy được và không đổi', () => {
+    const detections = [det(1, 0, 20000, 0.9, LEFT), det(1, 1, 50000, 0.5, RIGHT), det(1, 2, 10000, 0.1, box(500, 100, 620, 300))].reverse();
+    const input = result(1, detections, checkerGray(64, 48, 4));
+    const before = structuredClone(input);
+    deepFreeze(input);
+    const analyzer = createFrameAnalyzer(DEFAULT_CONFIG);
+    expect(() => run(analyzer, [input, input, input, input])).not.toThrow();
+    expect(input).toEqual(before);
+  });
+
+  it('sửa các mảng kết quả không ảnh hưởng đầu vào', () => {
+    const input = result(1, [det(1, 0, 20000, 0.9, CENTER)]);
+    const analysis = createFrameAnalyzer(DEFAULT_CONFIG).analyze(input);
+    analysis.detections.length = 0;
+    analysis.sure.length = 0;
+    analysis.meta.frameId = 999;
+    expect(input.detections).toHaveLength(1);
+    expect(input.meta.frameId).toBe(1);
+  });
+});
+</file>
+
 <file path="tests/analyzer/overlap-detector.test.ts">
 import { describe, expect, it } from 'vitest';
 import { detectOverlap } from '../../src/analyzer/overlap-detector';
@@ -4037,6 +4462,299 @@ describe('analyzePosition · nhiều hộp và trường hợp biên', () => {
     const snapshot = JSON.stringify(input);
     expect(() => analyze(input as Detection[])).not.toThrow();
     expect(JSON.stringify(input)).toBe(snapshot);
+  });
+});
+</file>
+
+<file path="tests/analyzer/temporal-stabilizer.test.ts">
+import { describe, expect, it } from 'vitest';
+import { createTemporalStabilizer, isFrameValid, matchDetections } from '../../src/analyzer/temporal-stabilizer';
+import type { MatchableBox, StabilizerConfig, StabilizerFrame, TemporalStabilizer } from '../../src/analyzer/temporal-stabilizer';
+import type { BBox, Denomination, Detection } from '../../src/contracts';
+import {
+  makeAnalysis,
+  makeConflictAnalysis,
+  makeDetection,
+  makeOverlapAnalysis,
+  makeSingleSureAnalysis,
+  makeUnsureAnalysis,
+} from '../fakes';
+
+const CONFIG: StabilizerConfig = { windowSize: 5, minAgree: 4, matchIou: 0.5, maxAgeMs: 2500 };
+const STEP_MS = 100;
+
+const box = (x1: number, y1: number, x2: number, y2: number): BBox => ({ x1, y1, x2, y2 });
+const LEFT = box(20, 100, 180, 300);
+const RIGHT = box(200, 100, 360, 300);
+
+/** Detection chắc với bản sao riêng của hộp, để test sửa một Detection không lan sang hằng số dùng chung. */
+const sure = (denomination: Denomination = 20000, confidence = 0.9, bbox: BBox = LEFT, index = 0): Detection =>
+  makeDetection({ id: `1-${index}`, denomination, confidence, bbox: { ...bbox } });
+const frame = (timestamp: number, sureBoxes: Detection[], valid = true): StabilizerFrame => ({ timestamp, valid, sure: sureBoxes });
+const lastOf = <T>(xs: readonly T[]): T | undefined => xs[xs.length - 1];
+
+/** Mã mẫu: A = khung hợp lệ 20000đ, B = khung hợp lệ 50000đ, x = khung không hợp lệ; mỗi khung cách nhau STEP_MS. */
+function feedPattern(stabilizer: TemporalStabilizer, pattern: string) {
+  return [...pattern].map((code, index) =>
+    stabilizer.push(frame(index * STEP_MS, [sure(code === 'B' ? 50000 : 20000)], code !== 'x')),
+  );
+}
+
+/** Khung có `count` tờ: 1 → [20000 trái]; 2 → [20000 trái, 50000 phải]. */
+const notes = (count: 1 | 2): Detection[] =>
+  count === 1 ? [sure(20000, 0.9, LEFT, 0)] : [sure(20000, 0.9, LEFT, 0), sure(50000, 0.9, RIGHT, 1)];
+
+describe('createTemporalStabilizer · đồng thuận theo số khung', () => {
+  it.each([
+    { name: '5 khung đồng thuận', pattern: 'AAAAA', stable: true, agree: 5 },
+    { name: 'đủ minAgree đúng ranh (4 khung)', pattern: 'AAAA', stable: true, agree: 4 },
+    { name: '3 khung đồng thuận chưa đủ', pattern: 'AAA', stable: false, agree: 3 },
+    { name: '3 trong 5 khung hợp lệ (xen khung không hợp lệ)', pattern: 'AxAxA', stable: false, agree: 3 },
+    { name: 'khung xen kẽ đổi mệnh giá', pattern: 'ABABA', stable: false, agree: 3 },
+    { name: 'một khung lệch mệnh giá ở đầu cửa sổ vẫn ổn định', pattern: 'BAAAA', stable: true, agree: 4 },
+    { name: 'một khung không hợp lệ ở đầu cửa sổ không cản', pattern: 'xAAAA', stable: true, agree: 4 },
+    { name: 'khung mới nhất đổi mệnh giá', pattern: 'AAAAB', stable: false, agree: 1 },
+    { name: 'khung mới nhất không hợp lệ thì không ổn định dù 4 khung trước đồng thuận', pattern: 'AAAAx', stable: false, agree: 0 },
+    { name: 'cửa sổ trượt: chỉ tính 5 khung gần nhất', pattern: 'AAAAAAAAAA', stable: true, agree: 5 },
+  ])('$name', ({ pattern, stable, agree }) => {
+    const infos = feedPattern(createTemporalStabilizer(CONFIG), pattern);
+    expect(lastOf(infos)).toMatchObject({ stable, agree });
+  });
+
+  it('khung tự khai hợp lệ nhưng không có hộp chắc nào thì không bao giờ ổn định', () => {
+    const s = createTemporalStabilizer(CONFIG);
+    const infos = [0, 1, 2, 3, 4].map((i) => s.push(frame(i * STEP_MS, [])));
+    expect(infos.every((i) => !i.stable && i.agree === 0 && i.consensus === null)).toBe(true);
+  });
+
+  it('window luôn bằng windowSize (sức chứa), kể cả khi cửa sổ chưa đầy', () => {
+    const infos = feedPattern(createTemporalStabilizer(CONFIG), 'AA');
+    expect(infos.map((i) => i.window)).toEqual([5, 5]);
+  });
+
+  it('agree tăng dần theo từng khung đồng thuận', () => {
+    const infos = feedPattern(createTemporalStabilizer(CONFIG), 'AAAAA');
+    expect(infos.map((i) => i.agree)).toEqual([1, 2, 3, 4, 5]);
+    expect(infos.map((i) => i.stable)).toEqual([false, false, false, true, true]);
+  });
+});
+
+describe('createTemporalStabilizer · đổi số tờ', () => {
+  it.each([
+    { name: 'ba khung một tờ rồi hai khung hai tờ', counts: [1, 1, 1, 2, 2] as const, stable: false, agree: 2 },
+    { name: 'một khung một tờ rồi bốn khung hai tờ (khung cũ lệch bị bỏ qua)', counts: [1, 2, 2, 2, 2] as const, stable: true, agree: 4 },
+    { name: 'bốn khung hai tờ rồi một khung một tờ', counts: [2, 2, 2, 2, 1] as const, stable: false, agree: 1 },
+  ])('$name', ({ counts, stable, agree }) => {
+    const s = createTemporalStabilizer(CONFIG);
+    const infos = counts.map((count, index) => s.push(frame(index * STEP_MS, notes(count))));
+    expect(lastOf(infos)).toMatchObject({ stable, agree });
+  });
+});
+
+describe('createTemporalStabilizer · mục quá hạn', () => {
+  it.each([
+    { name: 'bốn khung trong hạn', times: [0, 500, 1000, 1500], stable: true, agree: 4 },
+    { name: 'khung cũ nhất già hơn maxAgeMs thì bị loại', times: [0, 500, 1000, 2600], stable: false, agree: 3 },
+    { name: 'đúng maxAgeMs thì còn giữ', times: [0, 100, 200, 2500], stable: true, agree: 4 },
+    { name: 'hơn maxAgeMs 1 ms thì bị loại', times: [0, 100, 200, 2501], stable: false, agree: 3 },
+    { name: 'đồng hồ lùi thì bỏ các mục "ở tương lai"', times: [1000, 1100, 1200, 500], stable: false, agree: 1 },
+    { name: 'mốc thời gian NaN thì bỏ mọi mục cũ', times: [0, 100, 200, Number.NaN], stable: false, agree: 1 },
+  ])('$name', ({ times, stable, agree }) => {
+    const s = createTemporalStabilizer(CONFIG);
+    const infos = times.map((t) => s.push(frame(t, [sure()])));
+    expect(lastOf(infos)).toMatchObject({ stable, agree });
+  });
+});
+
+describe('createTemporalStabilizer · reset', () => {
+  it('sau reset phải đủ minAgree khung mới mới ổn định lại', () => {
+    const s = createTemporalStabilizer(CONFIG);
+    expect(lastOf(feedPattern(s, 'AAAA'))?.stable).toBe(true);
+    s.reset();
+    const after = [0, 1, 2, 3].map((i) => s.push(frame(1000 + i * STEP_MS, [sure()])));
+    expect(after.map((i) => i.agree)).toEqual([1, 2, 3, 4]);
+    expect(after.map((i) => i.stable)).toEqual([false, false, false, true]);
+  });
+});
+
+describe('createTemporalStabilizer · consensus', () => {
+  it('confidence là trung bình các khung đồng thuận, phần còn lại lấy từ khung mới nhất', () => {
+    const s = createTemporalStabilizer(CONFIG);
+    const confidences = [0.8, 0.9, 0.85, 0.95];
+    const infos = confidences.map((c, i) =>
+      s.push(frame(i * STEP_MS, [makeDetection({ id: `${i + 1}-0`, frameId: i + 1, timestamp: i * STEP_MS, confidence: c, bbox: LEFT })])),
+    );
+    const consensus = lastOf(infos)?.consensus;
+    expect(consensus).toHaveLength(1);
+    expect(consensus?.[0]?.confidence).toBeCloseTo(0.875, 9);
+    expect(consensus?.[0]).toMatchObject({ id: '4-0', frameId: 4, timestamp: 300, denomination: 20000, bbox: LEFT });
+  });
+
+  it('hai tờ: mỗi tờ có trung bình riêng, giữ thứ tự trái → phải', () => {
+    const s = createTemporalStabilizer(CONFIG);
+    const rightConfidences = [0.7, 0.9, 0.7, 0.9];
+    const infos = rightConfidences.map((c, i) =>
+      s.push(frame(i * STEP_MS, [sure(20000, 0.8, LEFT, 0), sure(50000, c, RIGHT, 1)])),
+    );
+    const consensus = lastOf(infos)?.consensus ?? [];
+    expect(consensus.map((d) => d.denomination)).toEqual([20000, 50000]);
+    expect(consensus[0]?.confidence).toBeCloseTo(0.8, 9);
+    expect(consensus[1]?.confidence).toBeCloseTo(0.8, 9);
+  });
+
+  it('khung không hợp lệ trong cửa sổ không được tính vào trung bình', () => {
+    const s = createTemporalStabilizer(CONFIG);
+    s.push(frame(0, [sure(20000, 0.9)]));
+    s.push(frame(100, [sure(20000, 0.1)], false));
+    s.push(frame(200, [sure(20000, 0.8)]));
+    s.push(frame(300, [sure(20000, 0.8)]));
+    const info = s.push(frame(400, [sure(20000, 0.9)]));
+    expect(info.stable).toBe(true);
+    expect(info.consensus?.[0]?.confidence).toBeCloseTo(0.85, 9);
+  });
+
+  it('hộp xê dịch nhẹ giữa các khung (IoU ≥ matchIou) vẫn đồng thuận, bbox lấy từ khung mới nhất', () => {
+    const s = createTemporalStabilizer(CONFIG);
+    const infos = [0, 5, 10, 15].map((dx, i) => s.push(frame(i * STEP_MS, [sure(20000, 0.9, box(20 + dx, 100, 180 + dx, 300))])));
+    const last = lastOf(infos);
+    expect(last?.stable).toBe(true);
+    expect(last?.consensus?.[0]?.bbox).toEqual(box(35, 100, 195, 300));
+  });
+
+  it('chưa ổn định hoặc khung mới nhất không hợp lệ thì consensus là null', () => {
+    const s = createTemporalStabilizer(CONFIG);
+    expect(s.push(frame(0, [sure()])).consensus).toBeNull();
+    expect(s.push(frame(100, [sure()], false)).consensus).toBeNull();
+  });
+
+  it('consensus là bản sao: sửa nó không làm đổi đầu vào', () => {
+    const s = createTemporalStabilizer({ ...CONFIG, minAgree: 1 });
+    const input = sure(20000, 0.9);
+    const consensus = s.push(frame(0, [input])).consensus;
+    expect(consensus).not.toBeNull();
+    const first = consensus?.[0];
+    if (first === undefined) return;
+    first.confidence = 0.1;
+    first.bbox.x1 = 999;
+    expect(input.confidence).toBe(0.9);
+    expect(input.bbox).toEqual(LEFT);
+  });
+});
+
+describe('createTemporalStabilizer · tính độc lập với đối tượng của người gọi', () => {
+  it('sửa Detection sau khi push không làm hỏng cửa sổ', () => {
+    const s = createTemporalStabilizer(CONFIG);
+    const first = sure(20000, 0.8);
+    s.push(frame(0, [first]));
+    first.confidence = 0.1;
+    first.bbox.x1 = 600;
+    first.bbox.x2 = 640;
+    const infos = [1, 2, 3].map((i) => s.push(frame(i * STEP_MS, [sure(20000, 0.8)])));
+    const last = lastOf(infos);
+    expect(last?.stable).toBe(true);
+    expect(last?.consensus?.[0]?.confidence).toBeCloseTo(0.8, 9);
+  });
+
+  it('đầu vào đóng băng vẫn chạy được', () => {
+    const s = createTemporalStabilizer(CONFIG);
+    const frozen = Object.freeze([Object.freeze(makeDetection({ id: '1-0', bbox: Object.freeze({ ...LEFT }) }))]);
+    expect(() => {
+      for (let i = 0; i < 4; i++) s.push({ timestamp: i * STEP_MS, valid: true, sure: frozen });
+    }).not.toThrow();
+  });
+});
+
+describe('createTemporalStabilizer · cấu hình', () => {
+  it.each([
+    { name: 'windowSize 0', patch: { windowSize: 0 } },
+    { name: 'windowSize không nguyên', patch: { windowSize: 2.5 } },
+    { name: 'minAgree 0', patch: { minAgree: 0 } },
+    { name: 'minAgree lớn hơn windowSize', patch: { minAgree: 6 } },
+    { name: 'minAgree không nguyên', patch: { minAgree: 3.5 } },
+    { name: 'matchIou 0', patch: { matchIou: 0 } },
+    { name: 'matchIou lớn hơn 1', patch: { matchIou: 1.2 } },
+    { name: 'maxAgeMs âm', patch: { maxAgeMs: -1 } },
+    { name: 'maxAgeMs NaN', patch: { maxAgeMs: Number.NaN } },
+  ])('ném RangeError khi $name', ({ patch }) => {
+    expect(() => createTemporalStabilizer({ ...CONFIG, ...patch })).toThrow(RangeError);
+  });
+
+  it.each([
+    { name: 'cửa sổ một khung, minAgree 1', config: { ...CONFIG, windowSize: 1, minAgree: 1 }, pattern: 'A', stable: true },
+    { name: 'maxAgeMs vô hạn tắt việc loại theo tuổi', config: { ...CONFIG, maxAgeMs: Number.POSITIVE_INFINITY }, pattern: 'AAAA', stable: true },
+    { name: 'minAgree 2 thì hai khung là đủ', config: { ...CONFIG, minAgree: 2 }, pattern: 'AA', stable: true },
+  ])('chấp nhận $name', ({ config, pattern, stable }) => {
+    expect(lastOf(feedPattern(createTemporalStabilizer(config), pattern))?.stable).toBe(stable);
+  });
+});
+
+describe('matchDetections · ghép hộp giữa hai khung', () => {
+  const m = (denomination: Denomination, bbox: BBox): MatchableBox => ({ denomination, bbox });
+  const base = box(0, 0, 100, 100);
+
+  it.each([
+    { name: 'hai hộp giống hệt', a: [m(20000, base)], b: [m(20000, base)], expected: [0] },
+    { name: 'IoU đúng ngưỡng 0,5 thì ghép được (so sánh ≥)', a: [m(20000, base)], b: [m(20000, box(0, 0, 100, 50))], expected: [0] },
+    { name: 'IoU 0,49 thì không ghép', a: [m(20000, base)], b: [m(20000, box(0, 0, 100, 49))], expected: null },
+    { name: 'khác mệnh giá', a: [m(20000, base)], b: [m(50000, base)], expected: null },
+    { name: 'khác số tờ', a: [m(20000, base)], b: [m(20000, base), m(20000, box(300, 0, 400, 100))], expected: null },
+    { name: 'cùng số tờ nhưng khác đa tập mệnh giá', a: [m(20000, LEFT), m(20000, RIGHT)], b: [m(20000, LEFT), m(50000, RIGHT)], expected: null },
+    { name: 'hai tờ đổi chỗ cho nhau thì không ghép được dù cùng đa tập', a: [m(20000, LEFT), m(50000, RIGHT)], b: [m(50000, LEFT), m(20000, RIGHT)], expected: null },
+    { name: 'thứ tự trong mảng khác nhau nhưng vị trí khớp', a: [m(20000, LEFT), m(50000, RIGHT)], b: [m(50000, RIGHT), m(20000, LEFT)], expected: [1, 0] },
+    { name: 'hộp suy biến không ghép được', a: [m(20000, box(5, 5, 5, 50))], b: [m(20000, box(5, 5, 5, 50))], expected: null },
+  ])('$name', ({ a, b, expected }) => {
+    expect(matchDetections(a, b, 0.5)).toEqual(expected);
+  });
+
+  it('một hộp cũ không thể được ghép cho hai hộp mới', () => {
+    const a = [m(20000, box(0, 0, 100, 100)), m(20000, box(60, 0, 160, 100))];
+    const b = [m(20000, box(30, 0, 130, 100)), m(20000, box(300, 0, 400, 100))];
+    expect(matchDetections(a, b, 0.5)).toBeNull();
+  });
+
+  it('ghép tham lam theo IoU giảm dần tìm đủ cặp mà ghép theo thứ tự chỉ số sẽ bỏ lỡ', () => {
+    // b[0] (x = 60) là lựa chọn duy nhất của a[1] (x = 62, IoU 0,96) nhưng cũng là ứng viên đầu tiên của a[0] (x = 32, IoU 0,56);
+    // b[1] (x = 0) chỉ vừa đủ cho a[0] (IoU 0,52). Phải ưu tiên cặp IoU cao nhất thì mới ghép đủ.
+    const a = [m(20000, box(32, 0, 132, 100)), m(20000, box(62, 0, 162, 100))];
+    const b = [m(20000, box(60, 0, 160, 100)), m(20000, box(0, 0, 100, 100))];
+    expect(matchDetections(a, b, 0.5)).toEqual([1, 0]);
+  });
+
+  it('ưu tiên cặp IoU cao nhất trước (giảm dần), không phải thấp nhất', () => {
+    // a[1] chỉ hợp b[1] (IoU 0,96); a[0] hợp b[0] (0,90) và b[1] (0,52). Ưu tiên IoU thấp trước sẽ để a[0] chiếm b[1] rồi bỏ lỡ a[1].
+    const a = [m(20000, box(5, 0, 105, 100)), m(20000, box(39, 0, 139, 100))];
+    const b = [m(20000, box(0, 0, 100, 100)), m(20000, box(37, 0, 137, 100))];
+    expect(matchDetections(a, b, 0.5)).toEqual([0, 1]);
+  });
+
+  it('không sửa đầu vào', () => {
+    const a = Object.freeze([Object.freeze(m(20000, Object.freeze(base)))]);
+    expect(() => matchDetections(a, a, 0.5)).not.toThrow();
+  });
+});
+
+describe('isFrameValid · điều kiện khung hợp lệ', () => {
+  it.each([
+    { name: 'một tờ chắc, không cờ nào', analysis: makeSingleSureAnalysis(), expected: true },
+    { name: 'không có tờ nào', analysis: makeAnalysis(), expected: false },
+    { name: 'chỉ có tờ chưa chắc', analysis: makeUnsureAnalysis(), expected: false },
+    {
+      name: 'có tờ chắc nhưng kèm một tờ chưa chắc',
+      analysis: makeSingleSureAnalysis(20000, { unsure: [makeDetection({ id: '1-1', confidence: 0.5 })] }),
+      expected: false,
+    },
+    { name: 'chồng lấn', analysis: makeOverlapAnalysis(), expected: false },
+    { name: 'xung đột lớp', analysis: makeConflictAnalysis(), expected: false },
+    {
+      name: 'quá nhỏ, chạm mép, mờ và tối không làm khung mất hợp lệ',
+      analysis: makeSingleSureAnalysis(20000, {
+        position: { tooSmall: true, partial: true },
+        quality: { blurScore: 1, blurry: true, brightness: 5, lowLight: true },
+      }),
+      expected: true,
+    },
+  ])('$name', ({ analysis, expected }) => {
+    expect(isFrameValid(analysis)).toBe(expected);
   });
 });
 </file>
@@ -9087,6 +9805,84 @@ export default defineConfig({
     13,
     3549
   ]
+}
+</file>
+
+<file path="src/analyzer/frame-analyzer.ts">
+import type { AppConfig, Detection, FrameAnalysis, IFrameAnalyzer, InferenceResult } from '../contracts';
+import { center } from '../utils/geometry';
+import { measureBlur } from './blur-detector';
+import { measureBrightness } from './brightness-analyzer';
+import { splitByConfidence } from './confidence-analyzer';
+import { detectClassConflict } from './conflict-detector';
+import { detectOverlap } from './overlap-detector';
+import { analyzePosition } from './position-analyzer';
+import { createTemporalStabilizer, isFrameValid } from './temporal-stabilizer';
+
+/** Sắp từ trái sang phải (tâm x tăng dần, hòa thì theo tâm y), ổn định. Trả mảng mới, không sửa đầu vào. */
+function sortLeftToRight(detections: readonly Detection[]): Detection[] {
+  return [...detections].sort((a, b) => {
+    const ca = center(a.bbox);
+    const cb = center(b.bbox);
+    return ca.x - cb.x || ca.y - cb.y;
+  });
+}
+
+/**
+ * Tạo bộ phân tích khung hình. Chỉ MÔ TẢ khung hình (chắc hay không, chồng lấn, xung đột, vị trí, mờ, tối, ổn định),
+ * tuyệt đối không quyết định đọc hay không, không nói, không tính tổng.
+ *
+ * Mỗi lần analyze: sắp detection trái → phải, tách sure/unsure (A1), rồi chạy A2 đến A6 trên mọi detection có
+ * độ tin cậy ≥ confLow (cả chắc lẫn chưa chắc), cuối cùng đưa khung vào bộ ổn định (A7).
+ * Ngưỡng: confLow, confSure lấy từ config.inference; mọi ngưỡng còn lại từ config.analyzer. Không có hằng số ma thuật.
+ * Trạng thái duy nhất giữ lại giữa các khung: cửa sổ của bộ ổn định và emptyStreak.
+ * Không sửa InferenceResult đầu vào; kết quả dùng mảng mới (các đối tượng Detection được dùng chung với đầu vào).
+ * Ném RangeError nếu config.analyzer.stabilizer không hợp lệ (xem createTemporalStabilizer).
+ *
+ * @param config Cấu hình ứng dụng (DEFAULT_CONFIG hoặc bản đã hiệu chỉnh).
+ */
+export function createFrameAnalyzer(config: AppConfig): IFrameAnalyzer {
+  const { inference, analyzer } = config;
+  const stabilizer = createTemporalStabilizer(analyzer.stabilizer);
+  let emptyStreak = 0;
+
+  /** Phân tích một kết quả suy luận; meta.timestamp (mili-giây) là mốc thời gian cho cửa sổ ổn định. */
+  function analyze(r: InferenceResult): FrameAnalysis {
+    const { sure, unsure, kept } = splitByConfidence(sortLeftToRight(r.detections), inference.confLow, inference.confSure);
+    const overlap = detectOverlap(kept, analyzer.overlapRatio);
+    const conflict = detectClassConflict(kept, analyzer.conflictIou);
+    const position = analyzePosition(kept, r.meta, analyzer.minAreaRatio, analyzer.edgeMarginRatio);
+    const blur = measureBlur(r.gray, r.meta, kept.map((d) => d.bbox), analyzer.blurThreshold);
+    const brightness = measureBrightness(r.gray, analyzer.lowLightMean);
+
+    const stability = stabilizer.push({
+      timestamp: r.meta.timestamp,
+      valid: isFrameValid({ sure, unsure, overlap, conflict }),
+      sure,
+    });
+    emptyStreak = kept.length === 0 ? emptyStreak + 1 : 0;
+
+    return {
+      meta: { ...r.meta },
+      detections: kept,
+      sure,
+      unsure,
+      overlap,
+      conflict,
+      position,
+      quality: { ...blur, ...brightness },
+      stability,
+      emptyStreak,
+    };
+  }
+
+  /** Xóa cửa sổ ổn định và đưa emptyStreak về 0 (ví dụ khi camera tạm dừng rồi chạy lại). */
+  function reset(): void {
+    stabilizer.reset();
+    emptyStreak = 0;
+  }
+
+  return { analyze, reset };
 }
 </file>
 

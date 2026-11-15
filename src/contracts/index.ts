@@ -259,4 +259,6 @@ export interface AppConfig {
     guidanceCooldownMs: number; guidancePriority: GuidanceCode[];
   };
   speech: { dedupeWindowMs: number; minGapMs: number; guidanceStaleMs: number; maxUtteranceMs: number };
+  /** Giới hạn của cài đặt người dùng: kho cài đặt kẹp giá trị theo đây (speechRates là các mức được phép). */
+  settings: { fontScaleMin: number; fontScaleMax: number; speechRates: number[]; modelVersionMaxLength: number };
 }

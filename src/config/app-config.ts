@@ -15,6 +15,7 @@ export const DEFAULT_CONFIG: AppConfig = {
     guidancePriority: ['CLASS_CONFLICT', 'OVERLAP', 'PARTIAL_IN_FRAME', 'TOO_FAR', 'LOW_LIGHT', 'BLUR', 'LOW_CONFIDENCE', 'MULTI_NOT_ALLOWED', 'HOLD_STEADY', 'NO_MONEY'],
   },
   speech: { dedupeWindowMs: 5000, minGapMs: 400, guidanceStaleMs: 3000, maxUtteranceMs: 15000 },
+  settings: { fontScaleMin: 1, fontScaleMax: 2, speechRates: [0.8, 1.0, 1.2], modelVersionMaxLength: 32 },
 };
 
 export const DEFAULT_SETTINGS: Settings = {

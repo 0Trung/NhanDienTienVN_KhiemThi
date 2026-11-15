@@ -1,4 +1,3 @@
-import { DEFAULT_CONFIG } from '../config/app-config';
 import { AppError } from '../contracts';
 import type { AppConfig, CapturedFrame, IInferenceClient, InferenceResult, ModelInfo, WorkerRequest, WorkerResponse } from '../contracts';
 import { createLogger } from '../utils/logger';
@@ -12,8 +11,6 @@ export interface InferenceClientOptions {
   modelBaseUrl: string;
   ortBaseUrl: string;
   config: AppConfig['inference'];
-  /** Bề rộng ảnh xám thu nhỏ do tiền xử lý tạo cho P06; mặc định DEFAULT_CONFIG.analyzer.grayThumbWidth. */
-  grayThumbWidth?: number;
   workerFactory?: () => Worker;
 }
 
@@ -147,7 +144,6 @@ export function createInferenceClient(o: InferenceClientOptions): IInferenceClie
           modelBaseUrl: toAbsoluteDir(o.modelBaseUrl),
           ortBaseUrl: toAbsoluteDir(o.ortBaseUrl),
           config: o.config,
-          grayThumbWidth: o.grayThumbWidth ?? DEFAULT_CONFIG.analyzer.grayThumbWidth,
         };
         w.postMessage(request);
       } catch (e) {

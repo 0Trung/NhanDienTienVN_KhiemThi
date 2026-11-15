@@ -254,7 +254,7 @@ describe('createWorkerCore › lỗi từng khung không làm chết lõi', () =
 
 describe('createWorkerCore › INIT và DISPOSE', () => {
   it('INIT → READY mang ModelInfo của mô hình đã nạp', async () => {
-    expect(expectType(await makeRig().core.handle({ type: 'INIT', modelBaseUrl: 'm/', ortBaseUrl: 'o/', config: DEFAULT_CONFIG.inference, grayThumbWidth: 256 }), 'READY').info).toBe(INFO);
+    expect(expectType(await makeRig().core.handle({ type: 'INIT', modelBaseUrl: 'm/', ortBaseUrl: 'o/', config: DEFAULT_CONFIG.inference }), 'READY').info).toBe(INFO);
   });
 
   it('DISPOSE không có phản hồi (null) và giải phóng mô hình đúng một lần dù gọi lặp', async () => {

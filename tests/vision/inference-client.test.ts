@@ -119,7 +119,10 @@ describe('createInferenceClient › init', () => {
     expect(rig.client.ready).toBe(false);
     const initPromise = rig.client.init();
     expect(rig.worker().posted).toHaveLength(1);
-    expect(rig.worker().posted[0]?.message).toEqual({ type: 'INIT', modelBaseUrl: 'models/', ortBaseUrl: 'ort/', config: DEFAULT_CONFIG.inference });
+    expect(rig.worker().posted[0]?.message).toEqual({
+      type: 'INIT', modelBaseUrl: 'models/', ortBaseUrl: 'ort/', config: DEFAULT_CONFIG.inference,
+      grayThumbWidth: DEFAULT_CONFIG.analyzer.grayThumbWidth,
+    });
     expect(rig.client.ready).toBe(false); // chưa có READY
     rig.worker().emit({ type: 'READY', info: INFO });
     await expect(initPromise).resolves.toBe(INFO);
@@ -144,6 +147,15 @@ describe('createInferenceClient › init', () => {
     void rig.client.init();
     expect(rig.worker().posted[0]?.message).toMatchObject({ modelBaseUrl: 'a/b/', ortBaseUrl: 'c/' });
   });
+
+  it.each([{ given: 128, expected: 128 }, { given: undefined, expected: DEFAULT_CONFIG.analyzer.grayThumbWidth }])(
+    'grayThumbWidth=$given được chuyển cho worker qua INIT (không có thì lấy mặc định của cấu hình)',
+    ({ given, expected }) => {
+      const rig = makeRig(given === undefined ? {} : { grayThumbWidth: given });
+      void rig.client.init();
+      expect(rig.worker().posted[0]?.message).toMatchObject({ type: 'INIT', grayThumbWidth: expected });
+    },
+  );
 
   it('gọi init nhiều lần chỉ tạo một worker và trả cùng một lời hứa', async () => {
     const rig = makeRig();

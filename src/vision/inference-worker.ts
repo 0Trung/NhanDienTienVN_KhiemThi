@@ -1,4 +1,3 @@
-import { DEFAULT_CONFIG } from '../config/app-config';
 import { buildClassMap } from '../config/denominations';
 import { AppError } from '../contracts';
 import type { WorkerRequest, WorkerResponse } from '../contracts';
@@ -32,11 +31,10 @@ async function init(req: Extract<WorkerRequest, { type: 'INIT' }>): Promise<Work
   try {
     model = await loadModel({ baseUrl: req.modelBaseUrl, ortBaseUrl: req.ortBaseUrl, config: req.config });
     const classMap = buildClassMap(model.classes);
-    // INIT không mang AppConfig['analyzer'] nên bề rộng ảnh xám lấy từ DEFAULT_CONFIG (xem "Đề xuất sửa hợp đồng").
     const preprocessor = createPreprocessor({
       inputSize: model.config.inputSize,
       padValue: model.config.padValue,
-      grayThumbWidth: DEFAULT_CONFIG.analyzer.grayThumbWidth,
+      grayThumbWidth: req.grayThumbWidth,
     });
     const postProcessor = createPostProcessor({ classMap, inference: req.config, layoutHint: model.config.outputLayout });
     core = createWorkerCore({ model, preprocessor, postProcessor });

@@ -16,6 +16,7 @@ const FORBIDDEN: Array<{ name: string; pattern: RegExp }> = [
   { name: 'số ngẫu nhiên', pattern: /\bMath\.random\b/ },
   { name: 'kiểu any', pattern: /:\s*any\b|\bas\s+any\b|<any>/ },
   { name: 'import động', pattern: /\bimport\s*\(/ },
+  { name: 'hằng số ma thuật (số từ 2 trở lên hoặc số thập phân: ngưỡng phải lấy từ config)', pattern: /(?<![\w.$])(?:[2-9]\d*|1\d+|\d+\.\d+)(?![\w.])/ },
 ];
 const ALLOWED_IMPORT = /^(\.\/[\w-]+|\.\.\/contracts|\.\.\/config\/[\w-]+|\.\.\/utils\/[\w-]+)$/;
 

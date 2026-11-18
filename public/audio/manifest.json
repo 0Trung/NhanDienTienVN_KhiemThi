@@ -1,0 +1,11 @@
+{
+  "welcome": "welcome.mp3",
+  "permission-primer": "permission-primer.mp3",
+  "camera-ready": "camera-ready.mp3",
+  "no-money": "no-money.mp3",
+  "low-light": "low-light.mp3",
+  "blur": "blur.mp3",
+  "camera-error": "camera-error.mp3",
+  "model-error": "model-error.mp3",
+  "no-vi-voice": "no-vi-voice.mp3"
+}

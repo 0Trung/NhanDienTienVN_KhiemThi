@@ -18,7 +18,7 @@ npm run dev        # chạy thử trên trình duyệt (localhost)
 npm run typecheck  # kiểm tra kiểu
 npm test           # chạy Vitest
 ```
-Đóng gói APK: xem docs/ANDROID-SETUP.md.
+Đóng gói APK: docs/ANDROID-SETUP.md (lần đầu, tạo dự án Android) rồi docs/ANDROID-BUILD.md (sửa manifest, ký APK, cài lên máy).
 
 ## Lệnh
 | Lệnh | Tác dụng |
@@ -28,6 +28,16 @@ npm test           # chạy Vitest
 | npm run check:registry | in trạng thái THẬT / STUB / THIẾU của từng module |
 | npm run verify:bundle | kiểm tra dist/ có model, classes.json, wasm |
 | npm run cap:sync / cap:open | build rồi đồng bộ sang Android / mở Android Studio |
+| npm run build:apk-assets | copy-ort → vite build → cap sync → verify:bundle (chuẩn bị gói web cho APK) |
+
+## Chạy trên điện thoại thật
+1. Bật Tùy chọn nhà phát triển và Gỡ lỗi USB trên điện thoại Android, cắm cáp USB, chọn Cho phép khi máy hỏi.
+2. `npm run build:apk-assets`. Cần có `public/models/best.onnx` và các file mp3 trong `public/audio`; đạt khi dòng cuối là `Gói đủ tài nguyên để chạy ngoại tuyến`.
+3. `npm run cap:open` mở Android Studio, chọn điện thoại trên thanh trên rồi bấm Run (▶). Lần đầu cấp quyền Camera.
+4. Muốn kiểm tra ngoại tuyến thì làm OFFLINE-01 ở cuối tài liệu này.
+
+Lớp debug (hộp phát hiện, FPS, độ trễ, nút tải log JSON): chạy `npm run dev` rồi mở `?debug=1`, hoặc dựng APK debug bằng
+`npx vite build --mode development && npx cap sync android`. Bản release không có lớp này. Sửa manifest, ký APK và `adb install -r`: docs/ANDROID-BUILD.md.
 
 ## Cấu trúc thư mục
 - src/: contracts · config · utils · camera · vision · analyzer · decision · voice · accessibility · offline · ui · app

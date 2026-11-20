@@ -9,7 +9,7 @@
     "dev": "vite",
     "build": "tsc --noEmit -p tsconfig.json && vite build",
     "preview": "vite preview",
-    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.tools.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json",
     "test": "vitest run",
     "test:watch": "vitest",
     "copy-ort": "node scripts/copy-ort-wasm.mjs",
@@ -18,9 +18,8 @@
     "prebuild": "node scripts/copy-ort-wasm.mjs",
     "check:registry": "tsx scripts/check-registry.ts",
     "verify:bundle": "node scripts/verify-bundle.mjs",
-    "replay:scenarios": "tsx tools/scenario-replay/run.ts",
-    "metrics:log": "tsx tools/metrics-from-log/run.ts",
     "cap:sync": "npm run build && npx cap sync android",
+    "build:apk-assets": "npm run copy-ort && vite build && npx cap sync android && npm run verify:bundle",
     "cap:open": "npx cap open android"
   },
   "dependencies": {

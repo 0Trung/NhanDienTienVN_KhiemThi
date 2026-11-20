@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Nhận dạng tiền</string>
+    <string name="title_activity_main">Nhận dạng tiền</string>
+    <string name="package_name">vn.edu.duytan.cdio4.moneyreader</string>
+    <string name="custom_url_scheme">vn.edu.duytan.cdio4.moneyreader</string>
+</resources>

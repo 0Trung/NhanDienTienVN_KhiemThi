@@ -113,7 +113,6 @@ src/
     camera-screen.ts
     debug-overlay.ts
     error-screen.ts
-    main.ts
     settings-screen.ts
     styles.css
   utils/
@@ -474,1146 +473,6 @@ Báo `INSTALL_FAILED_UPDATE_INCOMPATIBLE` nghĩa là bản đang cài ký bằng
 (`ort-wasm-simd-threaded*.wasm`) mà Vite phát thêm vào `assets/` vì worker nạp onnxruntime-web. Khi chạy, ORT lấy wasm ở `ort/`
 (đã đặt bằng `ort.env.wasm.wasmPaths`) nên hai bản kia nhiều khả năng không dùng đến. Muốn thử: xóa `dist/assets/ort-wasm-*.wasm`
 trước khi `npx cap sync android`, làm lại OFFLINE-01. Nhận dạng vẫn chạy ngoại tuyến thì mới giữ cách này lâu dài.
-</file>
-
-<file path="src/ui/app-ui.ts">
-/**
- * Bản cài thật của cổng AppUi (P11): ghép màn camera, màn cài đặt, màn lỗi, cổng khởi động và lớp debug trong một
- * thẻ gốc, mỗi lúc chỉ hiện một màn. Không chứa logic nghiệp vụ: app.ts quyết định, file này chỉ dựng và đổi màn.
- */
-import { createStartGate } from '../accessibility/start-gate';
-import type { AppScreen, AppUi, UiAction } from '../app/app';
-import { systemClock } from '../utils/time';
-import type { Clock } from '../utils/time';
-import { createCameraScreen, describeStatus } from './camera-screen';
-import { createDebugOverlay } from './debug-overlay';
-import { createErrorScreen } from './error-screen';
-import { createSettingsScreen } from './settings-screen';
-import type { UiSettings } from './settings-screen';
-
-export interface AppUiHandle extends AppUi {
-  /** Thẻ video của màn camera: đưa cho createCameraService({ video }). */
-  readonly video: HTMLVideoElement;
-  dispose(): void;
-}
-
-export function createAppUi(
-  o: { root: HTMLElement; settings: UiSettings; onReplayGuide: () => void; debug?: boolean; now?: Clock },
-): AppUiHandle {
-  const doc = o.root.ownerDocument;
-  const handlers = new Set<(a: UiAction) => void>();
-  const emit = (a: UiAction): void => {
-    for (const h of [...handlers]) h(a);
-  };
-
-  const camera = createCameraScreen({ doc, onReplay: () => emit('REPLAY'), onToggleTorch: () => emit('TOGGLE_TORCH'), onOpenSettings: () => emit('OPEN_SETTINGS') });
-  const settingsScreen = createSettingsScreen({ doc, settings: o.settings, onReplayGuide: o.onReplayGuide, onClose: () => emit('CLOSE_SETTINGS') });
-  const errorScreen = createErrorScreen({ doc, onRetry: () => emit('RETRY'), showDetail: o.debug === true });
-  o.root.append(camera.el, settingsScreen.el, errorScreen.el);
-  const overlay = o.debug === true ? createDebugOverlay({ doc, surface: camera.surface, panelHost: camera.overlay, now: o.now ?? systemClock }) : null;
-  let gate: { show(): void; hide(): void } | null = null;
-
-  function showOnly(name: AppScreen): void {
-    if (name === 'camera') camera.show();
-    else camera.hide();
-    if (name !== 'settings') settingsScreen.hide();
-    if (name !== 'error') errorScreen.hide();
-  }
-
-  return {
-    video: camera.video,
-    showStartGate({ unlock, onStart }) {
-      gate?.hide();
-      gate = createStartGate({ root: camera.el, unlock, onStart });
-      gate.show();
-    },
-    hideStartGate() {
-      gate?.hide();
-      gate = null;
-    },
-    showCamera() {
-      showOnly('camera');
-      camera.focusReplay();
-    },
-    showSettings() {
-      showOnly('settings');
-      settingsScreen.show();
-    },
-    showError(e) {
-      showOnly('error');
-      errorScreen.show(e);
-    },
-    render(view) {
-      camera.setStatusText(describeStatus(view));
-      overlay?.update(view);
-    },
-    setTorch: (t) => camera.setTorch(t),
-    onAction(handler) {
-      handlers.add(handler);
-      return () => void handlers.delete(handler);
-    },
-    dispose() {
-      handlers.clear();
-      gate?.hide();
-      overlay?.dispose();
-      camera.dispose();
-      settingsScreen.dispose();
-      errorScreen.dispose();
-    },
-  };
-}
-</file>
-
-<file path="src/ui/camera-screen.ts">
-/**
- * Màn camera: bề mặt video toàn màn hình (chạm = nghe lại, giữ = đèn), cụm nút và vùng trạng thái chữ to.
- * Nút và vùng trạng thái do createAccessibilityManager dựng (nút thật, có nhãn); cử chỉ do createGestureController
- * chỉ gắn lên bề mặt video, KHÔNG gắn lên cả màn để chạm vào nút không bị tính thành "nghe lại" lần hai.
- * Màn này không chứa logic nghiệp vụ: chỉ dựng DOM và hiện chữ do describeStatus tạo.
- */
-import { createAccessibilityManager } from '../accessibility/accessibility-manager';
-import { createGestureController } from '../accessibility/gesture-controller';
-import type { AppView } from '../app/app';
-import type { AppState, DecisionStatus } from '../contracts';
-
-const STATE_TEXT: Readonly<Record<AppState, string>> = {
-  INITIALIZING: 'Đang khởi động',
-  AWAITING_START: 'Chạm để bắt đầu',
-  WAITING_PERMISSION: 'Hãy cho phép dùng camera',
-  LOADING_MODEL: 'Đang tải bộ nhận dạng',
-  READY: 'Đưa tiền vào trước camera',
-  NO_CANDIDATE: 'Chưa thấy tiền',
-  DETECTING: 'Đang nhận dạng',
-  UNCERTAIN: 'Chưa nhận rõ tờ tiền',
-  OVERLAPPING: 'Các tờ tiền đang chồng nhau',
-  STABILIZING: 'Giữ yên tờ tiền',
-  RESULT_READY: 'Đã nhận dạng',
-  SPEAKING: 'Đã nhận dạng',
-  ERROR: 'Có lỗi',
-};
-
-const STATUS_TEXT: Readonly<Record<DecisionStatus, string>> = {
-  NO_MONEY_CANDIDATE: 'Chưa thấy tiền',
-  LOW_CONFIDENCE: 'Chưa nhận rõ tờ tiền',
-  CLASS_CONFLICT: 'Chưa phân biệt được mệnh giá',
-  OVERLAP: 'Các tờ tiền đang chồng nhau',
-  PARTIAL_IN_FRAME: 'Tờ tiền chưa nằm trọn trong khung',
-  TOO_FAR: 'Đưa tiền lại gần camera hơn',
-  BLUR: 'Hình bị mờ, hãy giữ máy cho yên',
-  LOW_LIGHT: 'Ánh sáng yếu',
-  UNSTABLE: 'Giữ yên tờ tiền',
-  MULTI_NOT_ALLOWED: 'Chỉ đưa từng tờ một',
-  CONFIDENT_SINGLE: 'Đã nhận dạng',
-  CONFIDENT_MULTI: 'Đã nhận dạng',
-};
-
-/**
- * Chữ cho vùng trạng thái. Chỉ hiện số tiền khi engine đang xác nhận kết quả (Fail Safe): khi tờ tiền đã rời khung
- * hay chưa chắc thì màn hình không được để lại tổng cũ như thể còn đúng.
- */
-export function describeStatus(view: AppView): string {
-  const { result } = view;
-  const confirmed = view.state === 'SPEAKING' || view.state === 'RESULT_READY' || view.status === 'CONFIDENT_SINGLE' || view.status === 'CONFIDENT_MULTI';
-  if (confirmed && result !== null) return result.count > 1 ? `${result.count} tờ, tổng ${result.formattedTotal}` : result.formattedTotal;
-  return view.status !== null ? STATUS_TEXT[view.status] : STATE_TEXT[view.state];
-}
-
-export interface CameraScreen {
-  readonly el: HTMLElement;
-  /** Bề mặt chứa video (và lớp vẽ debug); nhận cử chỉ. */
-  readonly surface: HTMLElement;
-  /** Lớp phủ chứa cụm nút, vùng trạng thái (và bảng debug). */
-  readonly overlay: HTMLElement;
-  readonly video: HTMLVideoElement;
-  setStatusText(text: string): void;
-  setTorch(t: { supported: boolean; on: boolean }): void;
-  focusReplay(): void;
-  show(): void;
-  hide(): void;
-  dispose(): void;
-}
-
-export function createCameraScreen(o: { doc: Document; onReplay: () => void; onToggleTorch: () => void; onOpenSettings: () => void }): CameraScreen {
-  const { doc } = o;
-  const el = doc.createElement('main');
-  el.className = 'screen camera-screen';
-  el.setAttribute('aria-label', 'Màn hình camera');
-
-  const surface = doc.createElement('div');
-  surface.className = 'camera-surface';
-  const video = doc.createElement('video');
-  video.className = 'camera-video';
-  video.muted = true;
-  video.playsInline = true;
-  video.autoplay = true;
-  video.tabIndex = -1;
-  video.setAttribute('aria-hidden', 'true'); // hình ảnh không có ý nghĩa với trình đọc màn hình
-  surface.append(video);
-
-  const overlay = doc.createElement('div');
-  overlay.className = 'camera-overlay';
-  el.append(surface, overlay);
-
-  const a11y = createAccessibilityManager({ root: overlay, torchSupported: false, onReplay: o.onReplay, onToggleTorch: o.onToggleTorch, onOpenSettings: o.onOpenSettings });
-  const gestures = createGestureController({ surface, onReplay: o.onReplay, onToggleTorch: o.onToggleTorch });
-  let lastText: string | null = null;
-
-  return {
-    el, surface, overlay, video,
-    setStatusText(text) {
-      // Mỗi khung hình đều gọi vào đây: chỉ ghi khi chữ đổi, kẻo vùng trực tiếp (aria-live) bị đọc lặp liên tục.
-      if (text === lastText) return;
-      lastText = text;
-      a11y.setStatusText(text);
-    },
-    setTorch: (t) => {
-      a11y.setTorchSupported(t.supported); // chỉ biết sau khi camera chạy, nên không đặt lúc dựng
-      a11y.setTorchPressed(t.on);
-    },
-    focusReplay: () => a11y.focusReplay(),
-    show: () => void (el.hidden = false),
-    hide: () => void (el.hidden = true),
-    dispose: () => {
-      gestures.dispose();
-      a11y.dispose();
-      el.remove();
-    },
-  };
-}
-</file>
-
-<file path="src/ui/debug-overlay.ts">
-/**
- * Lớp debug (chỉ được dựng khi có ?debug=1 hoặc bản dựng development): vẽ hộp phát hiện lên video, hiện FPS,
- * độ trễ từng bước, state, status, reasons; có nút tải log JSON. KHÔNG BAO GIỜ lưu hay gửi ảnh: log chỉ chứa số liệu,
- * mã trạng thái, tọa độ hộp và dòng log chữ.
- */
-import type { AppView, ScanFrameView } from '../app/app';
-import { DEFAULT_CONFIG } from '../config/app-config';
-import type { AppState, BBox, DecisionStatus, InferenceTimings } from '../contracts';
-import { getRecentLogs } from '../utils/logger';
-import type { Clock } from '../utils/time';
-
-/** Số bản ghi tối đa giữ trong bộ nhớ cho log JSON (cũ nhất bị bỏ). */
-export const MAX_DEBUG_ENTRIES = 300;
-/** Số khung gần nhất dùng để tính FPS thực đo được. */
-const FPS_WINDOW = 10;
-const MS_PER_SECOND = 1000;
-const SURE_COLOR = '#00ff66';
-const UNSURE_COLOR = '#ffb000';
-const UNSURE_DASH = [6, 4]; // nét đứt = chưa chắc: không chỉ dựa vào màu
-
-export interface DebugEntry {
-  t: number;
-  state: AppState;
-  status: DecisionStatus | null;
-  reasons: string[];
-  frame: {
-    latencyMs: number;
-    samplingFps: number;
-    timings: InferenceTimings;
-    detections: Array<{ denomination: number; confidence: number; bbox: BBox }>;
-  } | null;
-}
-
-export interface DebugLog {
-  createdAt: string;
-  entries: DebugEntry[];
-  logs: string[];
-}
-
-export interface DebugOverlay {
-  update(view: AppView): void;
-  buildLog(): DebugLog;
-  dispose(): void;
-}
-
-export function createDebugOverlay(
-  o: { doc: Document; surface: HTMLElement; panelHost: HTMLElement; now: Clock; confSure?: number },
-): DebugOverlay {
-  const { doc } = o;
-  const confSure = o.confSure ?? DEFAULT_CONFIG.inference.confSure;
-  const entries: DebugEntry[] = [];
-  const stamps: number[] = [];
-  let lastFrame: ScanFrameView | null = null;
-
-  const canvas = doc.createElement('canvas');
-  canvas.className = 'debug-canvas';
-  canvas.setAttribute('aria-hidden', 'true');
-  o.surface.append(canvas);
-
-  const panel = doc.createElement('div');
-  panel.className = 'debug-panel';
-  panel.setAttribute('data-role', 'debug');
-  const text = doc.createElement('pre');
-  text.setAttribute('aria-hidden', 'true');
-  const save = doc.createElement('button');
-  save.type = 'button';
-  save.setAttribute('aria-label', 'Tải log JSON');
-  save.textContent = 'Tải log JSON';
-  panel.append(text, save);
-  o.panelHost.append(panel);
-
-  const measuredFps = (): number => {
-    const first = stamps[0];
-    const last = stamps[stamps.length - 1];
-    return first === undefined || last === undefined || last <= first ? 0 : ((stamps.length - 1) * MS_PER_SECOND) / (last - first);
-  };
-
-  function draw(frame: ScanFrameView): void {
-    const ctx = canvas.getContext('2d');
-    if (ctx === null) return;
-    const w = canvas.clientWidth;
-    const h = canvas.clientHeight;
-    if (canvas.width !== w || canvas.height !== h) {
-      canvas.width = w;
-      canvas.height = h;
-    }
-    ctx.clearRect(0, 0, w, h);
-    const { width, height } = frame.meta;
-    if (width <= 0 || height <= 0) return;
-    const scale = Math.min(w / width, h / height); // video hiển thị object-fit: contain
-    const ox = (w - width * scale) / 2;
-    const oy = (h - height * scale) / 2;
-    ctx.lineWidth = 3;
-    ctx.font = '14px monospace';
-    for (const d of frame.detections) {
-      const sure = d.confidence >= confSure;
-      const x = ox + d.bbox.x1 * scale;
-      const y = oy + d.bbox.y1 * scale;
-      ctx.strokeStyle = sure ? SURE_COLOR : UNSURE_COLOR;
-      ctx.fillStyle = ctx.strokeStyle;
-      ctx.setLineDash(sure ? [] : UNSURE_DASH);
-      ctx.strokeRect(x, y, (d.bbox.x2 - d.bbox.x1) * scale, (d.bbox.y2 - d.bbox.y1) * scale);
-      ctx.fillText(`${d.denomination} ${Math.round(d.confidence * 100)}%`, x + 4, Math.max(14, y - 4));
-    }
-  }
-
-  function render(view: AppView): void {
-    const lines = [`state ${view.state}  status ${view.status ?? '-'}`, `reasons ${view.reasons.join(', ') || '-'}`];
-    if (lastFrame !== null) {
-      const t = lastFrame.timings;
-      const ms = (v: number): string => String(Math.round(v));
-      lines.push(
-        `fps ${measuredFps().toFixed(1)} / lấy mẫu ${lastFrame.samplingFps}  trễ ${ms(lastFrame.latencyMs)} ms`,
-        `tiền xử lý ${ms(t.preprocessMs)}  suy luận ${ms(t.inferMs)}  hậu xử lý ${ms(t.postprocessMs)}  tổng ${ms(t.totalMs)} ms`,
-      );
-    }
-    text.textContent = lines.join('\n');
-  }
-
-  function buildLog(): DebugLog {
-    return { createdAt: new Date().toISOString(), entries: [...entries], logs: getRecentLogs() };
-  }
-
-  /** Tải về bằng liên kết blob. Trong WebView Android thao tác này có thể không tải được: dùng chrome://inspect hoặc trình duyệt. */
-  save.addEventListener('click', () => {
-    const url = URL.createObjectURL(new Blob([JSON.stringify(buildLog(), null, 2)], { type: 'application/json' }));
-    const link = doc.createElement('a');
-    link.href = url;
-    link.download = `money-reader-log-${Date.now()}.json`;
-    doc.body.append(link);
-    link.click();
-    link.remove();
-    URL.revokeObjectURL(url);
-  });
-
-  return {
-    update(view) {
-      const frame = view.frame;
-      if (frame !== null) {
-        lastFrame = frame;
-        stamps.push(o.now());
-        if (stamps.length > FPS_WINDOW) stamps.shift();
-        draw(frame);
-      }
-      entries.push({
-        t: o.now(), state: view.state, status: view.status, reasons: [...view.reasons],
-        frame: frame === null ? null : {
-          latencyMs: frame.latencyMs, samplingFps: frame.samplingFps, timings: frame.timings,
-          detections: frame.detections.map((d) => ({ denomination: d.denomination, confidence: d.confidence, bbox: d.bbox })),
-        },
-      });
-      if (entries.length > MAX_DEBUG_ENTRIES) entries.shift();
-      render(view);
-    },
-    buildLog,
-    dispose() {
-      canvas.remove();
-      panel.remove();
-    },
-  };
-}
-</file>
-
-<file path="src/ui/error-screen.ts">
-/**
- * Màn lỗi: thông điệp theo mã lỗi và một nút "Thử lại" có nhãn. Lời nói đã nói lỗi từ trước (app.ts); màn này dành cho
- * người nhược thị và người giúp đỡ nên KHÔNG tự đọc (không aria-live): chỉ chuyển focus tới tiêu đề để trình đọc màn
- * hình đọc "Có lỗi", rồi người dùng lướt tới thông điệp và nút.
- */
-import type { AppErrorCode } from '../contracts';
-
-export const ERROR_TITLE = 'Có lỗi';
-export const RETRY_LABEL = 'Thử lại';
-
-/** Đủ mọi mã lỗi (Record bắt buộc đủ khóa). Nội dung khớp với câu đã đọc, thêm tên nút "Thử lại". */
-export const ERROR_MESSAGES: Readonly<Record<AppErrorCode, string>> = {
-  UNSUPPORTED_BROWSER: 'Điện thoại chưa hỗ trợ đủ tính năng cần thiết. Hãy cập nhật WebView trong cửa hàng ứng dụng rồi mở lại ứng dụng.',
-  CAMERA_PERMISSION_DENIED: 'Bạn chưa cấp quyền camera. Hãy mở Cài đặt của điện thoại, chọn Ứng dụng, chọn ứng dụng này rồi bật quyền Camera.',
-  CAMERA_NOT_FOUND: 'Không tìm thấy camera trên điện thoại. Hãy thử lại trên một điện thoại có camera sau.',
-  CAMERA_IN_USE: 'Camera đang được ứng dụng khác sử dụng. Hãy đóng ứng dụng đó rồi bấm Thử lại.',
-  CAMERA_FAILED: 'Không mở được camera. Hãy bấm Thử lại, nếu vẫn lỗi thì đóng ứng dụng rồi mở lại.',
-  MODEL_MISSING: 'Ứng dụng thiếu dữ liệu nhận dạng. Hãy cài lại ứng dụng.',
-  MODEL_CORRUPT: 'Dữ liệu nhận dạng bị hỏng. Hãy cài lại ứng dụng.',
-  MODEL_INIT_FAILED: 'Không khởi động được bộ nhận dạng. Hãy bấm Thử lại, nếu vẫn lỗi thì đóng ứng dụng rồi mở lại.',
-  INFERENCE_FAILED: 'Nhận dạng gặp lỗi. Hãy bấm Thử lại, nếu vẫn lỗi thì đóng ứng dụng rồi mở lại.',
-  TTS_UNAVAILABLE: 'Giọng đọc của điện thoại đang không hoạt động. Hãy kiểm tra mục Chuyển văn bản thành giọng nói trong Cài đặt rồi bấm Thử lại.',
-  TTS_NO_VIETNAMESE_VOICE: 'Điện thoại chưa có giọng đọc tiếng Việt. Hãy vào Cài đặt, Chuyển văn bản thành giọng nói, rồi tải dữ liệu giọng Tiếng Việt.',
-  STORAGE_FAILED: 'Không lưu được cài đặt. Hãy kiểm tra bộ nhớ điện thoại còn trống rồi bấm Thử lại.',
-  OFFLINE_NOT_READY: 'Ứng dụng thiếu dữ liệu nhận dạng. Hãy cài lại ứng dụng.',
-};
-
-export interface ErrorScreen {
-  readonly el: HTMLElement;
-  show(e: { code: AppErrorCode; detail?: string }): void;
-  hide(): void;
-  dispose(): void;
-}
-
-export function createErrorScreen(o: { doc: Document; onRetry: () => void; showDetail?: boolean }): ErrorScreen {
-  const { doc } = o;
-  const el = doc.createElement('section');
-  el.className = 'screen error-screen';
-  el.hidden = true;
-  el.setAttribute('aria-labelledby', 'error-title');
-
-  const title = doc.createElement('h1');
-  title.id = 'error-title';
-  title.tabIndex = -1;
-  title.textContent = ERROR_TITLE;
-  const message = doc.createElement('p');
-  message.className = 'error-message';
-  const detail = doc.createElement('p');
-  detail.className = 'error-detail'; // chi tiết kỹ thuật: chỉ hiện ở bản debug
-  detail.hidden = true;
-  const retry = doc.createElement('button');
-  retry.type = 'button';
-  retry.className = 'btn btn-primary';
-  retry.setAttribute('aria-label', RETRY_LABEL);
-  retry.textContent = RETRY_LABEL;
-  retry.addEventListener('click', o.onRetry);
-  el.append(title, message, detail, retry);
-
-  return {
-    el,
-    show({ code, detail: text }) {
-      message.textContent = ERROR_MESSAGES[code];
-      detail.textContent = `${code}${text === undefined ? '' : `: ${text}`}`;
-      detail.hidden = o.showDetail !== true;
-      el.hidden = false;
-      title.focus({ preventScroll: true });
-    },
-    hide: () => void (el.hidden = true),
-    dispose: () => el.remove(),
-  };
-}
-</file>
-
-<file path="src/ui/main.ts">
-/**
- * Điểm vào của ứng dụng: dựng các bản cài THẬT rồi nối vào createApp. Không có logic nghiệp vụ ở đây.
- * Thứ tự dựng: cài đặt → giao diện (cho thẻ video) → camera → suy luận → rung → giọng nói → app.
- * Lớp debug chỉ bật khi có ?debug=1 hoặc khi dựng ở chế độ development (vite --mode development); bản release không có.
- */
-import './ui/styles.css';
-import { createAriaLiveEngine } from './accessibility/aria-live-engine';
-import { createSettingsManager } from './accessibility/settings-manager';
-import { createFrameAnalyzer } from './analyzer/frame-analyzer';
-import { createApp } from './app/app';
-import type { App } from './app/app';
-import { createAppLifecyclePort } from './app/app-lifecycle-adapter';
-import { createNativeTorchPort } from './app/native-torch';
-import { createCameraService } from './camera/camera-controller';
-import { DEFAULT_CONFIG } from './config/app-config';
-import type { SettingAck } from './contracts';
-import { createDecisionEngine } from './decision/decision-engine';
-import { checkBundledAssets } from './offline/asset-check';
-import { createSettingsStore } from './offline/settings-store';
-import { createAppUi } from './ui/app-ui';
-import { createLogger } from './utils/logger';
-import { getPlatform } from './utils/platform';
-import { systemClock } from './utils/time';
-import { createInferenceClient } from './vision/inference-client';
-import { createAudioClipEngine } from './voice/audio-clip-engine';
-import { createHaptics } from './voice/haptic-service';
-import { createNativeTtsEngine } from './voice/native-tts-engine';
-import { createSpeechManager } from './voice/speech-manager';
-import { createWebSpeechEngine } from './voice/web-speech-engine';
-
-const log = createLogger('main');
-
-function bootstrap(): App {
-  const root = document.getElementById('app');
-  if (root === null) throw new Error('Thiếu phần tử #app trong index.html');
-  const config = DEFAULT_CONFIG;
-  const base = import.meta.env.BASE_URL; // './' (Vite base): mọi tài nguyên nằm sẵn trong APK
-  const debug = new URLSearchParams(window.location.search).get('debug') === '1' || import.meta.env.MODE === 'development';
-
-  // Lời xác nhận khi đổi cài đặt đi qua bộ nói; bộ nói được dựng sau cài đặt nên nối muộn.
-  let acknowledge: (what: SettingAck) => void = () => undefined;
-  const settings = createSettingsManager(createSettingsStore(), (what) => acknowledge(what));
-
-  const ui = createAppUi({ root, settings, debug, now: systemClock, onReplayGuide: () => speech.say({ kind: 'WELCOME' }) });
-  const torchPort = createNativeTorchPort();
-  const camera = createCameraService({ video: ui.video, fps: config.inference.targetFps, torchPort });
-  const inference = createInferenceClient({ modelBaseUrl: `${base}models/`, ortBaseUrl: `${base}ort/`, config: config.inference });
-  const haptics = createHaptics({ isEnabled: () => settings.get().vibrationEnabled });
-  const speech = createSpeechManager({
-    engines: [createNativeTtsEngine(), createWebSpeechEngine(), createAudioClipEngine({ baseUrl: base }), createAriaLiveEngine({ root })],
-    haptics,
-    getSettings: () => settings.get(),
-    config: config.speech,
-  });
-  acknowledge = (what) => speech.say({ kind: 'SETTING_ACK', what });
-
-  return createApp({
-    camera, inference, analyzer: createFrameAnalyzer(config), decision: createDecisionEngine(config.decision),
-    speech, haptics, settings, ui, torchPort, platform: getPlatform(), clock: systemClock,
-    assets: () => checkBundledAssets({ baseUrl: base }), lifecycle: createAppLifecyclePort(), config,
-  });
-}
-
-/** Lưới an toàn cuối cùng: nếu không dựng nổi giao diện thì vẫn phải có chữ (không để màn hình đen im lặng). */
-function showFatal(message: string): void {
-  const note = document.createElement('p');
-  note.setAttribute('role', 'alert');
-  note.style.cssText = 'margin:0;padding:1rem;color:#fff;font:700 1.5rem/1.4 system-ui,sans-serif';
-  note.textContent = message;
-  (document.getElementById('app') ?? document.body).replaceChildren(note);
-}
-
-try {
-  void bootstrap().start(); // không dispose ở pagehide: WebView đóng thì camera và worker tự dừng, còn dispose nhầm là tắt app vĩnh viễn
-} catch (e) {
-  log.error('Không dựng được ứng dụng', e);
-  showFatal('Không khởi động được ứng dụng. Hãy đóng ứng dụng rồi mở lại.');
-}
-</file>
-
-<file path="src/ui/settings-screen.ts">
-/**
- * Màn Cài đặt dựng từ buildSettingsViewModel (P10): công tắc, nhóm lựa chọn, nút hành động. Mọi thay đổi đi qua hàm
- * set của view-model nên được áp dụng, lưu và xác nhận bằng giọng nói. Cập nhật TẠI CHỖ (không dựng lại DOM) để focus
- * của trình đọc màn hình không bị mất mỗi khi một giá trị đổi.
- */
-import { buildSettingsViewModel } from '../accessibility/settings-view-model';
-import type { ActionItem, RadioItem, SwitchItem } from '../accessibility/settings-view-model';
-import type { Settings } from '../contracts';
-import { createLogger } from '../utils/logger';
-
-const log = createLogger('settings-screen');
-
-export const SETTINGS_TITLE = 'Cài đặt';
-export const SETTINGS_CLOSE_LABEL = 'Quay lại màn hình camera';
-
-/** Phần của settings-manager mà giao diện dùng. */
-export interface UiSettings {
-  get(): Settings;
-  set(p: Partial<Settings>): Promise<Settings>;
-  subscribe(h: (s: Settings) => void): () => void;
-}
-
-interface Row {
-  el: HTMLElement;
-  refresh(): void;
-}
-
-export interface SettingsScreen {
-  readonly el: HTMLElement;
-  show(): void;
-  hide(): void;
-  refresh(): void;
-  dispose(): void;
-}
-
-/** Lỗi bất đồng bộ của hàm đổi cài đặt chỉ được ghi log, không làm hỏng giao diện. */
-const fire = (p: Promise<unknown>): void => void p.catch((e: unknown) => log.warn('Đổi cài đặt lỗi', e));
-
-export function createSettingsScreen(o: { doc: Document; settings: UiSettings; onReplayGuide: () => void; onClose: () => void }): SettingsScreen {
-  const { doc } = o;
-  const items = buildSettingsViewModel(() => o.settings.get(), (p) => o.settings.set(p), { onReplayGuide: o.onReplayGuide });
-  const make = <K extends keyof HTMLElementTagNameMap>(tag: K, className?: string, text?: string): HTMLElementTagNameMap[K] => {
-    const node = doc.createElement(tag);
-    if (className !== undefined) node.className = className;
-    if (text !== undefined) node.textContent = text;
-    return node;
-  };
-
-  /** Công tắc: nhãn nằm ở aria-label, trạng thái ở aria-checked; chữ "Bật/Tắt" hiện cho mắt nên bị ẩn khỏi trình đọc. */
-  function switchRow(item: SwitchItem): Row {
-    const button = make('button', 'btn');
-    button.type = 'button';
-    button.setAttribute('role', 'switch');
-    button.setAttribute('aria-label', item.label);
-    const state = make('span');
-    state.setAttribute('aria-hidden', 'true');
-    button.append(make('span', undefined, item.label), state);
-    button.addEventListener('click', () => fire(item.toggle()));
-    return {
-      el: button,
-      refresh: () => {
-        button.setAttribute('aria-checked', String(item.value));
-        state.textContent = item.valueText;
-      },
-    };
-  }
-
-  function radioRow(item: RadioItem): Row {
-    const group = make('fieldset', 'setting');
-    group.append(make('legend', undefined, item.label));
-    const inputs = item.options.map((option) => {
-      const label = make('label', 'choice');
-      const input = make('input');
-      input.type = 'radio';
-      input.name = `setting-${item.id}`;
-      input.value = option.value;
-      input.addEventListener('change', () => {
-        if (input.checked) fire(item.set(option.value));
-      });
-      label.append(input, make('span', undefined, option.label));
-      group.append(label);
-      return input;
-    });
-    return { el: group, refresh: () => inputs.forEach((input) => void (input.checked = input.value === item.value)) };
-  }
-
-  function actionRow(item: ActionItem): Row {
-    const button = make('button', 'btn', item.label);
-    button.type = 'button';
-    button.setAttribute('aria-label', item.label);
-    button.addEventListener('click', () => item.run());
-    return { el: button, refresh: () => undefined };
-  }
-
-  const el = make('section', 'screen settings-screen');
-  el.hidden = true;
-  el.setAttribute('aria-labelledby', 'settings-title');
-  const title = make('h1', undefined, SETTINGS_TITLE);
-  title.id = 'settings-title';
-  title.tabIndex = -1;
-  const close = make('button', 'btn btn-primary', SETTINGS_CLOSE_LABEL);
-  close.type = 'button';
-  close.setAttribute('aria-label', SETTINGS_CLOSE_LABEL);
-  close.addEventListener('click', o.onClose);
-  const rows = items.map((item) => (item.kind === 'switch' ? switchRow(item) : item.kind === 'radio' ? radioRow(item) : actionRow(item)));
-  const list = make('div', 'settings-list');
-  list.append(...rows.map((row) => row.el));
-  el.append(title, close, list);
-
-  const refresh = (): void => rows.forEach((row) => row.refresh());
-  refresh();
-  const unsubscribe = o.settings.subscribe(refresh);
-
-  return {
-    el,
-    refresh,
-    show() {
-      refresh();
-      el.hidden = false;
-      title.focus({ preventScroll: true }); // trình đọc màn hình đọc "Cài đặt" khi màn mở
-    },
-    hide: () => void (el.hidden = true),
-    dispose() {
-      unsubscribe();
-      el.remove();
-    },
-  };
-}
-</file>
-
-<file path="src/ui/styles.css">
-/*
- * Giao diện ứng dụng nhận dạng tiền. Ứng dụng chạy ngoại tuyến nên không tải phông từ mạng: dùng phông hệ thống.
- * Chữ to và tương phản cao: settings-manager đặt --font-scale, --a11y-fg, --a11y-bg, --a11y-border-width và
- * data-contrast trên <html>; mọi cỡ chữ ở đây nhân với --font-scale. Không có chuyển động trang trí.
- */
-:root {
-  --font-scale: 1;
-  --bg: #000000;
-  --fg: #ffffff;
-  --accent: #ffd400; /* vàng trên nền đen: tương phản rất cao, dùng cho viền chọn và nút chính */
-  --panel: #16181c;
-  --line: #8b929c;
-  --target: 64px; /* vùng chạm tối thiểu; khuyến nghị của Android là 48dp */
-  color-scheme: dark;
-}
-:root[data-contrast='high'] {
-  --panel: #000000;
-  --line: #ffffff;
-  --accent: #ffff00;
-}
-
-html,
-body,
-#app {
-  height: 100%;
-  margin: 0;
-  background: var(--bg);
-  color: var(--fg);
-}
-body {
-  font-family: system-ui, 'Roboto', 'Noto Sans', 'Segoe UI', sans-serif;
-  font-size: calc(1rem * var(--font-scale));
-  line-height: 1.4;
-  overscroll-behavior: none;
-  -webkit-tap-highlight-color: transparent;
-}
-:focus-visible {
-  outline: 4px solid var(--accent);
-  outline-offset: 2px;
-}
-
-/* Mỗi lúc chỉ một màn; thuộc tính hidden phải thắng display của .screen. */
-.screen {
-  position: fixed;
-  inset: 0;
-  box-sizing: border-box;
-  display: flex;
-  flex-direction: column;
-  gap: 1rem;
-  overflow-y: auto;
-  background: var(--bg);
-  padding: max(1rem, env(safe-area-inset-top)) max(1rem, env(safe-area-inset-right)) max(1rem, env(safe-area-inset-bottom)) max(1rem, env(safe-area-inset-left));
-}
-.screen[hidden] {
-  display: none;
-}
-.screen h1 {
-  margin: 0;
-  font-size: calc(1.75rem * var(--font-scale));
-}
-
-/* Màn camera: video chiếm trọn màn, lớp phủ nhường chỗ trống cho bề mặt nhận cử chỉ. */
-.camera-screen {
-  padding: 0;
-  gap: 0;
-  overflow: hidden;
-}
-.camera-surface {
-  position: absolute;
-  inset: 0;
-  background: #000000;
-}
-.camera-video,
-.debug-canvas {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-}
-.camera-video {
-  object-fit: contain; /* thấy TRỌN khung hình: khớp với lời nhắc "tờ tiền chưa nằm trọn trong khung" */
-}
-.debug-canvas {
-  pointer-events: none;
-}
-.camera-overlay {
-  position: relative;
-  z-index: 1;
-  box-sizing: border-box;
-  display: flex;
-  flex-direction: column;
-  justify-content: space-between;
-  min-height: 100%;
-  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
-  pointer-events: none;
-}
-.camera-overlay [data-a11y='status'] {
-  order: -1; /* chữ trạng thái ở trên, nút ở dưới (vùng ngón cái); thứ tự focus vẫn là thứ tự DOM */
-  background: rgba(0, 0, 0, 0.72);
-}
-.camera-overlay [data-a11y='controls'] {
-  order: 1;
-  background: rgba(0, 0, 0, 0.72);
-  pointer-events: auto;
-}
-/* P10 đặt min-height 48px bằng style nội tuyến nên cần !important để nới lên vùng chạm lớn hơn. */
-.camera-overlay [data-a11y='controls'] > button {
-  flex: 1 1 8rem;
-  min-height: var(--target) !important;
-}
-
-/* Màn cài đặt và màn lỗi. */
-.btn {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 1rem;
-  box-sizing: border-box;
-  width: 100%;
-  min-height: var(--target);
-  padding: 0.75rem 1rem;
-  border: var(--a11y-border-width, 2px) solid var(--fg);
-  border-radius: 0.5rem;
-  background: var(--panel);
-  color: var(--fg);
-  font: inherit;
-  font-weight: 700;
-  text-align: left;
-  cursor: pointer;
-}
-.btn[aria-checked='true'] {
-  border-color: var(--accent); /* trạng thái còn có chữ Bật/Tắt: màu không phải thông tin duy nhất */
-}
-.btn-primary {
-  justify-content: center;
-  border-color: var(--accent);
-  background: var(--accent);
-  color: #000000;
-  text-align: center;
-}
-.settings-list {
-  display: flex;
-  flex-direction: column;
-  gap: 1rem;
-}
-.setting {
-  display: grid;
-  gap: 0.5rem;
-  margin: 0;
-  padding: 0;
-  border: 0;
-}
-.setting legend {
-  padding: 0 0 0.5rem;
-  font-weight: 700;
-}
-.choice {
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
-  box-sizing: border-box;
-  min-height: var(--target);
-  padding: 0.5rem 1rem;
-  border: 2px solid var(--line);
-  border-radius: 0.5rem;
-  background: var(--panel);
-}
-.choice input {
-  flex: none;
-  width: 1.5rem;
-  height: 1.5rem;
-  accent-color: var(--accent);
-}
-.error-message {
-  margin: 0;
-  font-size: calc(1.25rem * var(--font-scale));
-}
-.error-detail {
-  margin: 0;
-  color: var(--line);
-  font: 12px/1.35 ui-monospace, monospace;
-}
-
-/* Bảng debug (chỉ có khi bật cờ debug). */
-.debug-panel {
-  align-self: flex-start;
-  max-width: 100%;
-  margin: 0.5rem;
-  padding: 0.5rem;
-  border-radius: 0.25rem;
-  background: rgba(0, 0, 0, 0.72);
-  color: #7dff9b;
-  font: 12px/1.35 ui-monospace, monospace;
-  pointer-events: none;
-}
-.debug-panel pre {
-  margin: 0;
-  white-space: pre-wrap;
-}
-.debug-panel button {
-  min-height: 40px;
-  margin-top: 0.5rem;
-  pointer-events: auto;
-}
-</file>
-
-<file path="tests/ui/ui.test.ts">
-// @vitest-environment happy-dom
-// Test giao diện nhẹ (P11): nhãn nút, đổi màn, màn cài đặt, màn lỗi, cổng khởi động, lớp debug chỉ có khi bật cờ,
-// và một bài ghép createApp với giao diện thật. Phần cần module P10 thật tự bỏ qua (ghi lý do vào log) khi nó còn là stub.
-import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
-import { createAccessibilityManager } from '../../src/accessibility/accessibility-manager';
-import { createGestureController } from '../../src/accessibility/gesture-controller';
-import { buildSettingsViewModel } from '../../src/accessibility/settings-view-model';
-import { createStartGate } from '../../src/accessibility/start-gate';
-import { createApp } from '../../src/app/app';
-import type { AppView, UiAction } from '../../src/app/app';
-import { DEFAULT_SETTINGS } from '../../src/config/app-config';
-import { AppError } from '../../src/contracts';
-import type { AppErrorCode, RecognitionResult } from '../../src/contracts';
-import { createAppUi } from '../../src/ui/app-ui';
-import { describeStatus } from '../../src/ui/camera-screen';
-import { MAX_DEBUG_ENTRIES, createDebugOverlay } from '../../src/ui/debug-overlay';
-import { ERROR_MESSAGES, RETRY_LABEL } from '../../src/ui/error-screen';
-import { SETTINGS_CLOSE_LABEL } from '../../src/ui/settings-screen';
-import { createLogger, setLogSink } from '../../src/utils/logger';
-import { FakeSettings, flush, makeDeps } from '../app/app-fakes';
-
-const noop = (): void => undefined;
-const REAL_MODULES: ReadonlyArray<readonly [string, () => unknown]> = [
-  ['createAccessibilityManager', () => createAccessibilityManager({ root: document.createElement('div'), torchSupported: false, onReplay: noop, onToggleTorch: noop, onOpenSettings: noop })],
-  ['createGestureController', () => createGestureController({ surface: document.createElement('div'), onReplay: noop, onToggleTorch: noop })],
-  ['createStartGate', () => createStartGate({ root: document.createElement('div'), onStart: noop, unlock: noop })],
-  ['buildSettingsViewModel', () => buildSettingsViewModel(() => DEFAULT_SETTINGS, async () => DEFAULT_SETTINGS, { onReplayGuide: noop })],
-];
-const stubs = REAL_MODULES.filter(([, make]) => {
-  try {
-    make();
-    return false;
-  } catch (e) {
-    return e instanceof Error && e.message.startsWith('STUB:');
-  }
-}).map(([name]) => name);
-const needsP10 = stubs.length > 0 ? describe.skip : describe;
-if (stubs.length > 0) createLogger('ui-test').warn(`BỎ QUA test giao diện vì còn là stub: ${stubs.join(', ')}`);
-
-beforeAll(() => setLogSink(() => undefined));
-afterAll(() => setLogSink(null));
-
-const view = (o: Partial<AppView> = {}): AppView => ({ state: 'READY', status: null, reasons: [], result: null, frame: null, ...o });
-const result = (count: number, total: string): RecognitionResult => ({
-  status: count > 1 ? 'CONFIDENT_MULTI' : 'CONFIDENT_SINGLE', count, denominations: [50000], total: 0, formattedTotal: total, timestamp: 0,
-});
-
-describe('describeStatus', () => {
-  it.each<[string, Partial<AppView>, string]>([
-    ['sẵn sàng', {}, 'Đưa tiền vào trước camera'],
-    ['chưa thấy tiền', { state: 'NO_CANDIDATE' }, 'Chưa thấy tiền'],
-    ['một tờ chưa chắc', { state: 'UNCERTAIN', status: 'LOW_CONFIDENCE' }, 'Chưa nhận rõ tờ tiền'],
-    ['đưa lại gần', { state: 'DETECTING', status: 'TOO_FAR' }, 'Đưa tiền lại gần camera hơn'],
-    ['đang đọc một tờ', { state: 'SPEAKING', status: 'CONFIDENT_SINGLE', result: result(1, '50.000 đồng') }, '50.000 đồng'],
-    ['đang đọc nhiều tờ', { state: 'SPEAKING', status: 'CONFIDENT_MULTI', result: result(2, '170.000 đồng') }, '2 tờ, tổng 170.000 đồng'],
-    ['tờ cũ vẫn còn trước camera', { state: 'DETECTING', status: 'CONFIDENT_SINGLE', result: result(1, '50.000 đồng') }, '50.000 đồng'],
-    ['Fail Safe: tiền đã rời khung thì không giữ tổng cũ', { state: 'NO_CANDIDATE', status: 'NO_MONEY_CANDIDATE', result: result(1, '50.000 đồng') }, 'Chưa thấy tiền'],
-    ['Fail Safe: chưa chắc thì không hiện tổng cũ', { state: 'UNCERTAIN', status: 'LOW_CONFIDENCE', result: result(1, '50.000 đồng') }, 'Chưa nhận rõ tờ tiền'],
-  ])('%s', (_name, v, expected) => expect(describeStatus(view(v))).toBe(expected));
-
-  it('thông điệp lỗi đủ cho mọi mã, và chỉ hướng dẫn bấm nút có thật', () => {
-    const messages = Object.values(ERROR_MESSAGES);
-    expect(messages).toHaveLength(13);
-    for (const m of messages) {
-      expect(m.length).toBeGreaterThan(20);
-      if (m.includes('bấm')) expect(m).toContain(`bấm ${RETRY_LABEL}`);
-    }
-  });
-});
-
-function setup(debug = false) {
-  document.body.replaceChildren();
-  const root = document.createElement('div');
-  document.body.append(root);
-  const settings = new FakeSettings();
-  const guide = vi.fn();
-  const ui = createAppUi({ root, settings, onReplayGuide: guide, debug });
-  const actions: UiAction[] = [];
-  ui.onAction((a) => actions.push(a));
-  const q = <T extends HTMLElement>(selector: string): T => {
-    const el = root.querySelector<T>(selector);
-    if (el === null) throw new Error(`Không thấy ${selector}`);
-    return el;
-  };
-  const visible = (): string[] => Array.from(root.children).filter((c) => !(c as HTMLElement).hidden).map((c) => c.className.replace('screen ', ''));
-  return { root, settings, guide, ui, actions, q, visible };
-}
-const role = (r: string): string => `[data-a11y="${r}"]`;
-
-needsP10('màn hình', () => {
-  it('mỗi lúc chỉ hiện một màn', () => {
-    const t = setup();
-    t.ui.showSettings();
-    expect(t.visible()).toEqual(['settings-screen']);
-    t.ui.showError({ code: 'CAMERA_FAILED' });
-    expect(t.visible()).toEqual(['error-screen']);
-    t.ui.showCamera();
-    expect(t.visible()).toEqual(['camera-screen']);
-  });
-
-  it('màn camera: mọi nút có nhãn riêng, video ẩn khỏi trình đọc màn hình, nút đèn chỉ có khi máy hỗ trợ', () => {
-    const t = setup();
-    const labels = (): string[] => Array.from(t.q('.camera-screen').querySelectorAll('button')).map((b) => b.getAttribute('aria-label') ?? '');
-    t.ui.setTorch({ supported: false, on: false });
-    expect(labels()).toHaveLength(2);
-    t.ui.setTorch({ supported: true, on: false });
-    expect(labels()).toHaveLength(3);
-    expect(labels().every((l) => l.length > 0) && new Set(labels()).size === 3).toBe(true);
-    expect(t.q('video').getAttribute('aria-hidden')).toBe('true');
-  });
-
-  it('bấm nút gửi đúng thao tác; hủy đăng ký thì thôi nhận', () => {
-    const t = setup();
-    t.ui.setTorch({ supported: true, on: false });
-    for (const r of ['replay', 'torch', 'settings']) t.q(role(r)).click();
-    expect(t.actions).toEqual(['REPLAY', 'TOGGLE_TORCH', 'OPEN_SETTINGS']);
-    const late: UiAction[] = [];
-    t.ui.onAction((a) => late.push(a))();
-    t.q(role('replay')).click();
-    expect(late).toEqual([]);
-  });
-
-  it('vùng trạng thái hiện chữ của describeStatus', () => {
-    const t = setup();
-    t.ui.render(view({ state: 'NO_CANDIDATE' }));
-    expect(t.q(role('status')).textContent).toBe('Chưa thấy tiền');
-  });
-
-  it('chữ trạng thái không đổi thì không ghi lại (tránh vùng aria-live bị đọc lặp mỗi khung hình)', () => {
-    const t = setup();
-    t.ui.render(view({ state: 'NO_CANDIDATE' }));
-    const node = t.q(role('status')).firstChild;
-    t.ui.render(view({ state: 'NO_CANDIDATE', reasons: ['khác'] }));
-    expect(t.q(role('status')).firstChild).toBe(node);
-    t.ui.render(view({ state: 'READY' }));
-    expect(t.q(role('status')).textContent).toBe('Đưa tiền vào trước camera');
-  });
-
-  it('màn cài đặt: điều khiển nào cũng có nhãn, bấm là đổi cài đặt, giá trị theo dõi cài đặt đổi từ nơi khác', async () => {
-    const t = setup();
-    t.ui.showSettings();
-    const screen = t.q('.settings-screen');
-    const named = (el: Element): boolean => (el.getAttribute('aria-label') ?? el.closest('label')?.textContent ?? '').length > 0;
-    expect(Array.from(screen.querySelectorAll('button, input')).every(named)).toBe(true);
-
-    const toggle = t.q<HTMLButtonElement>('button[role="switch"]');
-    const before = toggle.getAttribute('aria-checked');
-    toggle.click();
-    await flush();
-    expect(t.settings.patches).toHaveLength(1);
-    expect(toggle.getAttribute('aria-checked')).not.toBe(before);
-
-    const radio = Array.from(screen.querySelectorAll<HTMLInputElement>('input[type="radio"]')).find((r) => !r.checked);
-    if (radio === undefined) throw new Error('Không có lựa chọn nào đang tắt');
-    radio.checked = true;
-    radio.dispatchEvent(new Event('change', { bubbles: true }));
-    await flush();
-    expect(t.settings.patches).toHaveLength(2);
-
-    t.q('.settings-list > button:not([role="switch"])').click();
-    expect(t.guide).toHaveBeenCalledTimes(1);
-    t.q(`button[aria-label="${SETTINGS_CLOSE_LABEL}"]`).click();
-    expect(t.actions).toEqual(['CLOSE_SETTINGS']);
-  });
-
-  it.each<[AppErrorCode, boolean]>([['CAMERA_IN_USE', false], ['MODEL_CORRUPT', true]])('màn lỗi %s: thông điệp, nút "Thử lại" có nhãn, chi tiết chỉ khi debug=%s', (code, debug) => {
-    const t = setup(debug);
-    t.ui.showError({ code, detail: 'chi tiết' });
-    expect(t.q('.error-message').textContent).toBe(ERROR_MESSAGES[code]);
-    expect(t.q('.error-detail').hidden).toBe(!debug);
-    const retry = t.q(`button[aria-label="${RETRY_LABEL}"]`);
-    retry.click();
-    expect(t.actions).toEqual(['RETRY']);
-  });
-
-  it('cổng khởi động: chạm thì unlock chạy trước onStart, rồi cổng biến mất', () => {
-    const t = setup();
-    const calls: string[] = [];
-    t.ui.showStartGate({ unlock: () => calls.push('unlock'), onStart: () => calls.push('start') });
-    t.q(role('start-gate')).click();
-    expect(calls).toEqual(['unlock', 'start']);
-    expect(t.root.querySelector(role('start-gate'))).toBeNull();
-  });
-
-  it.each([[false], [true]])('lớp debug chỉ hiện khi có cờ (debug=%s)', (debug) => {
-    const t = setup(debug);
-    expect(t.root.querySelector('[data-role="debug"]') !== null).toBe(debug);
-    expect(t.root.querySelector('canvas') !== null).toBe(debug);
-  });
-});
-
-describe('debug-overlay', () => {
-  function overlay() {
-    const host = document.createElement('div');
-    const panelHost = document.createElement('div');
-    document.body.append(host, panelHost);
-    let now = 0;
-    return { overlay: createDebugOverlay({ doc: document, surface: host, panelHost, now: () => (now += 100) }), panelHost };
-  }
-  const frameView = (): AppView =>
-    view({
-      state: 'DETECTING', status: 'LOW_CONFIDENCE', reasons: ['A', 'B'],
-      frame: {
-        meta: { frameId: 1, width: 640, height: 480, timestamp: 0 }, detections: [], latencyMs: 12,
-        timings: { preprocessMs: 1, inferMs: 2, postprocessMs: 3, totalMs: 6 }, samplingFps: 3,
-      },
-    });
-
-  it('bảng hiện state, status, reasons, độ trễ từng bước và có nút tải log có nhãn', () => {
-    const t = overlay();
-    t.overlay.update(frameView());
-    const text = t.panelHost.textContent ?? '';
-    for (const part of ['state DETECTING', 'status LOW_CONFIDENCE', 'reasons A, B', 'trễ 12 ms', 'suy luận 2', 'tổng 6 ms']) expect(text).toContain(part);
-    expect(t.panelHost.querySelector('button')?.getAttribute('aria-label')).toBe('Tải log JSON');
-  });
-
-  it.each<[string, [number, number], [number, number, number, number], number[]]>([
-    ['canvas gấp đôi khung, không lề', [1280, 960], [100, 50, 300, 250], [200, 100, 400, 400]],
-    ['canvas vuông: khung được đặt giữa, có lề trên và dưới', [1000, 1000], [0, 0, 640, 480], [0, 125, 1000, 750]],
-  ])('vẽ hộp đúng chỗ trên video object-fit: contain: %s', (_name, [w, h], [x1, y1, x2, y2], expected) => {
-    const host = document.createElement('div');
-    document.body.append(host);
-    const calls: Array<[string, number[]]> = [];
-    const ctx = new Proxy({}, { get: (_t, name: string) => (...args: number[]) => void calls.push([name, args]), set: () => true });
-    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(ctx as unknown as CanvasRenderingContext2D);
-    const o = createDebugOverlay({ doc: document, surface: host, panelHost: document.createElement('div'), now: () => 0 });
-    const canvas = host.querySelector('canvas');
-    if (canvas === null) throw new Error('Thiếu canvas');
-    Object.defineProperty(canvas, 'clientWidth', { value: w });
-    Object.defineProperty(canvas, 'clientHeight', { value: h });
-    const det = { id: '1-0', classId: 7, denomination: 50000 as const, confidence: 0.9, bbox: { x1, y1, x2, y2 }, frameId: 1, timestamp: 0 };
-    o.update({ ...frameView(), frame: { ...(frameView().frame as NonNullable<AppView['frame']>), detections: [det] } });
-    vi.restoreAllMocks();
-    expect(calls.find(([name]) => name === 'strokeRect')?.[1]).toEqual(expected);
-    expect(calls.find(([name]) => name === 'fillText')?.[0]).toBe('fillText');
-  });
-
-  it('log JSON chỉ có số liệu (không ảnh) và giữ tối đa MAX_DEBUG_ENTRIES bản ghi', () => {
-    const t = overlay();
-    for (let i = 0; i < MAX_DEBUG_ENTRIES + 5; i++) t.overlay.update(frameView());
-    const log = t.overlay.buildLog();
-    expect(log.entries).toHaveLength(MAX_DEBUG_ENTRIES);
-    expect(Object.keys(log.entries[0]?.frame ?? {})).toEqual(['latencyMs', 'samplingFps', 'timings', 'detections']);
-    expect(JSON.stringify(log)).not.toMatch(/bitmap|gray|data:image/);
-  });
-});
-
-needsP10('ghép createApp với giao diện thật', () => {
-  it('khởi động xong thì màn camera hiện chữ theo trạng thái của engine', async () => {
-    const t = makeDeps();
-    t.decision.state = 'READY';
-    const s = setup();
-    const app = createApp({ ...t.deps, ui: s.ui });
-    await app.start();
-    expect(s.visible()).toEqual(['camera-screen']);
-    expect(s.q(role('status')).textContent).toBe('Đưa tiền vào trước camera');
-    app.dispose();
-  });
-
-  it('camera lỗi thì hiện màn lỗi; bấm "Thử lại" thì khởi động lại và về màn camera', async () => {
-    const t = makeDeps({ camera: { startError: new AppError('CAMERA_PERMISSION_DENIED', 'x', true) } });
-    const s = setup();
-    const app = createApp({ ...t.deps, ui: s.ui });
-    await app.start();
-    expect(s.visible()).toEqual(['error-screen']);
-    expect(s.q('.error-message').textContent).toBe(ERROR_MESSAGES.CAMERA_PERMISSION_DENIED);
-    t.camera.startError = null;
-    s.q(`button[aria-label="${RETRY_LABEL}"]`).click();
-    await flush();
-    expect(s.visible()).toEqual(['camera-screen']);
-    expect(t.decision.events.filter((e) => e === 'APP_STARTED')).toHaveLength(2);
-    app.dispose();
-  });
-});
 </file>
 
 <file path="docs/ANDROID-SETUP.md">
@@ -3654,6 +2513,788 @@ export function assertNoImageData(value: unknown): void {
 }
 </file>
 
+<file path="src/ui/app-ui.ts">
+/**
+ * Bản cài thật của cổng AppUi (P11): ghép màn camera, màn cài đặt, màn lỗi, cổng khởi động và lớp debug trong một
+ * thẻ gốc, mỗi lúc chỉ hiện một màn. Không chứa logic nghiệp vụ: app.ts quyết định, file này chỉ dựng và đổi màn.
+ */
+import { createStartGate } from '../accessibility/start-gate';
+import type { AppScreen, AppUi, UiAction } from '../app/app';
+import { systemClock } from '../utils/time';
+import type { Clock } from '../utils/time';
+import { createCameraScreen, describeStatus } from './camera-screen';
+import { createDebugOverlay } from './debug-overlay';
+import { createErrorScreen } from './error-screen';
+import { createSettingsScreen } from './settings-screen';
+import type { UiSettings } from './settings-screen';
+
+export interface AppUiHandle extends AppUi {
+  /** Thẻ video của màn camera: đưa cho createCameraService({ video }). */
+  readonly video: HTMLVideoElement;
+  dispose(): void;
+}
+
+export function createAppUi(
+  o: { root: HTMLElement; settings: UiSettings; onReplayGuide: () => void; debug?: boolean; now?: Clock },
+): AppUiHandle {
+  const doc = o.root.ownerDocument;
+  const handlers = new Set<(a: UiAction) => void>();
+  const emit = (a: UiAction): void => {
+    for (const h of [...handlers]) h(a);
+  };
+
+  const camera = createCameraScreen({ doc, onReplay: () => emit('REPLAY'), onToggleTorch: () => emit('TOGGLE_TORCH'), onOpenSettings: () => emit('OPEN_SETTINGS') });
+  const settingsScreen = createSettingsScreen({ doc, settings: o.settings, onReplayGuide: o.onReplayGuide, onClose: () => emit('CLOSE_SETTINGS') });
+  const errorScreen = createErrorScreen({ doc, onRetry: () => emit('RETRY'), showDetail: o.debug === true });
+  o.root.append(camera.el, settingsScreen.el, errorScreen.el);
+  const overlay = o.debug === true ? createDebugOverlay({ doc, surface: camera.surface, panelHost: camera.overlay, now: o.now ?? systemClock }) : null;
+  let gate: { show(): void; hide(): void } | null = null;
+
+  function showOnly(name: AppScreen): void {
+    if (name === 'camera') camera.show();
+    else camera.hide();
+    if (name !== 'settings') settingsScreen.hide();
+    if (name !== 'error') errorScreen.hide();
+  }
+
+  return {
+    video: camera.video,
+    showStartGate({ unlock, onStart }) {
+      gate?.hide();
+      gate = createStartGate({ root: camera.el, unlock, onStart });
+      gate.show();
+    },
+    hideStartGate() {
+      gate?.hide();
+      gate = null;
+    },
+    showCamera() {
+      showOnly('camera');
+      camera.focusReplay();
+    },
+    showSettings() {
+      showOnly('settings');
+      settingsScreen.show();
+    },
+    showError(e) {
+      showOnly('error');
+      errorScreen.show(e);
+    },
+    render(view) {
+      camera.setStatusText(describeStatus(view));
+      overlay?.update(view);
+    },
+    setTorch: (t) => camera.setTorch(t),
+    onAction(handler) {
+      handlers.add(handler);
+      return () => void handlers.delete(handler);
+    },
+    dispose() {
+      handlers.clear();
+      gate?.hide();
+      overlay?.dispose();
+      camera.dispose();
+      settingsScreen.dispose();
+      errorScreen.dispose();
+    },
+  };
+}
+</file>
+
+<file path="src/ui/camera-screen.ts">
+/**
+ * Màn camera: bề mặt video toàn màn hình (chạm = nghe lại, giữ = đèn), cụm nút và vùng trạng thái chữ to.
+ * Nút và vùng trạng thái do createAccessibilityManager dựng (nút thật, có nhãn); cử chỉ do createGestureController
+ * chỉ gắn lên bề mặt video, KHÔNG gắn lên cả màn để chạm vào nút không bị tính thành "nghe lại" lần hai.
+ * Màn này không chứa logic nghiệp vụ: chỉ dựng DOM và hiện chữ do describeStatus tạo.
+ */
+import { createAccessibilityManager } from '../accessibility/accessibility-manager';
+import { createGestureController } from '../accessibility/gesture-controller';
+import type { AppView } from '../app/app';
+import type { AppState, DecisionStatus } from '../contracts';
+
+const STATE_TEXT: Readonly<Record<AppState, string>> = {
+  INITIALIZING: 'Đang khởi động',
+  AWAITING_START: 'Chạm để bắt đầu',
+  WAITING_PERMISSION: 'Hãy cho phép dùng camera',
+  LOADING_MODEL: 'Đang tải bộ nhận dạng',
+  READY: 'Đưa tiền vào trước camera',
+  NO_CANDIDATE: 'Chưa thấy tiền',
+  DETECTING: 'Đang nhận dạng',
+  UNCERTAIN: 'Chưa nhận rõ tờ tiền',
+  OVERLAPPING: 'Các tờ tiền đang chồng nhau',
+  STABILIZING: 'Giữ yên tờ tiền',
+  RESULT_READY: 'Đã nhận dạng',
+  SPEAKING: 'Đã nhận dạng',
+  ERROR: 'Có lỗi',
+};
+
+const STATUS_TEXT: Readonly<Record<DecisionStatus, string>> = {
+  NO_MONEY_CANDIDATE: 'Chưa thấy tiền',
+  LOW_CONFIDENCE: 'Chưa nhận rõ tờ tiền',
+  CLASS_CONFLICT: 'Chưa phân biệt được mệnh giá',
+  OVERLAP: 'Các tờ tiền đang chồng nhau',
+  PARTIAL_IN_FRAME: 'Tờ tiền chưa nằm trọn trong khung',
+  TOO_FAR: 'Đưa tiền lại gần camera hơn',
+  BLUR: 'Hình bị mờ, hãy giữ máy cho yên',
+  LOW_LIGHT: 'Ánh sáng yếu',
+  UNSTABLE: 'Giữ yên tờ tiền',
+  MULTI_NOT_ALLOWED: 'Chỉ đưa từng tờ một',
+  CONFIDENT_SINGLE: 'Đã nhận dạng',
+  CONFIDENT_MULTI: 'Đã nhận dạng',
+};
+
+/**
+ * Chữ cho vùng trạng thái. Chỉ hiện số tiền khi engine đang xác nhận kết quả (Fail Safe): khi tờ tiền đã rời khung
+ * hay chưa chắc thì màn hình không được để lại tổng cũ như thể còn đúng.
+ */
+export function describeStatus(view: AppView): string {
+  const { result } = view;
+  const confirmed = view.state === 'SPEAKING' || view.state === 'RESULT_READY' || view.status === 'CONFIDENT_SINGLE' || view.status === 'CONFIDENT_MULTI';
+  if (confirmed && result !== null) return result.count > 1 ? `${result.count} tờ, tổng ${result.formattedTotal}` : result.formattedTotal;
+  return view.status !== null ? STATUS_TEXT[view.status] : STATE_TEXT[view.state];
+}
+
+export interface CameraScreen {
+  readonly el: HTMLElement;
+  /** Bề mặt chứa video (và lớp vẽ debug); nhận cử chỉ. */
+  readonly surface: HTMLElement;
+  /** Lớp phủ chứa cụm nút, vùng trạng thái (và bảng debug). */
+  readonly overlay: HTMLElement;
+  readonly video: HTMLVideoElement;
+  setStatusText(text: string): void;
+  setTorch(t: { supported: boolean; on: boolean }): void;
+  focusReplay(): void;
+  show(): void;
+  hide(): void;
+  dispose(): void;
+}
+
+export function createCameraScreen(o: { doc: Document; onReplay: () => void; onToggleTorch: () => void; onOpenSettings: () => void }): CameraScreen {
+  const { doc } = o;
+  const el = doc.createElement('main');
+  el.className = 'screen camera-screen';
+  el.setAttribute('aria-label', 'Màn hình camera');
+
+  const surface = doc.createElement('div');
+  surface.className = 'camera-surface';
+  const video = doc.createElement('video');
+  video.className = 'camera-video';
+  video.muted = true;
+  video.playsInline = true;
+  video.autoplay = true;
+  video.tabIndex = -1;
+  video.setAttribute('aria-hidden', 'true'); // hình ảnh không có ý nghĩa với trình đọc màn hình
+  surface.append(video);
+
+  const overlay = doc.createElement('div');
+  overlay.className = 'camera-overlay';
+  el.append(surface, overlay);
+
+  const a11y = createAccessibilityManager({ root: overlay, torchSupported: false, onReplay: o.onReplay, onToggleTorch: o.onToggleTorch, onOpenSettings: o.onOpenSettings });
+  const gestures = createGestureController({ surface, onReplay: o.onReplay, onToggleTorch: o.onToggleTorch });
+  let lastText: string | null = null;
+
+  return {
+    el, surface, overlay, video,
+    setStatusText(text) {
+      // Mỗi khung hình đều gọi vào đây: chỉ ghi khi chữ đổi, kẻo vùng trực tiếp (aria-live) bị đọc lặp liên tục.
+      if (text === lastText) return;
+      lastText = text;
+      a11y.setStatusText(text);
+    },
+    setTorch: (t) => {
+      a11y.setTorchSupported(t.supported); // chỉ biết sau khi camera chạy, nên không đặt lúc dựng
+      a11y.setTorchPressed(t.on);
+    },
+    focusReplay: () => a11y.focusReplay(),
+    show: () => void (el.hidden = false),
+    hide: () => void (el.hidden = true),
+    dispose: () => {
+      gestures.dispose();
+      a11y.dispose();
+      el.remove();
+    },
+  };
+}
+</file>
+
+<file path="src/ui/debug-overlay.ts">
+/**
+ * Lớp debug (chỉ được dựng khi có ?debug=1 hoặc bản dựng development): vẽ hộp phát hiện lên video, hiện FPS,
+ * độ trễ từng bước, state, status, reasons; có nút tải log JSON. KHÔNG BAO GIỜ lưu hay gửi ảnh: log chỉ chứa số liệu,
+ * mã trạng thái, tọa độ hộp và dòng log chữ.
+ */
+import type { AppView, ScanFrameView } from '../app/app';
+import { DEFAULT_CONFIG } from '../config/app-config';
+import type { AppState, BBox, DecisionStatus, InferenceTimings } from '../contracts';
+import { getRecentLogs } from '../utils/logger';
+import type { Clock } from '../utils/time';
+
+/** Số bản ghi tối đa giữ trong bộ nhớ cho log JSON (cũ nhất bị bỏ). */
+export const MAX_DEBUG_ENTRIES = 300;
+/** Số khung gần nhất dùng để tính FPS thực đo được. */
+const FPS_WINDOW = 10;
+const MS_PER_SECOND = 1000;
+const SURE_COLOR = '#00ff66';
+const UNSURE_COLOR = '#ffb000';
+const UNSURE_DASH = [6, 4]; // nét đứt = chưa chắc: không chỉ dựa vào màu
+
+export interface DebugEntry {
+  t: number;
+  state: AppState;
+  status: DecisionStatus | null;
+  reasons: string[];
+  frame: {
+    latencyMs: number;
+    samplingFps: number;
+    timings: InferenceTimings;
+    detections: Array<{ denomination: number; confidence: number; bbox: BBox }>;
+  } | null;
+}
+
+export interface DebugLog {
+  createdAt: string;
+  entries: DebugEntry[];
+  logs: string[];
+}
+
+export interface DebugOverlay {
+  update(view: AppView): void;
+  buildLog(): DebugLog;
+  dispose(): void;
+}
+
+export function createDebugOverlay(
+  o: { doc: Document; surface: HTMLElement; panelHost: HTMLElement; now: Clock; confSure?: number },
+): DebugOverlay {
+  const { doc } = o;
+  const confSure = o.confSure ?? DEFAULT_CONFIG.inference.confSure;
+  const entries: DebugEntry[] = [];
+  const stamps: number[] = [];
+  let lastFrame: ScanFrameView | null = null;
+
+  const canvas = doc.createElement('canvas');
+  canvas.className = 'debug-canvas';
+  canvas.setAttribute('aria-hidden', 'true');
+  o.surface.append(canvas);
+
+  const panel = doc.createElement('div');
+  panel.className = 'debug-panel';
+  panel.setAttribute('data-role', 'debug');
+  const text = doc.createElement('pre');
+  text.setAttribute('aria-hidden', 'true');
+  const save = doc.createElement('button');
+  save.type = 'button';
+  save.setAttribute('aria-label', 'Tải log JSON');
+  save.textContent = 'Tải log JSON';
+  panel.append(text, save);
+  o.panelHost.append(panel);
+
+  const measuredFps = (): number => {
+    const first = stamps[0];
+    const last = stamps[stamps.length - 1];
+    return first === undefined || last === undefined || last <= first ? 0 : ((stamps.length - 1) * MS_PER_SECOND) / (last - first);
+  };
+
+  function draw(frame: ScanFrameView): void {
+    const ctx = canvas.getContext('2d');
+    if (ctx === null) return;
+    const w = canvas.clientWidth;
+    const h = canvas.clientHeight;
+    if (canvas.width !== w || canvas.height !== h) {
+      canvas.width = w;
+      canvas.height = h;
+    }
+    ctx.clearRect(0, 0, w, h);
+    const { width, height } = frame.meta;
+    if (width <= 0 || height <= 0) return;
+    const scale = Math.min(w / width, h / height); // video hiển thị object-fit: contain
+    const ox = (w - width * scale) / 2;
+    const oy = (h - height * scale) / 2;
+    ctx.lineWidth = 3;
+    ctx.font = '14px monospace';
+    for (const d of frame.detections) {
+      const sure = d.confidence >= confSure;
+      const x = ox + d.bbox.x1 * scale;
+      const y = oy + d.bbox.y1 * scale;
+      ctx.strokeStyle = sure ? SURE_COLOR : UNSURE_COLOR;
+      ctx.fillStyle = ctx.strokeStyle;
+      ctx.setLineDash(sure ? [] : UNSURE_DASH);
+      ctx.strokeRect(x, y, (d.bbox.x2 - d.bbox.x1) * scale, (d.bbox.y2 - d.bbox.y1) * scale);
+      ctx.fillText(`${d.denomination} ${Math.round(d.confidence * 100)}%`, x + 4, Math.max(14, y - 4));
+    }
+  }
+
+  function render(view: AppView): void {
+    const lines = [`state ${view.state}  status ${view.status ?? '-'}`, `reasons ${view.reasons.join(', ') || '-'}`];
+    if (lastFrame !== null) {
+      const t = lastFrame.timings;
+      const ms = (v: number): string => String(Math.round(v));
+      lines.push(
+        `fps ${measuredFps().toFixed(1)} / lấy mẫu ${lastFrame.samplingFps}  trễ ${ms(lastFrame.latencyMs)} ms`,
+        `tiền xử lý ${ms(t.preprocessMs)}  suy luận ${ms(t.inferMs)}  hậu xử lý ${ms(t.postprocessMs)}  tổng ${ms(t.totalMs)} ms`,
+      );
+    }
+    text.textContent = lines.join('\n');
+  }
+
+  function buildLog(): DebugLog {
+    return { createdAt: new Date().toISOString(), entries: [...entries], logs: getRecentLogs() };
+  }
+
+  /** Tải về bằng liên kết blob. Trong WebView Android thao tác này có thể không tải được: dùng chrome://inspect hoặc trình duyệt. */
+  save.addEventListener('click', () => {
+    const url = URL.createObjectURL(new Blob([JSON.stringify(buildLog(), null, 2)], { type: 'application/json' }));
+    const link = doc.createElement('a');
+    link.href = url;
+    link.download = `money-reader-log-${Date.now()}.json`;
+    doc.body.append(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  });
+
+  return {
+    update(view) {
+      const frame = view.frame;
+      if (frame !== null) {
+        lastFrame = frame;
+        stamps.push(o.now());
+        if (stamps.length > FPS_WINDOW) stamps.shift();
+        draw(frame);
+      }
+      entries.push({
+        t: o.now(), state: view.state, status: view.status, reasons: [...view.reasons],
+        frame: frame === null ? null : {
+          latencyMs: frame.latencyMs, samplingFps: frame.samplingFps, timings: frame.timings,
+          detections: frame.detections.map((d) => ({ denomination: d.denomination, confidence: d.confidence, bbox: d.bbox })),
+        },
+      });
+      if (entries.length > MAX_DEBUG_ENTRIES) entries.shift();
+      render(view);
+    },
+    buildLog,
+    dispose() {
+      canvas.remove();
+      panel.remove();
+    },
+  };
+}
+</file>
+
+<file path="src/ui/error-screen.ts">
+/**
+ * Màn lỗi: thông điệp theo mã lỗi và một nút "Thử lại" có nhãn. Lời nói đã nói lỗi từ trước (app.ts); màn này dành cho
+ * người nhược thị và người giúp đỡ nên KHÔNG tự đọc (không aria-live): chỉ chuyển focus tới tiêu đề để trình đọc màn
+ * hình đọc "Có lỗi", rồi người dùng lướt tới thông điệp và nút.
+ */
+import type { AppErrorCode } from '../contracts';
+
+export const ERROR_TITLE = 'Có lỗi';
+export const RETRY_LABEL = 'Thử lại';
+
+/** Đủ mọi mã lỗi (Record bắt buộc đủ khóa). Nội dung khớp với câu đã đọc, thêm tên nút "Thử lại". */
+export const ERROR_MESSAGES: Readonly<Record<AppErrorCode, string>> = {
+  UNSUPPORTED_BROWSER: 'Điện thoại chưa hỗ trợ đủ tính năng cần thiết. Hãy cập nhật WebView trong cửa hàng ứng dụng rồi mở lại ứng dụng.',
+  CAMERA_PERMISSION_DENIED: 'Bạn chưa cấp quyền camera. Hãy mở Cài đặt của điện thoại, chọn Ứng dụng, chọn ứng dụng này rồi bật quyền Camera.',
+  CAMERA_NOT_FOUND: 'Không tìm thấy camera trên điện thoại. Hãy thử lại trên một điện thoại có camera sau.',
+  CAMERA_IN_USE: 'Camera đang được ứng dụng khác sử dụng. Hãy đóng ứng dụng đó rồi bấm Thử lại.',
+  CAMERA_FAILED: 'Không mở được camera. Hãy bấm Thử lại, nếu vẫn lỗi thì đóng ứng dụng rồi mở lại.',
+  MODEL_MISSING: 'Ứng dụng thiếu dữ liệu nhận dạng. Hãy cài lại ứng dụng.',
+  MODEL_CORRUPT: 'Dữ liệu nhận dạng bị hỏng. Hãy cài lại ứng dụng.',
+  MODEL_INIT_FAILED: 'Không khởi động được bộ nhận dạng. Hãy bấm Thử lại, nếu vẫn lỗi thì đóng ứng dụng rồi mở lại.',
+  INFERENCE_FAILED: 'Nhận dạng gặp lỗi. Hãy bấm Thử lại, nếu vẫn lỗi thì đóng ứng dụng rồi mở lại.',
+  TTS_UNAVAILABLE: 'Giọng đọc của điện thoại đang không hoạt động. Hãy kiểm tra mục Chuyển văn bản thành giọng nói trong Cài đặt rồi bấm Thử lại.',
+  TTS_NO_VIETNAMESE_VOICE: 'Điện thoại chưa có giọng đọc tiếng Việt. Hãy vào Cài đặt, Chuyển văn bản thành giọng nói, rồi tải dữ liệu giọng Tiếng Việt.',
+  STORAGE_FAILED: 'Không lưu được cài đặt. Hãy kiểm tra bộ nhớ điện thoại còn trống rồi bấm Thử lại.',
+  OFFLINE_NOT_READY: 'Ứng dụng thiếu dữ liệu nhận dạng. Hãy cài lại ứng dụng.',
+};
+
+export interface ErrorScreen {
+  readonly el: HTMLElement;
+  show(e: { code: AppErrorCode; detail?: string }): void;
+  hide(): void;
+  dispose(): void;
+}
+
+export function createErrorScreen(o: { doc: Document; onRetry: () => void; showDetail?: boolean }): ErrorScreen {
+  const { doc } = o;
+  const el = doc.createElement('section');
+  el.className = 'screen error-screen';
+  el.hidden = true;
+  el.setAttribute('aria-labelledby', 'error-title');
+
+  const title = doc.createElement('h1');
+  title.id = 'error-title';
+  title.tabIndex = -1;
+  title.textContent = ERROR_TITLE;
+  const message = doc.createElement('p');
+  message.className = 'error-message';
+  const detail = doc.createElement('p');
+  detail.className = 'error-detail'; // chi tiết kỹ thuật: chỉ hiện ở bản debug
+  detail.hidden = true;
+  const retry = doc.createElement('button');
+  retry.type = 'button';
+  retry.className = 'btn btn-primary';
+  retry.setAttribute('aria-label', RETRY_LABEL);
+  retry.textContent = RETRY_LABEL;
+  retry.addEventListener('click', o.onRetry);
+  el.append(title, message, detail, retry);
+
+  return {
+    el,
+    show({ code, detail: text }) {
+      message.textContent = ERROR_MESSAGES[code];
+      detail.textContent = `${code}${text === undefined ? '' : `: ${text}`}`;
+      detail.hidden = o.showDetail !== true;
+      el.hidden = false;
+      title.focus({ preventScroll: true });
+    },
+    hide: () => void (el.hidden = true),
+    dispose: () => el.remove(),
+  };
+}
+</file>
+
+<file path="src/ui/settings-screen.ts">
+/**
+ * Màn Cài đặt dựng từ buildSettingsViewModel (P10): công tắc, nhóm lựa chọn, nút hành động. Mọi thay đổi đi qua hàm
+ * set của view-model nên được áp dụng, lưu và xác nhận bằng giọng nói. Cập nhật TẠI CHỖ (không dựng lại DOM) để focus
+ * của trình đọc màn hình không bị mất mỗi khi một giá trị đổi.
+ */
+import { buildSettingsViewModel } from '../accessibility/settings-view-model';
+import type { ActionItem, RadioItem, SwitchItem } from '../accessibility/settings-view-model';
+import type { Settings } from '../contracts';
+import { createLogger } from '../utils/logger';
+
+const log = createLogger('settings-screen');
+
+export const SETTINGS_TITLE = 'Cài đặt';
+export const SETTINGS_CLOSE_LABEL = 'Quay lại màn hình camera';
+
+/** Phần của settings-manager mà giao diện dùng. */
+export interface UiSettings {
+  get(): Settings;
+  set(p: Partial<Settings>): Promise<Settings>;
+  subscribe(h: (s: Settings) => void): () => void;
+}
+
+interface Row {
+  el: HTMLElement;
+  refresh(): void;
+}
+
+export interface SettingsScreen {
+  readonly el: HTMLElement;
+  show(): void;
+  hide(): void;
+  refresh(): void;
+  dispose(): void;
+}
+
+/** Lỗi bất đồng bộ của hàm đổi cài đặt chỉ được ghi log, không làm hỏng giao diện. */
+const fire = (p: Promise<unknown>): void => void p.catch((e: unknown) => log.warn('Đổi cài đặt lỗi', e));
+
+export function createSettingsScreen(o: { doc: Document; settings: UiSettings; onReplayGuide: () => void; onClose: () => void }): SettingsScreen {
+  const { doc } = o;
+  const items = buildSettingsViewModel(() => o.settings.get(), (p) => o.settings.set(p), { onReplayGuide: o.onReplayGuide });
+  const make = <K extends keyof HTMLElementTagNameMap>(tag: K, className?: string, text?: string): HTMLElementTagNameMap[K] => {
+    const node = doc.createElement(tag);
+    if (className !== undefined) node.className = className;
+    if (text !== undefined) node.textContent = text;
+    return node;
+  };
+
+  /** Công tắc: nhãn nằm ở aria-label, trạng thái ở aria-checked; chữ "Bật/Tắt" hiện cho mắt nên bị ẩn khỏi trình đọc. */
+  function switchRow(item: SwitchItem): Row {
+    const button = make('button', 'btn');
+    button.type = 'button';
+    button.setAttribute('role', 'switch');
+    button.setAttribute('aria-label', item.label);
+    const state = make('span');
+    state.setAttribute('aria-hidden', 'true');
+    button.append(make('span', undefined, item.label), state);
+    button.addEventListener('click', () => fire(item.toggle()));
+    return {
+      el: button,
+      refresh: () => {
+        button.setAttribute('aria-checked', String(item.value));
+        state.textContent = item.valueText;
+      },
+    };
+  }
+
+  function radioRow(item: RadioItem): Row {
+    const group = make('fieldset', 'setting');
+    group.append(make('legend', undefined, item.label));
+    const inputs = item.options.map((option) => {
+      const label = make('label', 'choice');
+      const input = make('input');
+      input.type = 'radio';
+      input.name = `setting-${item.id}`;
+      input.value = option.value;
+      input.addEventListener('change', () => {
+        if (input.checked) fire(item.set(option.value));
+      });
+      label.append(input, make('span', undefined, option.label));
+      group.append(label);
+      return input;
+    });
+    return { el: group, refresh: () => inputs.forEach((input) => void (input.checked = input.value === item.value)) };
+  }
+
+  function actionRow(item: ActionItem): Row {
+    const button = make('button', 'btn', item.label);
+    button.type = 'button';
+    button.setAttribute('aria-label', item.label);
+    button.addEventListener('click', () => item.run());
+    return { el: button, refresh: () => undefined };
+  }
+
+  const el = make('section', 'screen settings-screen');
+  el.hidden = true;
+  el.setAttribute('aria-labelledby', 'settings-title');
+  const title = make('h1', undefined, SETTINGS_TITLE);
+  title.id = 'settings-title';
+  title.tabIndex = -1;
+  const close = make('button', 'btn btn-primary', SETTINGS_CLOSE_LABEL);
+  close.type = 'button';
+  close.setAttribute('aria-label', SETTINGS_CLOSE_LABEL);
+  close.addEventListener('click', o.onClose);
+  const rows = items.map((item) => (item.kind === 'switch' ? switchRow(item) : item.kind === 'radio' ? radioRow(item) : actionRow(item)));
+  const list = make('div', 'settings-list');
+  list.append(...rows.map((row) => row.el));
+  el.append(title, close, list);
+
+  const refresh = (): void => rows.forEach((row) => row.refresh());
+  refresh();
+  const unsubscribe = o.settings.subscribe(refresh);
+
+  return {
+    el,
+    refresh,
+    show() {
+      refresh();
+      el.hidden = false;
+      title.focus({ preventScroll: true }); // trình đọc màn hình đọc "Cài đặt" khi màn mở
+    },
+    hide: () => void (el.hidden = true),
+    dispose() {
+      unsubscribe();
+      el.remove();
+    },
+  };
+}
+</file>
+
+<file path="src/ui/styles.css">
+/*
+ * Giao diện ứng dụng nhận dạng tiền. Ứng dụng chạy ngoại tuyến nên không tải phông từ mạng: dùng phông hệ thống.
+ * Chữ to và tương phản cao: settings-manager đặt --font-scale, --a11y-fg, --a11y-bg, --a11y-border-width và
+ * data-contrast trên <html>; mọi cỡ chữ ở đây nhân với --font-scale. Không có chuyển động trang trí.
+ */
+:root {
+  --font-scale: 1;
+  --bg: #000000;
+  --fg: #ffffff;
+  --accent: #ffd400; /* vàng trên nền đen: tương phản rất cao, dùng cho viền chọn và nút chính */
+  --panel: #16181c;
+  --line: #8b929c;
+  --target: 64px; /* vùng chạm tối thiểu; khuyến nghị của Android là 48dp */
+  color-scheme: dark;
+}
+:root[data-contrast='high'] {
+  --panel: #000000;
+  --line: #ffffff;
+  --accent: #ffff00;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+}
+body {
+  font-family: system-ui, 'Roboto', 'Noto Sans', 'Segoe UI', sans-serif;
+  font-size: calc(1rem * var(--font-scale));
+  line-height: 1.4;
+  overscroll-behavior: none;
+  -webkit-tap-highlight-color: transparent;
+}
+:focus-visible {
+  outline: 4px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Mỗi lúc chỉ một màn; thuộc tính hidden phải thắng display của .screen. */
+.screen {
+  position: fixed;
+  inset: 0;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  overflow-y: auto;
+  background: var(--bg);
+  padding: max(1rem, env(safe-area-inset-top)) max(1rem, env(safe-area-inset-right)) max(1rem, env(safe-area-inset-bottom)) max(1rem, env(safe-area-inset-left));
+}
+.screen[hidden] {
+  display: none;
+}
+.screen h1 {
+  margin: 0;
+  font-size: calc(1.75rem * var(--font-scale));
+}
+
+/* Màn camera: video chiếm trọn màn, lớp phủ nhường chỗ trống cho bề mặt nhận cử chỉ. */
+.camera-screen {
+  padding: 0;
+  gap: 0;
+  overflow: hidden;
+}
+.camera-surface {
+  position: absolute;
+  inset: 0;
+  background: #000000;
+}
+.camera-video,
+.debug-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+.camera-video {
+  object-fit: contain; /* thấy TRỌN khung hình: khớp với lời nhắc "tờ tiền chưa nằm trọn trong khung" */
+}
+.debug-canvas {
+  pointer-events: none;
+}
+.camera-overlay {
+  position: relative;
+  z-index: 1;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  min-height: 100%;
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  pointer-events: none;
+}
+.camera-overlay [data-a11y='status'] {
+  order: -1; /* chữ trạng thái ở trên, nút ở dưới (vùng ngón cái); thứ tự focus vẫn là thứ tự DOM */
+  background: rgba(0, 0, 0, 0.72);
+}
+.camera-overlay [data-a11y='controls'] {
+  order: 1;
+  background: rgba(0, 0, 0, 0.72);
+  pointer-events: auto;
+}
+/* P10 đặt min-height 48px bằng style nội tuyến nên cần !important để nới lên vùng chạm lớn hơn. */
+.camera-overlay [data-a11y='controls'] > button {
+  flex: 1 1 8rem;
+  min-height: var(--target) !important;
+}
+
+/* Màn cài đặt và màn lỗi. */
+.btn {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  box-sizing: border-box;
+  width: 100%;
+  min-height: var(--target);
+  padding: 0.75rem 1rem;
+  border: var(--a11y-border-width, 2px) solid var(--fg);
+  border-radius: 0.5rem;
+  background: var(--panel);
+  color: var(--fg);
+  font: inherit;
+  font-weight: 700;
+  text-align: left;
+  cursor: pointer;
+}
+.btn[aria-checked='true'] {
+  border-color: var(--accent); /* trạng thái còn có chữ Bật/Tắt: màu không phải thông tin duy nhất */
+}
+.btn-primary {
+  justify-content: center;
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #000000;
+  text-align: center;
+}
+.settings-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+.setting {
+  display: grid;
+  gap: 0.5rem;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+.setting legend {
+  padding: 0 0 0.5rem;
+  font-weight: 700;
+}
+.choice {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  box-sizing: border-box;
+  min-height: var(--target);
+  padding: 0.5rem 1rem;
+  border: 2px solid var(--line);
+  border-radius: 0.5rem;
+  background: var(--panel);
+}
+.choice input {
+  flex: none;
+  width: 1.5rem;
+  height: 1.5rem;
+  accent-color: var(--accent);
+}
+.error-message {
+  margin: 0;
+  font-size: calc(1.25rem * var(--font-scale));
+}
+.error-detail {
+  margin: 0;
+  color: var(--line);
+  font: 12px/1.35 ui-monospace, monospace;
+}
+
+/* Bảng debug (chỉ có khi bật cờ debug). */
+.debug-panel {
+  align-self: flex-start;
+  max-width: 100%;
+  margin: 0.5rem;
+  padding: 0.5rem;
+  border-radius: 0.25rem;
+  background: rgba(0, 0, 0, 0.72);
+  color: #7dff9b;
+  font: 12px/1.35 ui-monospace, monospace;
+  pointer-events: none;
+}
+.debug-panel pre {
+  margin: 0;
+  white-space: pre-wrap;
+}
+.debug-panel button {
+  min-height: 40px;
+  margin-top: 0.5rem;
+  pointer-events: auto;
+}
+</file>
+
 <file path="src/utils/event-bus.ts">
 import { createLogger } from './logger';
 
@@ -4782,11 +4423,6 @@ export function moneyToSpeech(n: number): string {
 export function denominationToSpeech(d: Denomination): string {
   return moneyToSpeech(d);
 }
-</file>
-
-<file path="src/main.ts">
-// Điểm vào của ứng dụng. P11 sẽ nối createApp vào đây.
-export {};
 </file>
 
 <file path="tests/accessibility/accessibility-manager.test.ts">
@@ -12751,6 +12387,283 @@ describe('describeProblems', () => {
 });
 </file>
 
+<file path="tests/ui/ui.test.ts">
+// @vitest-environment happy-dom
+// Test giao diện nhẹ (P11): nhãn nút, đổi màn, màn cài đặt, màn lỗi, cổng khởi động, lớp debug chỉ có khi bật cờ,
+// và một bài ghép createApp với giao diện thật. Phần cần module P10 thật tự bỏ qua (ghi lý do vào log) khi nó còn là stub.
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { createAccessibilityManager } from '../../src/accessibility/accessibility-manager';
+import { createGestureController } from '../../src/accessibility/gesture-controller';
+import { buildSettingsViewModel } from '../../src/accessibility/settings-view-model';
+import { createStartGate } from '../../src/accessibility/start-gate';
+import { createApp } from '../../src/app/app';
+import type { AppView, UiAction } from '../../src/app/app';
+import { DEFAULT_SETTINGS } from '../../src/config/app-config';
+import { AppError } from '../../src/contracts';
+import type { AppErrorCode, RecognitionResult } from '../../src/contracts';
+import { createAppUi } from '../../src/ui/app-ui';
+import { describeStatus } from '../../src/ui/camera-screen';
+import { MAX_DEBUG_ENTRIES, createDebugOverlay } from '../../src/ui/debug-overlay';
+import { ERROR_MESSAGES, RETRY_LABEL } from '../../src/ui/error-screen';
+import { SETTINGS_CLOSE_LABEL } from '../../src/ui/settings-screen';
+import { createLogger, setLogSink } from '../../src/utils/logger';
+import { FakeSettings, flush, makeDeps } from '../app/app-fakes';
+
+const noop = (): void => undefined;
+const REAL_MODULES: ReadonlyArray<readonly [string, () => unknown]> = [
+  ['createAccessibilityManager', () => createAccessibilityManager({ root: document.createElement('div'), torchSupported: false, onReplay: noop, onToggleTorch: noop, onOpenSettings: noop })],
+  ['createGestureController', () => createGestureController({ surface: document.createElement('div'), onReplay: noop, onToggleTorch: noop })],
+  ['createStartGate', () => createStartGate({ root: document.createElement('div'), onStart: noop, unlock: noop })],
+  ['buildSettingsViewModel', () => buildSettingsViewModel(() => DEFAULT_SETTINGS, async () => DEFAULT_SETTINGS, { onReplayGuide: noop })],
+];
+const stubs = REAL_MODULES.filter(([, make]) => {
+  try {
+    make();
+    return false;
+  } catch (e) {
+    return e instanceof Error && e.message.startsWith('STUB:');
+  }
+}).map(([name]) => name);
+const needsP10 = stubs.length > 0 ? describe.skip : describe;
+if (stubs.length > 0) createLogger('ui-test').warn(`BỎ QUA test giao diện vì còn là stub: ${stubs.join(', ')}`);
+
+beforeAll(() => setLogSink(() => undefined));
+afterAll(() => setLogSink(null));
+
+const view = (o: Partial<AppView> = {}): AppView => ({ state: 'READY', status: null, reasons: [], result: null, frame: null, ...o });
+const result = (count: number, total: string): RecognitionResult => ({
+  status: count > 1 ? 'CONFIDENT_MULTI' : 'CONFIDENT_SINGLE', count, denominations: [50000], total: 0, formattedTotal: total, timestamp: 0,
+});
+
+describe('describeStatus', () => {
+  it.each<[string, Partial<AppView>, string]>([
+    ['sẵn sàng', {}, 'Đưa tiền vào trước camera'],
+    ['chưa thấy tiền', { state: 'NO_CANDIDATE' }, 'Chưa thấy tiền'],
+    ['một tờ chưa chắc', { state: 'UNCERTAIN', status: 'LOW_CONFIDENCE' }, 'Chưa nhận rõ tờ tiền'],
+    ['đưa lại gần', { state: 'DETECTING', status: 'TOO_FAR' }, 'Đưa tiền lại gần camera hơn'],
+    ['đang đọc một tờ', { state: 'SPEAKING', status: 'CONFIDENT_SINGLE', result: result(1, '50.000 đồng') }, '50.000 đồng'],
+    ['đang đọc nhiều tờ', { state: 'SPEAKING', status: 'CONFIDENT_MULTI', result: result(2, '170.000 đồng') }, '2 tờ, tổng 170.000 đồng'],
+    ['tờ cũ vẫn còn trước camera', { state: 'DETECTING', status: 'CONFIDENT_SINGLE', result: result(1, '50.000 đồng') }, '50.000 đồng'],
+    ['Fail Safe: tiền đã rời khung thì không giữ tổng cũ', { state: 'NO_CANDIDATE', status: 'NO_MONEY_CANDIDATE', result: result(1, '50.000 đồng') }, 'Chưa thấy tiền'],
+    ['Fail Safe: chưa chắc thì không hiện tổng cũ', { state: 'UNCERTAIN', status: 'LOW_CONFIDENCE', result: result(1, '50.000 đồng') }, 'Chưa nhận rõ tờ tiền'],
+  ])('%s', (_name, v, expected) => expect(describeStatus(view(v))).toBe(expected));
+
+  it('thông điệp lỗi đủ cho mọi mã, và chỉ hướng dẫn bấm nút có thật', () => {
+    const messages = Object.values(ERROR_MESSAGES);
+    expect(messages).toHaveLength(13);
+    for (const m of messages) {
+      expect(m.length).toBeGreaterThan(20);
+      if (m.includes('bấm')) expect(m).toContain(`bấm ${RETRY_LABEL}`);
+    }
+  });
+});
+
+function setup(debug = false) {
+  document.body.replaceChildren();
+  const root = document.createElement('div');
+  document.body.append(root);
+  const settings = new FakeSettings();
+  const guide = vi.fn();
+  const ui = createAppUi({ root, settings, onReplayGuide: guide, debug });
+  const actions: UiAction[] = [];
+  ui.onAction((a) => actions.push(a));
+  const q = <T extends HTMLElement>(selector: string): T => {
+    const el = root.querySelector<T>(selector);
+    if (el === null) throw new Error(`Không thấy ${selector}`);
+    return el;
+  };
+  const visible = (): string[] => Array.from(root.children).filter((c) => !(c as HTMLElement).hidden).map((c) => c.className.replace('screen ', ''));
+  return { root, settings, guide, ui, actions, q, visible };
+}
+const role = (r: string): string => `[data-a11y="${r}"]`;
+
+needsP10('màn hình', () => {
+  it('mỗi lúc chỉ hiện một màn', () => {
+    const t = setup();
+    t.ui.showSettings();
+    expect(t.visible()).toEqual(['settings-screen']);
+    t.ui.showError({ code: 'CAMERA_FAILED' });
+    expect(t.visible()).toEqual(['error-screen']);
+    t.ui.showCamera();
+    expect(t.visible()).toEqual(['camera-screen']);
+  });
+
+  it('màn camera: mọi nút có nhãn riêng, video ẩn khỏi trình đọc màn hình, nút đèn chỉ có khi máy hỗ trợ', () => {
+    const t = setup();
+    const labels = (): string[] => Array.from(t.q('.camera-screen').querySelectorAll('button')).map((b) => b.getAttribute('aria-label') ?? '');
+    t.ui.setTorch({ supported: false, on: false });
+    expect(labels()).toHaveLength(2);
+    t.ui.setTorch({ supported: true, on: false });
+    expect(labels()).toHaveLength(3);
+    expect(labels().every((l) => l.length > 0) && new Set(labels()).size === 3).toBe(true);
+    expect(t.q('video').getAttribute('aria-hidden')).toBe('true');
+  });
+
+  it('bấm nút gửi đúng thao tác; hủy đăng ký thì thôi nhận', () => {
+    const t = setup();
+    t.ui.setTorch({ supported: true, on: false });
+    for (const r of ['replay', 'torch', 'settings']) t.q(role(r)).click();
+    expect(t.actions).toEqual(['REPLAY', 'TOGGLE_TORCH', 'OPEN_SETTINGS']);
+    const late: UiAction[] = [];
+    t.ui.onAction((a) => late.push(a))();
+    t.q(role('replay')).click();
+    expect(late).toEqual([]);
+  });
+
+  it('vùng trạng thái hiện chữ của describeStatus', () => {
+    const t = setup();
+    t.ui.render(view({ state: 'NO_CANDIDATE' }));
+    expect(t.q(role('status')).textContent).toBe('Chưa thấy tiền');
+  });
+
+  it('chữ trạng thái không đổi thì không ghi lại (tránh vùng aria-live bị đọc lặp mỗi khung hình)', () => {
+    const t = setup();
+    t.ui.render(view({ state: 'NO_CANDIDATE' }));
+    const node = t.q(role('status')).firstChild;
+    t.ui.render(view({ state: 'NO_CANDIDATE', reasons: ['khác'] }));
+    expect(t.q(role('status')).firstChild).toBe(node);
+    t.ui.render(view({ state: 'READY' }));
+    expect(t.q(role('status')).textContent).toBe('Đưa tiền vào trước camera');
+  });
+
+  it('màn cài đặt: điều khiển nào cũng có nhãn, bấm là đổi cài đặt, giá trị theo dõi cài đặt đổi từ nơi khác', async () => {
+    const t = setup();
+    t.ui.showSettings();
+    const screen = t.q('.settings-screen');
+    const named = (el: Element): boolean => (el.getAttribute('aria-label') ?? el.closest('label')?.textContent ?? '').length > 0;
+    expect(Array.from(screen.querySelectorAll('button, input')).every(named)).toBe(true);
+
+    const toggle = t.q<HTMLButtonElement>('button[role="switch"]');
+    const before = toggle.getAttribute('aria-checked');
+    toggle.click();
+    await flush();
+    expect(t.settings.patches).toHaveLength(1);
+    expect(toggle.getAttribute('aria-checked')).not.toBe(before);
+
+    const radio = Array.from(screen.querySelectorAll<HTMLInputElement>('input[type="radio"]')).find((r) => !r.checked);
+    if (radio === undefined) throw new Error('Không có lựa chọn nào đang tắt');
+    radio.checked = true;
+    radio.dispatchEvent(new Event('change', { bubbles: true }));
+    await flush();
+    expect(t.settings.patches).toHaveLength(2);
+
+    t.q('.settings-list > button:not([role="switch"])').click();
+    expect(t.guide).toHaveBeenCalledTimes(1);
+    t.q(`button[aria-label="${SETTINGS_CLOSE_LABEL}"]`).click();
+    expect(t.actions).toEqual(['CLOSE_SETTINGS']);
+  });
+
+  it.each<[AppErrorCode, boolean]>([['CAMERA_IN_USE', false], ['MODEL_CORRUPT', true]])('màn lỗi %s: thông điệp, nút "Thử lại" có nhãn, chi tiết chỉ khi debug=%s', (code, debug) => {
+    const t = setup(debug);
+    t.ui.showError({ code, detail: 'chi tiết' });
+    expect(t.q('.error-message').textContent).toBe(ERROR_MESSAGES[code]);
+    expect(t.q('.error-detail').hidden).toBe(!debug);
+    const retry = t.q(`button[aria-label="${RETRY_LABEL}"]`);
+    retry.click();
+    expect(t.actions).toEqual(['RETRY']);
+  });
+
+  it('cổng khởi động: chạm thì unlock chạy trước onStart, rồi cổng biến mất', () => {
+    const t = setup();
+    const calls: string[] = [];
+    t.ui.showStartGate({ unlock: () => calls.push('unlock'), onStart: () => calls.push('start') });
+    t.q(role('start-gate')).click();
+    expect(calls).toEqual(['unlock', 'start']);
+    expect(t.root.querySelector(role('start-gate'))).toBeNull();
+  });
+
+  it.each([[false], [true]])('lớp debug chỉ hiện khi có cờ (debug=%s)', (debug) => {
+    const t = setup(debug);
+    expect(t.root.querySelector('[data-role="debug"]') !== null).toBe(debug);
+    expect(t.root.querySelector('canvas') !== null).toBe(debug);
+  });
+});
+
+describe('debug-overlay', () => {
+  function overlay() {
+    const host = document.createElement('div');
+    const panelHost = document.createElement('div');
+    document.body.append(host, panelHost);
+    let now = 0;
+    return { overlay: createDebugOverlay({ doc: document, surface: host, panelHost, now: () => (now += 100) }), panelHost };
+  }
+  const frameView = (): AppView =>
+    view({
+      state: 'DETECTING', status: 'LOW_CONFIDENCE', reasons: ['A', 'B'],
+      frame: {
+        meta: { frameId: 1, width: 640, height: 480, timestamp: 0 }, detections: [], latencyMs: 12,
+        timings: { preprocessMs: 1, inferMs: 2, postprocessMs: 3, totalMs: 6 }, samplingFps: 3,
+      },
+    });
+
+  it('bảng hiện state, status, reasons, độ trễ từng bước và có nút tải log có nhãn', () => {
+    const t = overlay();
+    t.overlay.update(frameView());
+    const text = t.panelHost.textContent ?? '';
+    for (const part of ['state DETECTING', 'status LOW_CONFIDENCE', 'reasons A, B', 'trễ 12 ms', 'suy luận 2', 'tổng 6 ms']) expect(text).toContain(part);
+    expect(t.panelHost.querySelector('button')?.getAttribute('aria-label')).toBe('Tải log JSON');
+  });
+
+  it.each<[string, [number, number], [number, number, number, number], number[]]>([
+    ['canvas gấp đôi khung, không lề', [1280, 960], [100, 50, 300, 250], [200, 100, 400, 400]],
+    ['canvas vuông: khung được đặt giữa, có lề trên và dưới', [1000, 1000], [0, 0, 640, 480], [0, 125, 1000, 750]],
+  ])('vẽ hộp đúng chỗ trên video object-fit: contain: %s', (_name, [w, h], [x1, y1, x2, y2], expected) => {
+    const host = document.createElement('div');
+    document.body.append(host);
+    const calls: Array<[string, number[]]> = [];
+    const ctx = new Proxy({}, { get: (_t, name: string) => (...args: number[]) => void calls.push([name, args]), set: () => true });
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(ctx as unknown as CanvasRenderingContext2D);
+    const o = createDebugOverlay({ doc: document, surface: host, panelHost: document.createElement('div'), now: () => 0 });
+    const canvas = host.querySelector('canvas');
+    if (canvas === null) throw new Error('Thiếu canvas');
+    Object.defineProperty(canvas, 'clientWidth', { value: w });
+    Object.defineProperty(canvas, 'clientHeight', { value: h });
+    const det = { id: '1-0', classId: 7, denomination: 50000 as const, confidence: 0.9, bbox: { x1, y1, x2, y2 }, frameId: 1, timestamp: 0 };
+    o.update({ ...frameView(), frame: { ...(frameView().frame as NonNullable<AppView['frame']>), detections: [det] } });
+    vi.restoreAllMocks();
+    expect(calls.find(([name]) => name === 'strokeRect')?.[1]).toEqual(expected);
+    expect(calls.find(([name]) => name === 'fillText')?.[0]).toBe('fillText');
+  });
+
+  it('log JSON chỉ có số liệu (không ảnh) và giữ tối đa MAX_DEBUG_ENTRIES bản ghi', () => {
+    const t = overlay();
+    for (let i = 0; i < MAX_DEBUG_ENTRIES + 5; i++) t.overlay.update(frameView());
+    const log = t.overlay.buildLog();
+    expect(log.entries).toHaveLength(MAX_DEBUG_ENTRIES);
+    expect(Object.keys(log.entries[0]?.frame ?? {})).toEqual(['latencyMs', 'samplingFps', 'timings', 'detections']);
+    expect(JSON.stringify(log)).not.toMatch(/bitmap|gray|data:image/);
+  });
+});
+
+needsP10('ghép createApp với giao diện thật', () => {
+  it('khởi động xong thì màn camera hiện chữ theo trạng thái của engine', async () => {
+    const t = makeDeps();
+    t.decision.state = 'READY';
+    const s = setup();
+    const app = createApp({ ...t.deps, ui: s.ui });
+    await app.start();
+    expect(s.visible()).toEqual(['camera-screen']);
+    expect(s.q(role('status')).textContent).toBe('Đưa tiền vào trước camera');
+    app.dispose();
+  });
+
+  it('camera lỗi thì hiện màn lỗi; bấm "Thử lại" thì khởi động lại và về màn camera', async () => {
+    const t = makeDeps({ camera: { startError: new AppError('CAMERA_PERMISSION_DENIED', 'x', true) } });
+    const s = setup();
+    const app = createApp({ ...t.deps, ui: s.ui });
+    await app.start();
+    expect(s.visible()).toEqual(['error-screen']);
+    expect(s.q('.error-message').textContent).toBe(ERROR_MESSAGES.CAMERA_PERMISSION_DENIED);
+    t.camera.startError = null;
+    s.q(`button[aria-label="${RETRY_LABEL}"]`).click();
+    await flush();
+    expect(s.visible()).toEqual(['camera-screen']);
+    expect(t.decision.events.filter((e) => e === 'APP_STARTED')).toHaveLength(2);
+    app.dispose();
+  });
+});
+</file>
+
 <file path="tests/utils/event-bus.test.ts">
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { createEventBus } from '../../src/utils/event-bus';
@@ -19290,28 +19203,6 @@ async reset(): Promise<Settings>
 </files>
 </file>
 
-<file path="index.html">
-<!doctype html>
-<html lang="vi">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-    <meta name="theme-color" content="#000000" />
-    <meta name="color-scheme" content="dark" />
-    <title>Nhận dạng tiền</title>
-    <style>
-      /* Chống nháy trắng trước khi CSS của ứng dụng nạp xong. */
-      html, body { margin: 0; height: 100%; background: #000; }
-    </style>
-  </head>
-  <body>
-    <div id="app"></div>
-    <noscript>Ứng dụng cần JavaScript để chạy.</noscript>
-    <script type="module" src="/src/main.ts"></script>
-  </body>
-</html>
-</file>
-
 <file path="Test.ipynb">
 {
   "nbformat": 4,
@@ -24075,6 +23966,87 @@ export function createWebSpeechEngine(): ITtsEngine {
 }
 </file>
 
+<file path="src/main.ts">
+/**
+ * Điểm vào của ứng dụng: dựng các bản cài THẬT rồi nối vào createApp. Không có logic nghiệp vụ ở đây.
+ * Thứ tự dựng: cài đặt → giao diện (cho thẻ video) → camera → suy luận → rung → giọng nói → app.
+ * Lớp debug chỉ bật khi có ?debug=1 hoặc khi dựng ở chế độ development (vite --mode development); bản release không có.
+ */
+import './ui/styles.css';
+import { createAriaLiveEngine } from './accessibility/aria-live-engine';
+import { createSettingsManager } from './accessibility/settings-manager';
+import { createFrameAnalyzer } from './analyzer/frame-analyzer';
+import { createApp } from './app/app';
+import type { App } from './app/app';
+import { createAppLifecyclePort } from './app/app-lifecycle-adapter';
+import { createNativeTorchPort } from './app/native-torch';
+import { createCameraService } from './camera/camera-controller';
+import { DEFAULT_CONFIG } from './config/app-config';
+import type { SettingAck } from './contracts';
+import { createDecisionEngine } from './decision/decision-engine';
+import { checkBundledAssets } from './offline/asset-check';
+import { createSettingsStore } from './offline/settings-store';
+import { createAppUi } from './ui/app-ui';
+import { createLogger } from './utils/logger';
+import { getPlatform } from './utils/platform';
+import { systemClock } from './utils/time';
+import { createInferenceClient } from './vision/inference-client';
+import { createAudioClipEngine } from './voice/audio-clip-engine';
+import { createHaptics } from './voice/haptic-service';
+import { createNativeTtsEngine } from './voice/native-tts-engine';
+import { createSpeechManager } from './voice/speech-manager';
+import { createWebSpeechEngine } from './voice/web-speech-engine';
+
+const log = createLogger('main');
+
+function bootstrap(): App {
+  const root = document.getElementById('app');
+  if (root === null) throw new Error('Thiếu phần tử #app trong index.html');
+  const config = DEFAULT_CONFIG;
+  const base = import.meta.env.BASE_URL; // './' (Vite base): mọi tài nguyên nằm sẵn trong APK
+  const debug = new URLSearchParams(window.location.search).get('debug') === '1' || import.meta.env.MODE === 'development';
+
+  // Lời xác nhận khi đổi cài đặt đi qua bộ nói; bộ nói được dựng sau cài đặt nên nối muộn.
+  let acknowledge: (what: SettingAck) => void = () => undefined;
+  const settings = createSettingsManager(createSettingsStore(), (what) => acknowledge(what));
+
+  const ui = createAppUi({ root, settings, debug, now: systemClock, onReplayGuide: () => speech.say({ kind: 'WELCOME' }) });
+  const torchPort = createNativeTorchPort();
+  const camera = createCameraService({ video: ui.video, fps: config.inference.targetFps, torchPort });
+  const inference = createInferenceClient({ modelBaseUrl: `${base}models/`, ortBaseUrl: `${base}ort/`, config: config.inference });
+  const haptics = createHaptics({ isEnabled: () => settings.get().vibrationEnabled });
+  const speech = createSpeechManager({
+    engines: [createNativeTtsEngine(), createWebSpeechEngine(), createAudioClipEngine({ baseUrl: base }), createAriaLiveEngine({ root })],
+    haptics,
+    getSettings: () => settings.get(),
+    config: config.speech,
+  });
+  acknowledge = (what) => speech.say({ kind: 'SETTING_ACK', what });
+
+  return createApp({
+    camera, inference, analyzer: createFrameAnalyzer(config), decision: createDecisionEngine(config.decision),
+    speech, haptics, settings, ui, torchPort, platform: getPlatform(), clock: systemClock,
+    assets: () => checkBundledAssets({ baseUrl: base }), lifecycle: createAppLifecyclePort(), config,
+  });
+}
+
+/** Lưới an toàn cuối cùng: nếu không dựng nổi giao diện thì vẫn phải có chữ (không để màn hình đen im lặng). */
+function showFatal(message: string): void {
+  const note = document.createElement('p');
+  note.setAttribute('role', 'alert');
+  note.style.cssText = 'margin:0;padding:1rem;color:#fff;font:700 1.5rem/1.4 system-ui,sans-serif';
+  note.textContent = message;
+  (document.getElementById('app') ?? document.body).replaceChildren(note);
+}
+
+try {
+  void bootstrap().start(); // không dispose ở pagehide: WebView đóng thì camera và worker tự dừng, còn dispose nhầm là tắt app vĩnh viễn
+} catch (e) {
+  log.error('Không dựng được ứng dụng', e);
+  showFatal('Không khởi động được ứng dụng. Hãy đóng ứng dụng rồi mở lại.');
+}
+</file>
+
 <file path="tests/decision/source-rules.test.ts">
 // Bảo đảm tĩnh cho nghiệm thu: module decision không chạm DOM, đồng hồ, I/O, không dùng any,
 // và chỉ import hợp đồng, cấu hình, tiện ích P00 hoặc file cùng thư mục.
@@ -24425,149 +24397,26 @@ describe('loadModel', () => {
 </html>
 </file>
 
-<file path="package.json">
-{
-  "name": "money-reader-cdio4",
-  "version": "0.1.0",
-  "private": true,
-  "type": "module",
-  "description": "Nhận dạng mệnh giá tiền Việt Nam hỗ trợ người khiếm thị (CDIO4)",
-  "engines": { "node": ">=20.0.0" },
-  "scripts": {
-    "dev": "vite",
-    "build": "tsc --noEmit -p tsconfig.json && vite build",
-    "preview": "vite preview",
-    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json",
-    "test": "vitest run",
-    "test:watch": "vitest",
-    "copy-ort": "node scripts/copy-ort-wasm.mjs",
-    "postinstall": "node scripts/copy-ort-wasm.mjs",
-    "predev": "node scripts/copy-ort-wasm.mjs",
-    "prebuild": "node scripts/copy-ort-wasm.mjs",
-    "check:registry": "tsx scripts/check-registry.ts",
-    "verify:bundle": "node scripts/verify-bundle.mjs",
-    "cap:sync": "npm run build && npx cap sync android",
-    "build:apk-assets": "npm run copy-ort && vite build && npx cap sync android && npm run verify:bundle",
-    "cap:open": "npx cap open android"
-  },
-  "dependencies": {
-    "@capacitor-community/text-to-speech": "^6.1.0",
-    "@capacitor/app": "^7.0.0",
-    "@capacitor/core": "^7.0.0",
-    "@capacitor/haptics": "^7.0.0",
-    "@capacitor/preferences": "^7.0.0",
-    "onnxruntime-web": "^1.20.0"
-  },
-  "devDependencies": {
-    "@capacitor/android": "^7.0.0",
-    "@capacitor/cli": "^7.0.0",
-    "@types/node": "^20.0.0",
-    "happy-dom": "^15.0.0",
-    "tsx": "^4.19.0",
-    "typescript": "^5.6.0",
-    "vite": "^5.4.0",
-    "vitest": "^2.1.0"
-  }
-}
-</file>
-
-<file path="README.md">
-# Nhận dạng mệnh giá tiền Việt Nam hỗ trợ người khiếm thị (CDIO4)
-
-Ứng dụng Android chạy không cần mạng. Mở app là vào thẳng camera, nhận dạng liên tục mệnh giá
-tiền bằng YOLO11s (ONNX) và đọc kết quả bằng giọng nói. Sản phẩm cuối là file APK.
-
-## Nguyên tắc bất biến
-Voice First · Camera First · Hands-free · Offline First · Fail Safe · Anti-repeat · Privacy First.
-Không chắc chắn thì KHÔNG đọc tổng tiền.
-
-## Công nghệ
-Capacitor (WebView) · Vite · TypeScript strict · Vitest · onnxruntime-web (WASM, Web Worker)
-· Capacitor Text-to-Speech. Không framework UI, không Service Worker.
-
-## Bắt đầu
-```bash
-npm i              # cài gói và chép runtime ONNX vào public/ort
-npm run dev        # chạy thử trên trình duyệt (localhost)
-npm run typecheck  # kiểm tra kiểu
-npm test           # chạy Vitest
-```
-Đóng gói APK: docs/ANDROID-SETUP.md (lần đầu, tạo dự án Android) rồi docs/ANDROID-BUILD.md (sửa manifest, ký APK, cài lên máy).
-
-## Lệnh
-| Lệnh | Tác dụng |
-|---|---|
-| npm run dev / build / preview | Vite |
-| npm run copy-ort | chép wasm của onnxruntime-web vào public/ort |
-| npm run check:registry | in trạng thái THẬT / STUB / THIẾU của từng module |
-| npm run verify:bundle | kiểm tra dist/ có model, classes.json, wasm |
-| npm run cap:sync / cap:open | build rồi đồng bộ sang Android / mở Android Studio |
-| npm run build:apk-assets | copy-ort → vite build → cap sync → verify:bundle (chuẩn bị gói web cho APK) |
-
-## Chạy trên điện thoại thật
-1. Bật Tùy chọn nhà phát triển và Gỡ lỗi USB trên điện thoại Android, cắm cáp USB, chọn Cho phép khi máy hỏi.
-2. `npm run build:apk-assets`. Cần có `public/models/best.onnx` và các file mp3 trong `public/audio`; đạt khi dòng cuối là `Gói đủ tài nguyên để chạy ngoại tuyến`.
-3. `npm run cap:open` mở Android Studio, chọn điện thoại trên thanh trên rồi bấm Run (▶). Lần đầu cấp quyền Camera.
-4. Muốn kiểm tra ngoại tuyến thì làm OFFLINE-01 ở cuối tài liệu này.
-
-Lớp debug (hộp phát hiện, FPS, độ trễ, nút tải log JSON): chạy `npm run dev` rồi mở `?debug=1`, hoặc dựng APK debug bằng
-`npx vite build --mode development && npx cap sync android`. Bản release không có lớp này. Sửa manifest, ký APK và `adb install -r`: docs/ANDROID-BUILD.md.
-
-## Cấu trúc thư mục
-- src/: contracts · config · utils · camera · vision · analyzer · decision · voice · accessibility · offline · ui · app
-- public/: models · ort · audio
-- tests/: phản chiếu src; đồ giả dùng chung ở tests/fakes
-
-## Hợp đồng giữa các module
-src/contracts/index.ts là nguồn sự thật duy nhất, không module nào tự sửa. Mỗi module phải xuất
-đúng đường dẫn, tên và chữ ký ghi trong docs/export-registry.txt.
-
-## Quy trình ghép
-1. Thả file của module vào đúng đường dẫn, ghi đè file stub cùng tên (dòng đầu `// STUB P0x`).
-2. Xóa file `.js` cùng tên nếu còn sót: Vite ưu tiên `.js` hơn `.ts` nên nó che mất file thật.
-3. `npm run typecheck` phải sạch.
-4. `npm test` phải xanh. Test đơn vị dùng đồ giả ở tests/fakes, không import mã thật của module khác.
-5. `npm run check:registry`: dòng của module vừa ghép phải chuyển từ STUB sang THẬT.
-   Muốn chặn lỗi ghép: `npm run check:registry -- --require P02,P03` (thoát mã 1 nếu chưa THẬT hoặc có THIẾU).
-
-# README-OFFLINE — Kiểm tra ngoại tuyến trong APK
-
-Mọi tài nguyên (model ONNX, wasm của ORT, âm thanh) nằm sẵn trong APK. Ứng dụng **không có Service Worker và không dùng Cache API**:
-nhận dạng và giọng đọc không cần Internet. Thứ duy nhất được lưu là cài đặt người dùng; khung hình camera không bao giờ được lưu hay gửi.
-
-## 1. Kiểm tra gói trước khi cài (máy dev)
-1. `npm run cap:sync` (build web rồi chép vào `android/app/src/main/assets/public`).
-2. `npm run verify:bundle`. Mong đợi: mọi dòng `OK`, dòng cuối `Gói đủ tài nguyên để chạy ngoại tuyến`, mã thoát 0.
-   Script kiểm tra `models/*`, `ort/*.wasm`, `audio/*`, so sha256 của file onnx với `model-manifest.json`,
-   rồi in dung lượng từng file và tổng assets (ước lượng cỡ APK).
-3. Mã thoát 1 là thiếu file hoặc sai sha256: sửa nguồn (`public/models`, `npm run copy-ort`) rồi sync lại.
-   Trước khi sync có thể kiểm tra thư mục build: `node scripts/verify-bundle.mjs dist`.
-
-## 2. Quy trình OFFLINE-01 trên APK
-| Bước | Việc làm | Đạt khi |
-|---|---|---|
-| 1 | Cài APK lên điện thoại Android (Android Studio hoặc `adb install`) | Cài xong |
-| 2 | Bật chế độ máy bay; tắt Wi-Fi và dữ liệu di động | Máy không có Internet |
-| 3 | Đóng hẳn app (vuốt khỏi danh sách gần đây) rồi mở lại | Vào thẳng camera, không báo thiếu dữ liệu |
-| 4 | Đưa một tờ tiền trước camera | App nhận ra mệnh giá |
-| 5 | Nghe giọng đọc kết quả | Giọng tiếng Việt đọc đúng mệnh giá |
-| 6 | Chạm vào màn hình để nghe lại | App đọc lại đúng kết quả đó |
-
-**Điều kiện đạt:** cả 6 bước chạy được mà không cần Internet, không hộp thoại hay thông báo nào đòi mạng.
-Nếu app đọc "Ứng dụng thiếu dữ liệu nhận dạng. Hãy cài lại ứng dụng." thì gói thiếu tài nguyên: làm lại mục 1 rồi cài lại APK.
-
-## 3. Kiểm tra giọng Việt ngoại tuyến
-Giọng đọc dùng engine Text-to-Speech của Android, cần có dữ liệu giọng tiếng Việt trên máy.
-1. Khi còn mạng: Cài đặt Android → Chuyển văn bản thành giọng nói (tên và vị trí menu khác nhau tùy hãng máy).
-2. Chọn engine đang dùng, tải dữ liệu giọng **Tiếng Việt** rồi bấm nghe thử.
-3. Bật chế độ máy bay, nghe thử lại ngay trong màn hình đó, rồi chạy lại bước 3 đến 6 của OFFLINE-01.
-4. Nếu máy báo thiếu dữ liệu giọng khi không có mạng thì bước 5 **không đạt**. Các dự phòng (âm thanh ghi sẵn trong `audio/`,
-   trình đọc màn hình) chỉ phủ một số câu cố định.
-
-## 4. Cài đặt đã lưu
-- Lưu bằng Preferences của Capacitor, dự phòng localStorage rồi bộ nhớ trong; toàn bộ là một khóa JSON.
-- **Gỡ app hoặc xóa dữ liệu app sẽ mất cài đặt**, cài lại thì quay về mặc định.
-- Bộ chặn quyền riêng tư từ chối mọi lần lưu có ảnh: ImageBitmap, ImageData, Blob, mảng byte trên 4 KB, chuỗi `data:image`.
+<file path="index.html">
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#000000" />
+    <meta name="color-scheme" content="dark" />
+    <title>Nhận dạng tiền</title>
+    <style>
+      /* Chống nháy trắng trước khi CSS của ứng dụng nạp xong. */
+      html, body { margin: 0; height: 100%; background: #000; }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <noscript>Ứng dụng cần JavaScript để chạy.</noscript>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
 </file>
 
 <file path="src/contracts/index.ts">
@@ -25964,6 +25813,151 @@ describe('closeBitmap', () => {
     expect(() => closeBitmap(bitmap)).not.toThrow();
   });
 });
+</file>
+
+<file path="package.json">
+{
+  "name": "money-reader-cdio4",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Nhận dạng mệnh giá tiền Việt Nam hỗ trợ người khiếm thị (CDIO4)",
+  "engines": { "node": ">=20.0.0" },
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit -p tsconfig.json && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "copy-ort": "node scripts/copy-ort-wasm.mjs",
+    "postinstall": "node scripts/copy-ort-wasm.mjs",
+    "predev": "node scripts/copy-ort-wasm.mjs",
+    "prebuild": "node scripts/copy-ort-wasm.mjs",
+    "check:registry": "tsx scripts/check-registry.ts",
+    "verify:bundle": "node scripts/verify-bundle.mjs",
+    "cap:sync": "npm run build && npx cap sync android",
+    "build:apk-assets": "npm run copy-ort && vite build && npx cap sync android && npm run verify:bundle",
+    "cap:open": "npx cap open android"
+  },
+  "dependencies": {
+    "@capacitor-community/text-to-speech": "^6.1.0",
+    "@capacitor/app": "^7.0.0",
+    "@capacitor/core": "^7.0.0",
+    "@capacitor/haptics": "^7.0.0",
+    "@capacitor/preferences": "^7.0.0",
+    "onnxruntime-web": "^1.20.0"
+  },
+  "devDependencies": {
+    "@capacitor/android": "^7.0.0",
+    "@capacitor/cli": "^7.0.0",
+    "@types/node": "^20.0.0",
+    "happy-dom": "^15.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "vite": "^5.4.0",
+    "vitest": "^2.1.0"
+  }
+}
+</file>
+
+<file path="README.md">
+# Nhận dạng mệnh giá tiền Việt Nam hỗ trợ người khiếm thị (CDIO4)
+
+Ứng dụng Android chạy không cần mạng. Mở app là vào thẳng camera, nhận dạng liên tục mệnh giá
+tiền bằng YOLO11s (ONNX) và đọc kết quả bằng giọng nói. Sản phẩm cuối là file APK.
+
+## Nguyên tắc bất biến
+Voice First · Camera First · Hands-free · Offline First · Fail Safe · Anti-repeat · Privacy First.
+Không chắc chắn thì KHÔNG đọc tổng tiền.
+
+## Công nghệ
+Capacitor (WebView) · Vite · TypeScript strict · Vitest · onnxruntime-web (WASM, Web Worker)
+· Capacitor Text-to-Speech. Không framework UI, không Service Worker.
+
+## Bắt đầu
+```bash
+npm i              # cài gói và chép runtime ONNX vào public/ort
+npm run dev        # chạy thử trên trình duyệt (localhost)
+npm run typecheck  # kiểm tra kiểu
+npm test           # chạy Vitest
+```
+Đóng gói APK: docs/ANDROID-SETUP.md (lần đầu, tạo dự án Android) rồi docs/ANDROID-BUILD.md (sửa manifest, ký APK, cài lên máy).
+
+## Lệnh
+| Lệnh | Tác dụng |
+|---|---|
+| npm run dev / build / preview | Vite |
+| npm run copy-ort | chép wasm của onnxruntime-web vào public/ort |
+| npm run check:registry | in trạng thái THẬT / STUB / THIẾU của từng module |
+| npm run verify:bundle | kiểm tra dist/ có model, classes.json, wasm |
+| npm run cap:sync / cap:open | build rồi đồng bộ sang Android / mở Android Studio |
+| npm run build:apk-assets | copy-ort → vite build → cap sync → verify:bundle (chuẩn bị gói web cho APK) |
+
+## Chạy trên điện thoại thật
+1. Bật Tùy chọn nhà phát triển và Gỡ lỗi USB trên điện thoại Android, cắm cáp USB, chọn Cho phép khi máy hỏi.
+2. `npm run build:apk-assets`. Cần có `public/models/best.onnx` và các file mp3 trong `public/audio`; đạt khi dòng cuối là `Gói đủ tài nguyên để chạy ngoại tuyến`.
+3. `npm run cap:open` mở Android Studio, chọn điện thoại trên thanh trên rồi bấm Run (▶). Lần đầu cấp quyền Camera.
+4. Muốn kiểm tra ngoại tuyến thì làm OFFLINE-01 ở cuối tài liệu này.
+
+Lớp debug (hộp phát hiện, FPS, độ trễ, nút tải log JSON): chạy `npm run dev` rồi mở `?debug=1`, hoặc dựng APK debug bằng
+`npx vite build --mode development && npx cap sync android`. Bản release không có lớp này. Sửa manifest, ký APK và `adb install -r`: docs/ANDROID-BUILD.md.
+
+## Cấu trúc thư mục
+- src/: contracts · config · utils · camera · vision · analyzer · decision · voice · accessibility · offline · ui · app
+- public/: models · ort · audio
+- tests/: phản chiếu src; đồ giả dùng chung ở tests/fakes
+
+## Hợp đồng giữa các module
+src/contracts/index.ts là nguồn sự thật duy nhất, không module nào tự sửa. Mỗi module phải xuất
+đúng đường dẫn, tên và chữ ký ghi trong docs/export-registry.txt.
+
+## Quy trình ghép
+1. Thả file của module vào đúng đường dẫn, ghi đè file stub cùng tên (dòng đầu `// STUB P0x`).
+2. Xóa file `.js` cùng tên nếu còn sót: Vite ưu tiên `.js` hơn `.ts` nên nó che mất file thật.
+3. `npm run typecheck` phải sạch.
+4. `npm test` phải xanh. Test đơn vị dùng đồ giả ở tests/fakes, không import mã thật của module khác.
+5. `npm run check:registry`: dòng của module vừa ghép phải chuyển từ STUB sang THẬT.
+   Muốn chặn lỗi ghép: `npm run check:registry -- --require P02,P03` (thoát mã 1 nếu chưa THẬT hoặc có THIẾU).
+
+# README-OFFLINE — Kiểm tra ngoại tuyến trong APK
+
+Mọi tài nguyên (model ONNX, wasm của ORT, âm thanh) nằm sẵn trong APK. Ứng dụng **không có Service Worker và không dùng Cache API**:
+nhận dạng và giọng đọc không cần Internet. Thứ duy nhất được lưu là cài đặt người dùng; khung hình camera không bao giờ được lưu hay gửi.
+
+## 1. Kiểm tra gói trước khi cài (máy dev)
+1. `npm run cap:sync` (build web rồi chép vào `android/app/src/main/assets/public`).
+2. `npm run verify:bundle`. Mong đợi: mọi dòng `OK`, dòng cuối `Gói đủ tài nguyên để chạy ngoại tuyến`, mã thoát 0.
+   Script kiểm tra `models/*`, `ort/*.wasm`, `audio/*`, so sha256 của file onnx với `model-manifest.json`,
+   rồi in dung lượng từng file và tổng assets (ước lượng cỡ APK).
+3. Mã thoát 1 là thiếu file hoặc sai sha256: sửa nguồn (`public/models`, `npm run copy-ort`) rồi sync lại.
+   Trước khi sync có thể kiểm tra thư mục build: `node scripts/verify-bundle.mjs dist`.
+
+## 2. Quy trình OFFLINE-01 trên APK
+| Bước | Việc làm | Đạt khi |
+|---|---|---|
+| 1 | Cài APK lên điện thoại Android (Android Studio hoặc `adb install`) | Cài xong |
+| 2 | Bật chế độ máy bay; tắt Wi-Fi và dữ liệu di động | Máy không có Internet |
+| 3 | Đóng hẳn app (vuốt khỏi danh sách gần đây) rồi mở lại | Vào thẳng camera, không báo thiếu dữ liệu |
+| 4 | Đưa một tờ tiền trước camera | App nhận ra mệnh giá |
+| 5 | Nghe giọng đọc kết quả | Giọng tiếng Việt đọc đúng mệnh giá |
+| 6 | Chạm vào màn hình để nghe lại | App đọc lại đúng kết quả đó |
+
+**Điều kiện đạt:** cả 6 bước chạy được mà không cần Internet, không hộp thoại hay thông báo nào đòi mạng.
+Nếu app đọc "Ứng dụng thiếu dữ liệu nhận dạng. Hãy cài lại ứng dụng." thì gói thiếu tài nguyên: làm lại mục 1 rồi cài lại APK.
+
+## 3. Kiểm tra giọng Việt ngoại tuyến
+Giọng đọc dùng engine Text-to-Speech của Android, cần có dữ liệu giọng tiếng Việt trên máy.
+1. Khi còn mạng: Cài đặt Android → Chuyển văn bản thành giọng nói (tên và vị trí menu khác nhau tùy hãng máy).
+2. Chọn engine đang dùng, tải dữ liệu giọng **Tiếng Việt** rồi bấm nghe thử.
+3. Bật chế độ máy bay, nghe thử lại ngay trong màn hình đó, rồi chạy lại bước 3 đến 6 của OFFLINE-01.
+4. Nếu máy báo thiếu dữ liệu giọng khi không có mạng thì bước 5 **không đạt**. Các dự phòng (âm thanh ghi sẵn trong `audio/`,
+   trình đọc màn hình) chỉ phủ một số câu cố định.
+
+## 4. Cài đặt đã lưu
+- Lưu bằng Preferences của Capacitor, dự phòng localStorage rồi bộ nhớ trong; toàn bộ là một khóa JSON.
+- **Gỡ app hoặc xóa dữ liệu app sẽ mất cài đặt**, cài lại thì quay về mặc định.
+- Bộ chặn quyền riêng tư từ chối mọi lần lưu có ảnh: ImageBitmap, ImageData, Blob, mảng byte trên 4 KB, chuỗi `data:image`.
 </file>
 
 <file path="src/vision/inference-client.ts">

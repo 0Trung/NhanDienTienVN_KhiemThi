@@ -54,7 +54,7 @@ interface Agreeing {
  * không nằm trong điều kiện này: việc chặn theo chúng thuộc về bộ ra quyết định.
  */
 export function isFrameValid(f: Pick<FrameAnalysis, 'sure' | 'unsure' | 'overlap' | 'conflict'>): boolean {
-  return f.sure.length > 0 && f.unsure.length === 0 && !f.overlap.detected && !f.conflict.detected;
+  return f.sure.length > 0 && !f.overlap.detected && !f.conflict.detected;
 }
 
 /**

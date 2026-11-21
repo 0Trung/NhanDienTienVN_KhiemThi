@@ -53,7 +53,7 @@ function entrySpeech(t: TransitionResult): SpeechIntent | null {
  * CHỈ xảy ra ở nhánh 7 của ANALYSIS, sau khi nhánh 1..6 đều đã loại trừ mọi nghi ngờ.
  *
  * Mã lý do (`reasons`) = [mã chính, ...mã phụ]:
- * - SYSTEM hợp lệ: [tên sự kiện] + BOTH_READY | WAIT_CAMERA | WAIT_MODEL | MEMORY_CLEARED;
+* - SYSTEM hợp lệ: [tên sự kiện] + BOTH_READY | WAIT_CAMERA | WAIT_MODEL | MEMORY_CLEARED;
  *   trái phép: ['ILLEGAL_TRANSITION', 'SỰ_KIỆN@TRẠNG_THÁI'] (bỏ qua, không đổi trạng thái).
  * - FAILURE: ['FAILURE', mã lỗi] (+ DUPLICATE khi đang ERROR cùng mã: im lặng). USER_REPLAY: ['USER_REPLAY', HAS_RESULT | NO_RESULT].
  * - ANALYSIS bị bỏ qua: ['ANALYSIS_IGNORED', ERROR_STATE | NOT_READY | BACKGROUNDED | SPEAKING] (+ SIGNATURE_RESET).
@@ -111,8 +111,7 @@ export function createDecisionEngine(config: AppConfig['decision']): IDecisionEn
     errorCode = code;
     return outputOf(['FAILURE', code], { kind: 'ERROR', code });
   }
-
-  function onReplay(): DecisionOutput {
+function onReplay(): DecisionOutput {
     if (lastResult === null) return outputOf(['USER_REPLAY', 'NO_RESULT'], { kind: 'REPLAY_EMPTY' });
     return outputOf(['USER_REPLAY', 'HAS_RESULT'], { kind: 'REPLAY', result: cloneResult(lastResult) });
   }
@@ -168,7 +167,7 @@ export function createDecisionEngine(config: AppConfig['decision']): IDecisionEn
     if (phase === 'ERROR') return outputOf(['ANALYSIS_IGNORED', 'ERROR_STATE']);
     if (phase === 'STARTUP') return outputOf(['ANALYSIS_IGNORED', 'NOT_READY']);
     if (snapshot.backgrounded) return outputOf(['ANALYSIS_IGNORED', 'BACKGROUNDED']);
-    const signatureReset = trackEmpty(a, now);
+const signatureReset = trackEmpty(a, now);
     if (phase === 'SPEAKING') return outputOf(['ANALYSIS_IGNORED', 'SPEAKING', ...(signatureReset ? ['SIGNATURE_RESET'] : [])]);
 
     // 1. Không có detection nào: NO_MONEY chỉ được nói sau khi trống liên tục đủ noMoneyGuidanceDelayMs.
@@ -189,8 +188,8 @@ export function createDecisionEngine(config: AppConfig['decision']): IDecisionEn
       const speech = guide('OVERLAP', now);
       return observe('OVERLAP_SEEN', 'OVERLAP', ['OVERLAP', guidanceReason(speech)], speech);
     }
-    // 4. Còn tờ chưa chắc.
-    if (a.unsure.length > 0) {
+    // 4. Còn tờ chưa chắc: chỉ chặn để nhắc người dùng khi KHÔNG có tờ nào chắc chắn trong khung.
+    if (a.unsure.length > 0 && a.sure.length === 0) {
       const code = unsureGuidance(a);
       const speech = guide(code, now);
       return observe('UNCERTAIN_SEEN', 'LOW_CONFIDENCE', ['UNSURE_PRESENT', `CAUSE_${code}`, guidanceReason(speech)], speech);
@@ -214,7 +213,7 @@ export function createDecisionEngine(config: AppConfig['decision']): IDecisionEn
     // 7. Danh sách chốt: trùng chữ ký đã công bố thì im lặng (anti-repeat), ngược lại công bố kết quả mới.
     const denominations = consensus.map((d) => d.denomination);
     const signature = denominations.join(',');
-    const status = denominations.length === 1 ? 'CONFIDENT_SINGLE' : 'CONFIDENT_MULTI';
+const status = denominations.length === 1 ? 'CONFIDENT_SINGLE' : 'CONFIDENT_MULTI';
     if (signature === memory.announcedSignature) return observe('STEADY_SEEN', status, ['ANTI_REPEAT']);
     const total = safeTotal(denominations);
     if (total === null) return observe('UNSTABLE_SEEN', 'UNSTABLE', ['UNSTABLE', 'TOTAL_FAILED']);

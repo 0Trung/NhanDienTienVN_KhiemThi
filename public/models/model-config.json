@@ -1,13 +1,13 @@
 {
-  "inputSize": 416,
+  "inputSize": 640,
   "padValue": 114,
   "channelOrder": "RGB",
   "layout": "NCHW",
   "normalize": "div255",
   "outputLayout": "channels_first",
   "confLow": 0.25,
-  "confSure": 0.7,
-  "nmsIou": 0.7,
-  "agnosticNms": false,
+  "confSure": 0.65,
+  "nmsIou": 0.45,
+  "agnosticNms": true,
   "maxDetections": 20
 }

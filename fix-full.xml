@@ -1,0 +1,2892 @@
+This file is a merged representation of a subset of the codebase, containing specifically included files, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of a subset of the repository's contents that is considered the most important context.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Only files matching these patterns are included: src/config/app-config.ts, src/decision/decision-engine.ts, src/analyzer/temporal-stabilizer.ts, src/analyzer/frame-analyzer.ts, src/voice/speech-manager.ts, src/voice/audio-clip-engine.ts, src/voice/native-tts-engine.ts, src/voice/native-tts-adapter.ts, src/voice/prompt-manager.ts, src/app/app.ts, src/vision/model-manager.ts, src/vision/inference-client.ts, src/vision/inference-worker.ts, src/main.ts, capacitor.config.ts, vite.config.ts, scripts/copy-ort-wasm.mjs
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+scripts/
+  copy-ort-wasm.mjs
+src/
+  analyzer/
+    frame-analyzer.ts
+    temporal-stabilizer.ts
+  app/
+    app.ts
+  config/
+    app-config.ts
+  decision/
+    decision-engine.ts
+  vision/
+    inference-client.ts
+    inference-worker.ts
+    model-manager.ts
+  voice/
+    audio-clip-engine.ts
+    native-tts-adapter.ts
+    native-tts-engine.ts
+    prompt-manager.ts
+    speech-manager.ts
+  main.ts
+capacitor.config.ts
+vite.config.ts
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="scripts/copy-ort-wasm.mjs">
+// Chép runtime của onnxruntime-web (file .wasm và .mjs đi kèm, bản SIMD) vào public/ort/
+// để APK chứa sẵn và chạy offline. Bỏ biến thể jsep, webgpu, asyncify, jspi.
+// Chạy tự động ở postinstall, predev, prebuild.
+import { copyFileSync, existsSync, mkdirSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const root = join(dirname(fileURLToPath(import.meta.url)), '..');
+const srcDir = join(root, 'node_modules', 'onnxruntime-web', 'dist');
+const destDir = join(root, 'public', 'ort');
+
+const WANTED = /^ort-wasm-simd.*\.(wasm|mjs)$/;
+const EXCLUDED = /(jsep|webgpu|asyncify|jspi)/i;
+
+const mb = (bytes) => `${(bytes / 1048576).toFixed(2)} MB`;
+
+if (!existsSync(srcDir)) {
+  console.error(`[copy-ort] Không thấy ${srcDir}. Hãy chạy npm i trước.`);
+  process.exit(1);
+}
+
+const available = readdirSync(srcDir).sort();
+const selected = available.filter((f) => WANTED.test(f) && !EXCLUDED.test(f));
+
+if (!selected.some((f) => f.endsWith('.wasm'))) {
+  console.error('[copy-ort] Không tìm thấy file .wasm bản SIMD phù hợp. Các file ort-wasm* hiện có:');
+  for (const f of available.filter((x) => x.startsWith('ort-wasm'))) console.error(`  - ${f}`);
+  console.error('[copy-ort] Có thể phiên bản onnxruntime-web đổi tên file: hãy sửa WANTED/EXCLUDED trong script này.');
+  process.exit(1);
+}
+
+mkdirSync(destDir, { recursive: true });
+// Xóa bản chép cũ để không sót file của phiên bản trước.
+for (const old of readdirSync(destDir)) {
+  if (old.startsWith('ort-wasm')) rmSync(join(destDir, old), { force: true });
+}
+
+let total = 0;
+console.info('[copy-ort] Đã chép vào public/ort:');
+for (const f of selected) {
+  copyFileSync(join(srcDir, f), join(destDir, f));
+  const size = statSync(join(destDir, f)).size;
+  total += size;
+  console.info(`  - ${f}  (${mb(size)})`);
+}
+console.info(`[copy-ort] Tổng: ${selected.length} file, ${mb(total)}`);
+if (!selected.some((f) => f.endsWith('.mjs'))) {
+  console.warn('[copy-ort] Cảnh báo: chưa thấy file .mjs đi kèm. Kiểm tra lại phiên bản onnxruntime-web.');
+}
+</file>
+
+<file path="src/analyzer/temporal-stabilizer.ts">
+import type { AppConfig, BBox, Denomination, Detection, FrameAnalysis } from '../contracts';
+import { iou } from '../utils/geometry';
+import { mean } from '../utils/math';
+
+/** Cấu hình bộ ổn định, lấy từ config.analyzer.stabilizer. */
+export type StabilizerConfig = AppConfig['analyzer']['stabilizer'];
+
+/** Kết luận ổn định của một khung, đúng kiểu FrameAnalysis['stability']. */
+export type StabilityInfo = FrameAnalysis['stability'];
+
+/** Phần tối thiểu của một hộp để ghép giữa hai khung: mệnh giá và vị trí (pixel, khung gốc). */
+export type MatchableBox = Pick<Detection, 'denomination' | 'bbox'>;
+
+/** Một khung hình đưa vào bộ ổn định. */
+export interface StabilizerFrame {
+  /** Mốc thời gian chụp khung, mili-giây (FrameMeta.timestamp, cùng hệ quy chiếu performance.now()). */
+  timestamp: number;
+  /** Khung có hợp lệ để xét ổn định không (xem isFrameValid). */
+  valid: boolean;
+  /** Các detection CHẮC của khung, theo thứ tự trái → phải. */
+  sure: readonly Detection[];
+}
+
+/** Bộ ổn định theo thời gian (Detection Tracker): giữ cửa sổ các khung gần nhất. */
+export interface TemporalStabilizer {
+  /** Ghi một khung mới vào cửa sổ rồi trả kết luận ổn định cho CHÍNH khung đó. */
+  push(frame: StabilizerFrame): StabilityInfo;
+  /** Xóa toàn bộ cửa sổ. */
+  reset(): void;
+}
+
+/** Bản chụp một hộp chắc của khung cũ: tách khỏi đối tượng của người gọi để họ sửa sau này cũng không làm hỏng cửa sổ. */
+interface TrackedBox {
+  readonly denomination: Denomination;
+  readonly confidence: number;
+  readonly bbox: BBox;
+}
+
+interface Entry {
+  readonly timestamp: number;
+  readonly valid: boolean;
+  readonly boxes: readonly TrackedBox[];
+}
+
+interface Agreeing {
+  readonly boxes: readonly TrackedBox[];
+  /** matchOf[i] = chỉ số trong `boxes` được ghép với hộp thứ i của khung mới nhất. */
+  readonly matchOf: readonly number[];
+}
+
+/**
+ * Khung HỢP LỆ để xét ổn định khi: có ít nhất một tờ chắc, KHÔNG có tờ chưa chắc,
+ * không chồng lấn và không xung đột lớp. Vị trí (quá nhỏ, chạm mép) và chất lượng ảnh (mờ, tối)
+ * không nằm trong điều kiện này: việc chặn theo chúng thuộc về bộ ra quyết định.
+ */
+export function isFrameValid(f: Pick<FrameAnalysis, 'sure' | 'unsure' | 'overlap' | 'conflict'>): boolean {
+  return f.sure.length > 0 && f.unsure.length === 0 && !f.overlap.detected && !f.conflict.detected;
+}
+
+/**
+ * Ghép hộp của hai khung: mỗi hộp của `a` phải ghép được với ĐÚNG MỘT hộp của `b` (và ngược lại),
+ * cùng mệnh giá và IoU ≥ matchIou, ghép tham lam theo IoU giảm dần (hòa thì theo chỉ số nhỏ trước).
+ * Ghép đủ cặp kéo theo cùng số tờ và cùng đa tập mệnh giá nên không cần kiểm riêng.
+ * Hộp suy biến có IoU 0 nên không bao giờ ghép được.
+ *
+ * @param a Hộp của khung thứ nhất, pixel khung gốc.
+ * @param b Hộp của khung thứ hai, pixel khung gốc.
+ * @param matchIou Ngưỡng IoU, không đơn vị trong (0, 1] (config.analyzer.stabilizer.matchIou).
+ * @returns matchOf với matchOf[i] = chỉ số hộp của `b` ghép với a[i]; null nếu hai khung không đồng thuận.
+ */
+export function matchDetections(
+  a: readonly MatchableBox[],
+  b: readonly MatchableBox[],
+  matchIou: number,
+): number[] | null {
+  if (a.length !== b.length) return null;
+
+  const candidates: Array<{ i: number; j: number; iou: number }> = [];
+  for (let i = 0; i < a.length; i++) {
+    const left = a[i];
+    if (left === undefined) continue;
+    for (let j = 0; j < b.length; j++) {
+      const right = b[j];
+      if (right === undefined || left.denomination !== right.denomination) continue;
+      const overlap = iou(left.bbox, right.bbox);
+      if (overlap >= matchIou) candidates.push({ i, j, iou: overlap });
+    }
+  }
+  candidates.sort((p, q) => q.iou - p.iou || p.i - q.i || p.j - q.j);
+
+  const matchOf: number[] = new Array<number>(a.length).fill(-1);
+  const taken: boolean[] = new Array<boolean>(b.length).fill(false);
+  let matched = 0;
+  for (const c of candidates) {
+    if (matchOf[c.i] !== -1 || taken[c.j] === true) continue;
+    matchOf[c.i] = c.j;
+    taken[c.j] = true;
+    matched++;
+  }
+  return matched === a.length ? matchOf : null;
+}
+
+function assertValidConfig(c: StabilizerConfig): void {
+  if (!Number.isInteger(c.windowSize) || c.windowSize < 1) {
+    throw new RangeError(`stabilizer.windowSize phải là số nguyên ≥ 1, nhận ${c.windowSize}`);
+  }
+  if (!Number.isInteger(c.minAgree) || c.minAgree < 1 || c.minAgree > c.windowSize) {
+    throw new RangeError(`stabilizer.minAgree phải là số nguyên trong [1, windowSize = ${c.windowSize}], nhận ${c.minAgree}`);
+  }
+  if (!(c.matchIou > 0 && c.matchIou <= 1)) {
+    throw new RangeError(`stabilizer.matchIou phải thuộc (0, 1], nhận ${c.matchIou}`);
+  }
+  if (!(c.maxAgeMs >= 0)) {
+    throw new RangeError(`stabilizer.maxAgeMs phải ≥ 0 (mili-giây), nhận ${c.maxAgeMs}`);
+  }
+}
+
+function snapshotBox(d: Detection): TrackedBox {
+  return { denomination: d.denomination, confidence: d.confidence, bbox: { ...d.bbox } };
+}
+
+function toEntry(frame: StabilizerFrame): Entry {
+  // Khung tự khai "hợp lệ" nhưng không có hộp chắc nào thì không thể làm bằng chứng ổn định.
+  const valid = frame.valid && frame.sure.length > 0;
+  return { timestamp: frame.timestamp, valid, boxes: valid ? frame.sure.map(snapshotBox) : [] };
+}
+
+/** Detection của khung mới nhất, confidence = trung bình confidence của hộp được ghép ở mọi khung đồng thuận (kể cả chính nó). */
+function buildConsensus(latest: readonly Detection[], agreeing: readonly Agreeing[]): Detection[] {
+  return latest.map((d, i) => {
+    const confidences = [d.confidence];
+    for (const a of agreeing) {
+      const j = a.matchOf[i];
+      const other = j === undefined ? undefined : a.boxes[j];
+      if (other !== undefined) confidences.push(other.confidence);
+    }
+    return { ...d, bbox: { ...d.bbox }, confidence: mean(confidences) };
+  });
+}
+
+/**
+ * Tạo bộ ổn định theo thời gian.
+ *
+ * Cửa sổ giữ tối đa windowSize khung gần nhất (kể cả khung không hợp lệ). Mỗi lần push:
+ * 1. Bỏ các mục cũ hơn maxAgeMs (mili-giây) so với mốc thời gian của khung hiện tại; mục có mốc SAU khung hiện tại
+ *    (đồng hồ lùi) hoặc mốc không xác định (NaN) cũng bị bỏ, để bằng chứng cũ không sống sót qua một lần lùi đồng hồ.
+ * 2. Thêm khung hiện tại rồi cắt còn windowSize mục mới nhất.
+ * 3. Kết luận (Fail Safe): stable chỉ có thể true khi CHÍNH khung hiện tại hợp lệ. Khi đó
+ *    agree = 1 + số khung hợp lệ khác trong cửa sổ ĐỒNG THUẬN với khung hiện tại (xem matchDetections);
+ *    stable = agree ≥ minAgree. Khung hiện tại không hợp lệ cho stable false, agree 0.
+ * 4. consensus chỉ khác null khi stable: các Detection (bản sao) của khung hiện tại, trái → phải,
+ *    với confidence là trung bình mọi khung đồng thuận.
+ * `window` trong kết quả luôn bằng windowSize (sức chứa), không phải số mục đang có.
+ *
+ * Bộ ổn định chụp lại dữ liệu hộp khi push nên người gọi sửa Detection sau đó không ảnh hưởng cửa sổ.
+ * Ném RangeError nếu cấu hình không hợp lệ (windowSize, minAgree nguyên và 1 ≤ minAgree ≤ windowSize; 0 < matchIou ≤ 1; maxAgeMs ≥ 0).
+ *
+ * @param config config.analyzer.stabilizer: windowSize (khung), minAgree (khung), matchIou (không đơn vị), maxAgeMs (mili-giây).
+ */
+export function createTemporalStabilizer(config: StabilizerConfig): TemporalStabilizer {
+  assertValidConfig(config);
+  const { windowSize, minAgree, matchIou, maxAgeMs } = config;
+  let entries: Entry[] = [];
+
+  function push(frame: StabilizerFrame): StabilityInfo {
+    const now = frame.timestamp;
+    const fresh = entries.filter((e) => {
+      const age = now - e.timestamp;
+      return age >= 0 && age <= maxAgeMs;
+    });
+    const latest = toEntry(frame);
+    entries = [...fresh, latest].slice(-windowSize);
+
+    if (!latest.valid) return { stable: false, agree: 0, window: windowSize, consensus: null };
+
+    const agreeing: Agreeing[] = [];
+    for (const e of entries) {
+      if (e === latest || !e.valid) continue;
+      const matchOf = matchDetections(latest.boxes, e.boxes, matchIou);
+      if (matchOf !== null) agreeing.push({ boxes: e.boxes, matchOf });
+    }
+    const agree = 1 + agreeing.length;
+    if (agree < minAgree) return { stable: false, agree, window: windowSize, consensus: null };
+    return { stable: true, agree, window: windowSize, consensus: buildConsensus(frame.sure, agreeing) };
+  }
+
+  function reset(): void {
+    entries = [];
+  }
+
+  return { push, reset };
+}
+</file>
+
+<file path="src/voice/native-tts-adapter.ts">
+// FILE ADAPTER DUY NHẤT gọi plugin @capacitor-community/text-to-speech. Mọi nơi khác đi qua NativeTtsPort.
+import { TextToSpeech } from '@capacitor-community/text-to-speech';
+import { AppError } from '../contracts';
+import type { NativeTtsPort, NativeTtsVoice } from './native-tts-engine';
+
+/** Phần của plugin mà adapter dùng. Tên hàm và tham số cần xác minh với phiên bản cài thật (xem Giả định). */
+export interface TextToSpeechPluginLike {
+  speak(options: { text: string; lang: string; rate: number; queueStrategy: number }): Promise<void>;
+  stop(): Promise<void>;
+  isLanguageSupported(options: { lang: string }): Promise<{ supported: boolean }>;
+  getSupportedVoices(): Promise<{ voices: Array<{ lang: string; name?: string; localService?: boolean }> }>;
+}
+
+/** queueStrategy trên Android: 0 = Flush (câu mới thay câu đang đọc), 1 = Add (xếp hàng). */
+export const QUEUE_FLUSH = 0;
+
+/** Bọc mọi lời gọi plugin: lỗi đồng bộ hay bất đồng bộ đều thành AppError TTS_UNAVAILABLE. */
+async function guard<T>(what: string, call: () => Promise<T>): Promise<T> {
+  try {
+    return await call();
+  } catch (e) {
+    throw new AppError('TTS_UNAVAILABLE', `Plugin TTS lỗi khi ${what}`, false, e);
+  }
+}
+
+export function createCapacitorTtsPort(plugin: TextToSpeechPluginLike = TextToSpeech): NativeTtsPort {
+  return {
+    isLanguageSupported: (lang) =>
+      guard('kiểm tra ngôn ngữ', async () => (await plugin.isLanguageSupported({ lang })).supported === true),
+    listVoices: () =>
+      guard('liệt kê giọng', async (): Promise<NativeTtsVoice[]> => {
+        const { voices } = await plugin.getSupportedVoices();
+        if (!Array.isArray(voices)) throw new TypeError('getSupportedVoices không trả về danh sách giọng');
+        return voices.map((v) => ({ lang: v.lang, name: v.name, localService: v.localService }));
+      }),
+    speak: ({ text, lang, rate }) => guard('đọc', () => plugin.speak({ text, lang, rate, queueStrategy: QUEUE_FLUSH })),
+    stop: () => guard('dừng đọc', () => plugin.stop()),
+  };
+}
+</file>
+
+<file path="src/voice/prompt-manager.ts">
+import { isDenomination } from '../config/denominations';
+import type {
+  AppErrorCode,
+  Denomination,
+  GuidanceCode,
+  RecognitionResult,
+  SettingAck,
+  Settings,
+  SpeechIntent,
+} from '../contracts';
+import { denominationToSpeech, moneyToSpeech, numberToVietnameseWords } from './vietnamese-number';
+
+/** Mức ưu tiên của câu nói. Số lớn hơn thì được nói trước và được phép ngắt số nhỏ hơn. */
+export const SPEECH_PRIORITY = { ERROR: 3, RESULT: 2, REPLAY: 2, GUIDANCE: 1, OTHER: 0 } as const;
+export type SpeechPriority = 0 | 1 | 2 | 3;
+
+/** Khóa các file âm thanh ghi sẵn trong public/audio (mỗi khóa ứng với đúng một câu cố định). */
+export const AUDIO_KEYS = [
+  'welcome',
+  'permission-primer',
+  'camera-ready',
+  'no-money',
+  'low-light',
+  'blur',
+  'camera-error',
+  'model-error',
+  'no-vi-voice',
+] as const;
+export type AudioKey = (typeof AUDIO_KEYS)[number];
+
+export interface Prompt {
+  /** Câu sẽ đọc: tiếng Việt, viết hoa chữ đầu, số đã đọc thành chữ, mỗi câu kết thúc bằng dấu câu. */
+  text: string;
+  /** Khóa file mp3 ghi sẵn; chỉ có ở câu cố định có thu âm. */
+  audioKey?: AudioKey;
+  priority: SpeechPriority;
+  /** Mục mới có cùng supersedeKey sẽ thay mục đang chờ trong hàng đợi. */
+  supersedeKey: string;
+}
+
+/* ───── Câu cố định (khớp từng chữ với đặc tả) ───── */
+
+const WELCOME_TEXT = 'Xin chào! Hãy đưa tiền đến trước camera.';
+const PERMISSION_PRIMER_TEXT =
+  'Ứng dụng cần dùng camera để nhận dạng tiền. Hãy chọn Cho phép trên hộp thoại sắp hiện ra.';
+const CAMERA_READY_TEXT = 'Camera đã sẵn sàng, hãy đưa tiền vào trước camera.';
+const REPLAY_EMPTY_TEXT = 'Hiện tại tôi chưa nhận dạng được tờ tiền nào.';
+const TOTAL_CAVEAT_TEXT = 'Tổng này chỉ tính các tờ tôi nhìn thấy.';
+
+const GUIDANCE_TEXT: Readonly<Record<GuidanceCode, string>> = {
+  NO_MONEY: 'Chưa nhận diện được tiền. Hãy đưa tiền đến trước camera.',
+  TOO_FAR: 'Hãy đưa tiền lại gần camera hơn.',
+  PARTIAL_IN_FRAME: 'Hãy đưa toàn bộ tờ tiền vào khung hình.',
+  BLUR: 'Hình ảnh chưa rõ. Hãy giữ điện thoại yên.',
+  LOW_LIGHT: 'Ánh sáng yếu. Hãy bật đèn hỗ trợ hoặc chuyển đến nơi sáng hơn.',
+  // Đây là LỜI HƯỚNG DẪN, KHÔNG khẳng định tiền đang bị gấp.
+  LOW_CONFIDENCE: 'Tôi chưa nhận dạng rõ tờ tiền. Hãy duỗi phẳng tờ tiền và đưa gần camera hơn.',
+  CLASS_CONFLICT: 'Tôi chưa phân biệt được mệnh giá. Hãy giữ tờ tiền thẳng và rõ hơn.',
+  OVERLAP: 'Các tờ tiền có vẻ đang chồng lên nhau. Hãy tách chúng ra.',
+  HOLD_STEADY: 'Hãy giữ tiền yên trước camera.',
+  MULTI_NOT_ALLOWED: 'Hãy đưa từng tờ một.',
+};
+
+const GUIDANCE_AUDIO: Readonly<Partial<Record<GuidanceCode, AudioKey>>> = {
+  NO_MONEY: 'no-money',
+  LOW_LIGHT: 'low-light',
+  BLUR: 'blur',
+};
+
+const MISSING_MODEL_TEXT = 'Ứng dụng thiếu dữ liệu nhận dạng. Hãy cài lại ứng dụng.';
+
+/** Mỗi mã lỗi một câu nêu việc cần làm. */
+const ERROR_TEXT: Readonly<Record<AppErrorCode, string>> = {
+  UNSUPPORTED_BROWSER:
+    'Điện thoại chưa hỗ trợ đủ tính năng cần thiết. Hãy cập nhật WebView trong cửa hàng ứng dụng rồi mở lại ứng dụng.',
+  CAMERA_PERMISSION_DENIED:
+    'Bạn chưa cấp quyền camera. Hãy mở Cài đặt của điện thoại, chọn Ứng dụng, chọn ứng dụng này rồi bật quyền Camera.',
+  CAMERA_NOT_FOUND: 'Không tìm thấy camera trên điện thoại. Hãy thử lại trên một điện thoại có camera sau.',
+  CAMERA_IN_USE: 'Camera đang được ứng dụng khác sử dụng. Hãy đóng ứng dụng đó rồi mở lại ứng dụng này.',
+  CAMERA_FAILED: 'Không mở được camera. Hãy đóng ứng dụng rồi mở lại.',
+  MODEL_MISSING: MISSING_MODEL_TEXT,
+  MODEL_CORRUPT: 'Dữ liệu nhận dạng bị hỏng. Hãy cài lại ứng dụng.',
+  MODEL_INIT_FAILED: 'Không khởi động được bộ nhận dạng. Hãy đóng ứng dụng rồi mở lại.',
+  INFERENCE_FAILED: 'Nhận dạng gặp lỗi. Hãy thử lại, nếu vẫn lỗi thì đóng ứng dụng rồi mở lại.',
+  TTS_UNAVAILABLE:
+    'Giọng đọc của điện thoại đang không hoạt động. Hãy kiểm tra mục Chuyển văn bản thành giọng nói trong Cài đặt rồi mở lại ứng dụng.',
+  TTS_NO_VIETNAMESE_VOICE:
+    'Điện thoại chưa có giọng đọc tiếng Việt. Hãy vào Cài đặt, Chuyển văn bản thành giọng nói, rồi tải dữ liệu giọng Tiếng Việt.',
+  STORAGE_FAILED: 'Không lưu được cài đặt. Hãy kiểm tra bộ nhớ điện thoại còn trống rồi thử lại.',
+  OFFLINE_NOT_READY: MISSING_MODEL_TEXT,
+};
+
+/** Chỉ ba câu lỗi có thu âm sẵn (nội dung mp3 phải khớp câu tương ứng ở trên). */
+const ERROR_AUDIO: Readonly<Partial<Record<AppErrorCode, AudioKey>>> = {
+  CAMERA_PERMISSION_DENIED: 'camera-error',
+  MODEL_MISSING: 'model-error',
+  OFFLINE_NOT_READY: 'model-error',
+  TTS_NO_VIETNAMESE_VOICE: 'no-vi-voice',
+};
+
+const SETTING_ACK_TEXT: Readonly<Record<SettingAck, string>> = {
+  VOICE_ON: 'Đã bật giọng nói.',
+  VIBRATION_ON: 'Đã bật rung.',
+  VIBRATION_OFF: 'Đã tắt rung.',
+  TORCH_ON: 'Đã bật đèn hỗ trợ.',
+  TORCH_OFF: 'Đã tắt đèn hỗ trợ.',
+  TORCH_UNSUPPORTED: 'Điện thoại này không bật được đèn hỗ trợ.',
+  RATE_SLOW: 'Đã đặt tốc độ đọc chậm.',
+  RATE_NORMAL: 'Đã đặt tốc độ đọc bình thường.',
+  RATE_FAST: 'Đã đặt tốc độ đọc nhanh.',
+  VERBOSITY_BRIEF: 'Đã chọn chế độ đọc ngắn gọn.',
+  VERBOSITY_DETAILED: 'Đã chọn chế độ đọc chi tiết.',
+};
+
+/** Các xác nhận cùng một cài đặt dùng chung khóa thay thế: xác nhận mới thay xác nhận cũ đang chờ. */
+const SETTING_ACK_FAMILY: Readonly<Record<SettingAck, string>> = {
+  VOICE_ON: 'VOICE',
+  VIBRATION_ON: 'VIBRATION',
+  VIBRATION_OFF: 'VIBRATION',
+  TORCH_ON: 'TORCH',
+  TORCH_OFF: 'TORCH',
+  TORCH_UNSUPPORTED: 'TORCH',
+  RATE_SLOW: 'RATE',
+  RATE_NORMAL: 'RATE',
+  RATE_FAST: 'RATE',
+  VERBOSITY_BRIEF: 'VERBOSITY',
+  VERBOSITY_DETAILED: 'VERBOSITY',
+};
+
+/* ───── Hàm phụ ───── */
+
+/** Tra bảng câu; thiếu thì ném lỗi để KHÔNG BAO GIỜ đọc ra chữ "undefined". */
+function lookup<K extends string>(table: Readonly<Record<K, string>>, key: K, what: string): string {
+  const text = table[key];
+  if (typeof text !== 'string' || text === '') {
+    throw new RangeError(`buildPrompt: ${what} không được hỗ trợ: ${String(key)}`);
+  }
+  return text;
+}
+
+function capitalize(text: string): string {
+  return text === '' ? text : `${text.charAt(0).toUpperCase()}${text.slice(1)}`;
+}
+
+/** Câu một mệnh đề: viết hoa chữ đầu và thêm dấu chấm cuối. */
+function sentence(text: string): string {
+  return `${capitalize(text)}.`;
+}
+
+function makePrompt(text: string, priority: SpeechPriority, supersedeKey: string, audioKey?: AudioKey): Prompt {
+  return audioKey === undefined ? { text, priority, supersedeKey } : { text, audioKey, priority, supersedeKey };
+}
+
+/**
+ * Kiểm tra kết quả nhất quán trước khi đọc: có tờ tiền, count khớp số mệnh giá, total khớp tổng các mệnh giá,
+ * mọi mệnh giá hợp lệ. Sai một chỗ là ném RangeError (Fail Safe: thà không đọc còn hơn đọc sai số tiền).
+ */
+function assertConsistent(result: RecognitionResult): void {
+  const { denominations } = result;
+  if (denominations.length === 0) throw new RangeError('buildPrompt: kết quả không có tờ tiền nào');
+  let sum = 0;
+  for (const d of denominations) {
+    if (!isDenomination(d)) throw new RangeError(`buildPrompt: mệnh giá không hợp lệ: ${String(d)}`);
+    sum += d;
+  }
+  if (result.count !== denominations.length) {
+    throw new RangeError(`buildPrompt: count (${String(result.count)}) khác số mệnh giá (${denominations.length})`);
+  }
+  if (result.total !== sum) {
+    throw new RangeError(`buildPrompt: total (${String(result.total)}) khác tổng các mệnh giá (${sum})`);
+  }
+}
+
+interface DenominationGroup {
+  denomination: Denomination;
+  count: number;
+}
+
+/** Nhóm các tờ cùng mệnh giá, theo thứ tự xuất hiện đầu tiên từ trái sang phải. */
+function groupByDenomination(denominations: readonly Denomination[]): DenominationGroup[] {
+  const groups: DenominationGroup[] = [];
+  for (const d of denominations) {
+    const existing = groups.find((g) => g.denomination === d);
+    if (existing === undefined) groups.push({ denomination: d, count: 1 });
+    else existing.count += 1;
+  }
+  return groups;
+}
+
+/** Dựng câu đọc kết quả theo độ chi tiết. Dùng chung cho RESULT và REPLAY. */
+function buildResultText(result: RecognitionResult, verbosity: Settings['verbosity']): string {
+  assertConsistent(result);
+  const [first] = result.denominations;
+
+  if (result.denominations.length === 1 && first !== undefined) {
+    return sentence(denominationToSpeech(first));
+  }
+  if (verbosity === 'BRIEF') {
+    return sentence(moneyToSpeech(result.total));
+  }
+
+  const parts = [sentence(`có ${numberToVietnameseWords(result.denominations.length)} tờ tiền`)];
+  for (const group of groupByDenomination(result.denominations)) {
+    parts.push(sentence(`${numberToVietnameseWords(group.count)} tờ ${denominationToSpeech(group.denomination)}`));
+  }
+  parts.push(sentence(`tổng cộng ${moneyToSpeech(result.total)}`), TOTAL_CAVEAT_TEXT);
+  return parts.join(' ');
+}
+
+/**
+ * Dựng câu nói cho một ý định nói.
+ * Ném RangeError khi dữ liệu không đủ tin cậy để đọc (kết quả không nhất quán, mã không có câu);
+ * nơi gọi phải bắt lỗi và KHÔNG đọc gì thay vì đoán.
+ */
+export function buildPrompt(intent: SpeechIntent, settings: Pick<Settings, 'verbosity'>): Prompt {
+  switch (intent.kind) {
+    case 'WELCOME':
+      return makePrompt(WELCOME_TEXT, SPEECH_PRIORITY.OTHER, 'WELCOME', 'welcome');
+    case 'PERMISSION_PRIMER':
+      return makePrompt(PERMISSION_PRIMER_TEXT, SPEECH_PRIORITY.OTHER, 'PERMISSION_PRIMER', 'permission-primer');
+    case 'CAMERA_READY':
+      return makePrompt(CAMERA_READY_TEXT, SPEECH_PRIORITY.OTHER, 'CAMERA_READY', 'camera-ready');
+    case 'GUIDANCE':
+      return makePrompt(
+        lookup(GUIDANCE_TEXT, intent.code, 'mã hướng dẫn'),
+        SPEECH_PRIORITY.GUIDANCE,
+        'GUIDANCE',
+        GUIDANCE_AUDIO[intent.code],
+      );
+    case 'RESULT':
+      return makePrompt(buildResultText(intent.result, settings.verbosity), SPEECH_PRIORITY.RESULT, 'RESULT');
+    case 'REPLAY':
+      return makePrompt(buildResultText(intent.result, settings.verbosity), SPEECH_PRIORITY.REPLAY, 'REPLAY');
+    case 'REPLAY_EMPTY':
+      return makePrompt(REPLAY_EMPTY_TEXT, SPEECH_PRIORITY.OTHER, 'REPLAY');
+    case 'ERROR':
+      return makePrompt(
+        lookup(ERROR_TEXT, intent.code, 'mã lỗi'),
+        SPEECH_PRIORITY.ERROR,
+        `ERROR:${intent.code}`,
+        ERROR_AUDIO[intent.code],
+      );
+    case 'SETTING_ACK':
+      return makePrompt(
+        lookup(SETTING_ACK_TEXT, intent.what, 'xác nhận cài đặt'),
+        SPEECH_PRIORITY.OTHER,
+        `SETTING_ACK:${lookup(SETTING_ACK_FAMILY, intent.what, 'xác nhận cài đặt')}`,
+      );
+    default: {
+      const unsupported: never = intent;
+      throw new RangeError(`buildPrompt: ý định không được hỗ trợ: ${JSON.stringify(unsupported)}`);
+    }
+  }
+}
+</file>
+
+<file path="capacitor.config.ts">
+import type { CapacitorConfig } from '@capacitor/cli';
+
+const config: CapacitorConfig = {
+  appId: 'vn.edu.duytan.cdio4.moneyreader',
+  appName: 'Nhận dạng tiền',
+  webDir: 'dist',
+  server: {
+    androidScheme: 'https',
+  },
+  android: {
+    allowMixedContent: false,
+  },
+};
+
+export default config;
+</file>
+
+<file path="vite.config.ts">
+import { defineConfig } from 'vitest/config';
+
+/** Header cross-origin isolation: CHỈ để thử onnxruntime-web đa luồng trên máy tính (dev/preview). */
+const isolationHeaders = {
+  'Cross-Origin-Opener-Policy': 'same-origin',
+  'Cross-Origin-Embedder-Policy': 'require-corp',
+};
+
+export default defineConfig({
+  base: './', // bắt buộc cho Android WebView: mọi đường dẫn tài nguyên là tương đối
+  optimizeDeps: { exclude: ['onnxruntime-web'] },
+  worker: { format: 'es' },
+  build: {
+    target: 'es2022',
+    assetsInlineLimit: 0, // không nhúng tài nguyên vào JS: model/wasm/âm thanh luôn là file riêng
+  },
+  server: { headers: isolationHeaders },
+  preview: { headers: isolationHeaders },
+  test: {
+    include: ['tests/**/*.test.ts'],
+    environment: 'node', // file nào cần DOM thì khai báo: // @vitest-environment happy-dom
+  },
+});
+</file>
+
+<file path="src/analyzer/frame-analyzer.ts">
+import type { AppConfig, Detection, FrameAnalysis, IFrameAnalyzer, InferenceResult } from '../contracts';
+import { center } from '../utils/geometry';
+import { measureBlur } from './blur-detector';
+import { measureBrightness } from './brightness-analyzer';
+import { splitByConfidence } from './confidence-analyzer';
+import { detectClassConflict } from './conflict-detector';
+import { detectOverlap } from './overlap-detector';
+import { analyzePosition } from './position-analyzer';
+import { createTemporalStabilizer, isFrameValid } from './temporal-stabilizer';
+
+/** Sắp từ trái sang phải (tâm x tăng dần, hòa thì theo tâm y), ổn định. Trả mảng mới, không sửa đầu vào. */
+function sortLeftToRight(detections: readonly Detection[]): Detection[] {
+  return [...detections].sort((a, b) => {
+    const ca = center(a.bbox);
+    const cb = center(b.bbox);
+    return ca.x - cb.x || ca.y - cb.y;
+  });
+}
+
+/**
+ * Tạo bộ phân tích khung hình. Chỉ MÔ TẢ khung hình (chắc hay không, chồng lấn, xung đột, vị trí, mờ, tối, ổn định),
+ * tuyệt đối không quyết định đọc hay không, không nói, không tính tổng.
+ *
+ * Mỗi lần analyze: sắp detection trái → phải, tách sure/unsure (A1), rồi chạy A2 đến A6 trên mọi detection có
+ * độ tin cậy ≥ confLow (cả chắc lẫn chưa chắc), cuối cùng đưa khung vào bộ ổn định (A7).
+ * Ngưỡng: confLow, confSure lấy từ config.inference; mọi ngưỡng còn lại từ config.analyzer. Không có hằng số ma thuật.
+ * Trạng thái duy nhất giữ lại giữa các khung: cửa sổ của bộ ổn định và emptyStreak.
+ * Không sửa InferenceResult đầu vào; kết quả dùng mảng mới (các đối tượng Detection được dùng chung với đầu vào).
+ * Ném RangeError nếu config.analyzer.stabilizer không hợp lệ (xem createTemporalStabilizer).
+ *
+ * @param config Cấu hình ứng dụng (DEFAULT_CONFIG hoặc bản đã hiệu chỉnh).
+ */
+export function createFrameAnalyzer(config: AppConfig): IFrameAnalyzer {
+  const { inference, analyzer } = config;
+  const stabilizer = createTemporalStabilizer(analyzer.stabilizer);
+  let emptyStreak = 0;
+
+  /** Phân tích một kết quả suy luận; meta.timestamp (mili-giây) là mốc thời gian cho cửa sổ ổn định. */
+  function analyze(r: InferenceResult): FrameAnalysis {
+    const { sure, unsure, kept } = splitByConfidence(sortLeftToRight(r.detections), inference.confLow, inference.confSure);
+    const overlap = detectOverlap(kept, analyzer.overlapRatio);
+    const conflict = detectClassConflict(kept, analyzer.conflictIou);
+    const position = analyzePosition(kept, r.meta, analyzer.minAreaRatio, analyzer.edgeMarginRatio);
+    const blur = measureBlur(r.gray, r.meta, kept.map((d) => d.bbox), analyzer.blurThreshold);
+    const brightness = measureBrightness(r.gray, analyzer.lowLightMean);
+
+    const stability = stabilizer.push({
+      timestamp: r.meta.timestamp,
+      valid: isFrameValid({ sure, unsure, overlap, conflict }),
+      sure,
+    });
+    emptyStreak = kept.length === 0 ? emptyStreak + 1 : 0;
+
+    return {
+      meta: { ...r.meta },
+      detections: kept,
+      sure,
+      unsure,
+      overlap,
+      conflict,
+      position,
+      quality: { ...blur, ...brightness },
+      stability,
+      emptyStreak,
+    };
+  }
+
+  /** Xóa cửa sổ ổn định và đưa emptyStreak về 0 (ví dụ khi camera tạm dừng rồi chạy lại). */
+  function reset(): void {
+    stabilizer.reset();
+    emptyStreak = 0;
+  }
+
+  return { analyze, reset };
+}
+</file>
+
+<file path="src/app/app.ts">
+/**
+ * Bộ ráp ứng dụng (P11): nối camera → suy luận → phân tích → quyết định → giọng nói thành một vòng chạy liên tục,
+ * cùng vòng đời app, nút Back, đèn pin và các màn hình. File này CHỈ NỐI DÂY:
+ * - mọi quyết định "đọc hay không đọc" là của DecisionEngine; app chỉ chuyển đầu vào và phát lại đầu ra;
+ * - mọi việc chạm DOM hay plugin nằm sau hai cổng nhỏ (AppUi, AppLifecyclePort) hoặc các interface của Khối B,
+ *   nên chạy được trong Node với đồ giả. Không import lớp cụ thể của module khác.
+ *
+ * Mọi lời nói đều đi ra từ DecisionOutput.speech (kể cả WELCOME, PERMISSION_PRIMER, CAMERA_READY do engine phát
+ * khi vào trạng thái khởi động). Ngoại lệ có chủ đích: lỗi giọng tiếng Việt, xác nhận đèn không hỗ trợ.
+ */
+import { DEFAULT_CONFIG } from '../config/app-config';
+import { AppError } from '../contracts';
+import type {
+  AppConfig, AppErrorCode, AppState, CameraStatus, CapturedFrame, DecisionOutput, DecisionStatus, Detection, FrameMeta,
+  ICameraService, IDecisionEngine, IFrameAnalyzer, IHaptics, IInferenceClient, InferenceResult, InferenceTimings,
+  ISpeech, ITorchPort, Platform, RecognitionResult, Settings, SystemEvent, TtsCapabilities, UtteranceEvent,
+} from '../contracts';
+import { createLogger } from '../utils/logger';
+import { mean } from '../utils/math';
+import type { Clock } from '../utils/time';
+
+const log = createLogger('app');
+
+/** Số mili-giây trong một giây (đổi fps sang khoảng cách lấy mẫu). */
+const MS_PER_SECOND = 1000;
+
+/**
+ * Nhịp thích ứng (mục 9): khi độ trễ trung bình của `window` khung gần nhất vượt `latencyFactor` lần khoảng cách
+ * lấy mẫu thì hạ fps `step` bậc, không thấp hơn `minFps`. AppConfig chưa có các tham số này nên tạm đặt ở đây
+ * (xem "Đề xuất sửa hợp đồng").
+ */
+export const ADAPTIVE_FPS = { latencyFactor: 2, window: 5, step: 1, minFps: 1 } as const;
+
+/** Số khung liên tiếp suy luận lỗi (không nghiêm trọng) thì coi là INFERENCE_FAILED. Cũng nên nằm trong AppConfig. */
+export const INFERENCE_FAILURE_LIMIT = 5;
+
+/** Mã lỗi dùng khi khởi động hỏng vì một ngoại lệ không lường trước (không phải AppError). */
+const STARTUP_FALLBACK_CODE: AppErrorCode = 'MODEL_INIT_FAILED';
+
+const NO_SPEECH: TtsCapabilities = { available: false, vietnameseVoice: false, offlineVietnamese: false, requiresUserGesture: false };
+
+/* ───── Cổng và kiểu của app ───── */
+
+/** Màn hình đang hiện: nút Back và việc tạm dừng quét phụ thuộc vào đây. */
+export type AppScreen = 'camera' | 'settings' | 'error';
+
+/** Thao tác của người dùng do lớp giao diện báo lên (nút hoặc cử chỉ). */
+export type UiAction = 'REPLAY' | 'TOGGLE_TORCH' | 'OPEN_SETTINGS' | 'CLOSE_SETTINGS' | 'RETRY';
+
+/** Số liệu của khung vừa xử lý, dùng cho lớp debug. KHÔNG chứa ảnh (Privacy First). */
+export interface ScanFrameView {
+  meta: FrameMeta;
+  detections: readonly Detection[];
+  timings: InferenceTimings;
+  /** Từ lúc nhận khung đến lúc quyết định xong (mili-giây). */
+  latencyMs: number;
+  /** Tốc độ lấy mẫu đang đặt cho camera (khung/giây). */
+  samplingFps: number;
+}
+
+/** Dữ liệu để vẽ vùng trạng thái chữ to và lớp debug; được đẩy sau mỗi khung và mỗi lần đổi trạng thái. */
+export interface AppView {
+  state: AppState;
+  status: DecisionStatus | null;
+  reasons: readonly string[];
+  /** Kết quả đã công bố gần nhất (để hiện chữ to); null nếu chưa có. */
+  result: RecognitionResult | null;
+  /** null khi cập nhật không đến từ một khung hình (sự kiện hệ thống). */
+  frame: ScanFrameView | null;
+}
+
+/** Cổng giao diện: app chỉ gọi các hàm này, không chạm DOM. Bản thật nằm ở src/ui (kèm accessibility-manager). */
+export interface AppUi {
+  /** Hiện cổng khởi động; lớp giao diện gọi unlock() RỒI onStart() ngay trong sự kiện kích hoạt. */
+  showStartGate(o: { unlock: () => void; onStart: () => void }): void;
+  hideStartGate(): void;
+  showCamera(): void;
+  showSettings(): void;
+  showError(e: { code: AppErrorCode; detail?: string }): void;
+  render(view: AppView): void;
+  /** Trạng thái nút đèn: có hỗ trợ không, đang bật không (phản ánh đèn THẬT). */
+  setTorch(t: { supported: boolean; on: boolean }): void;
+  onAction(handler: (a: UiAction) => void): () => void;
+}
+
+/** Cổng vòng đời: hợp nhất visibilitychange và appStateChange của Capacitor, cộng nút Back của Android. */
+export interface AppLifecyclePort {
+  /** handler(true) khi app hiện, handler(false) khi ẩn. Hai nguồn có thể báo trùng: người nhận phải chịu được. */
+  onVisibilityChange(handler: (visible: boolean) => void): () => void;
+  onBackButton(handler: () => void): () => void;
+  /** Thu nhỏ app, không thoát hẳn. Ngoài Android thì không làm gì. */
+  minimize(): Promise<void>;
+}
+
+/** Phần của settings-manager (P10) mà app dùng. */
+export interface AppSettings {
+  load(): Promise<Settings>;
+  get(): Settings;
+  set(p: Partial<Settings>): Promise<Settings>;
+  subscribe(h: (s: Settings) => void): () => void;
+}
+
+/** Kết quả kiểm tra gói tài nguyên, đúng với kiểu trả về của checkBundledAssets (P09). */
+export interface AssetCheck {
+  ok: boolean;
+  missing: string[];
+  warnings: string[];
+  error?: AppError;
+}
+
+export interface AppDeps {
+  camera: ICameraService;
+  inference: IInferenceClient;
+  analyzer: IFrameAnalyzer;
+  decision: IDecisionEngine;
+  speech: ISpeech;
+  haptics: IHaptics;
+  settings: AppSettings;
+  /** Thường là () => checkBundledAssets({ baseUrl }). */
+  assets: () => Promise<AssetCheck>;
+  /** Cổng đèn native (dự phòng); app dùng nó để chắc chắn đèn tắt khi dừng. Camera đã nhận cùng cổng này khi dựng. */
+  torchPort?: ITorchPort;
+  platform: Platform;
+  clock: Clock;
+  /** Mở rộng so với danh sách trong đề: app cần cổng giao diện và cổng vòng đời để không chạm DOM/plugin. */
+  ui: AppUi;
+  lifecycle: AppLifecyclePort;
+  /** Mặc định DEFAULT_CONFIG. */
+  config?: AppConfig;
+}
+
+export interface App {
+  /** Chạy toàn bộ trình tự khởi động. Không bao giờ ném lỗi: lỗi được báo bằng giọng nói và màn hình lỗi. */
+  start(): Promise<void>;
+  dispose(): void;
+}
+
+/* ───── Hàm phụ thuần ───── */
+
+const codeOf = (e: unknown, fallback: AppErrorCode): AppErrorCode => (e instanceof AppError ? e.code : fallback);
+
+/** Chạy fn trong một Promise để lỗi ném đồng bộ cũng thành lời từ chối. */
+function attempt<T>(fn: () => Promise<T>): Promise<T> {
+  return new Promise<T>((resolve) => resolve(fn()));
+}
+
+function discard(frame: CapturedFrame): void {
+  try {
+    frame.bitmap.close();
+  } catch (e) {
+    log.debug('Không đóng được bitmap', e);
+  }
+}
+
+export function createApp(deps: AppDeps): App {
+  const { camera, inference, analyzer, decision, speech, haptics, settings, assets, torchPort, platform, clock, ui, lifecycle } = deps;
+  const config = deps.config ?? DEFAULT_CONFIG;
+
+  const permanent: Array<() => void> = []; // listener sống suốt đời app; dispose gỡ hết
+  let settingsOff: (() => void) | null = null;
+  let frameOff: (() => void) | null = null; // chỉ có khi đang quét
+  let gateResolve: (() => void) | null = null;
+
+  let disposed = false;
+  let started = false;
+  let bound = false;
+  let runId = 0; // tăng mỗi lần start/dispose: kết quả bất đồng bộ của lượt cũ bị bỏ
+  let unlocked = false;
+  let screen: AppScreen = 'camera';
+  let backgrounded = false;
+  let cameraUp = false; // camera.start() đã xong trong lượt này
+  let scanning = false; // camera đang chạy theo ý app (đối chiếu với pause/resume)
+  let torchOn = false;
+  let torchBusy = false;
+  let samplingFps: number = config.inference.targetFps;
+  let speechOutput: Settings['speechOutput'] = settings.get().speechOutput;
+  let lastResult: RecognitionResult | null = null;
+  let inferenceFailures = 0;
+  const latencies: number[] = [];
+
+  const stale = (run: number): boolean => disposed || run !== runId;
+  const halted = (run: number): boolean => stale(run) || screen === 'error';
+
+  function safely(label: string, fn: () => void): void {
+    try {
+      fn();
+    } catch (e) {
+      log.error(`${label} ném lỗi`, e);
+    }
+  }
+
+  /* ───── Kênh ra: lời nói và giao diện ───── */
+
+  function publish(out: DecisionOutput, frame: ScanFrameView | null): void {
+    if (out.result !== null) lastResult = out.result;
+    safely('ui.render', () => ui.render({ state: out.state, status: out.status, reasons: out.reasons, result: lastResult, frame }));
+  }
+
+  /** Gửi sự kiện hệ thống cho engine, phát lại lời nói (trừ khi giữ lại) và cập nhật giao diện. */
+  function send(event: SystemEvent, holdSpeech = false): DecisionOutput {
+    const out = decision.handle({ type: 'SYSTEM', event, now: clock() });
+    if (!holdSpeech && out.speech !== null) speech.say(out.speech);
+    publish(out, null);
+    return out;
+  }
+
+  function renderTorch(): void {
+    safely('ui.setTorch', () => ui.setTorch({ supported: camera.torchSupported, on: torchOn }));
+  }
+
+  /* ───── Dừng và báo lỗi ───── */
+
+  function haltScanning(): void {
+    frameOff?.();
+    frameOff = null;
+    cameraUp = false;
+    scanning = false;
+    torchOn = false; // dừng camera là đèn tắt
+    latencies.length = 0;
+    inferenceFailures = 0;
+    safely('camera.stop', () => camera.stop());
+    safely('inference.dispose', () => inference.dispose());
+  }
+
+  /** Lỗi nghiêm trọng: dừng quét, gửi FAILURE, nói ERROR bằng giọng VÀ hiện màn hình lỗi (không để màn hình đen im lặng). */
+  function fail(code: AppErrorCode, cause?: unknown): void {
+    if (disposed || screen === 'error') return;
+    log.error(`Lỗi ${code}`, cause ?? '');
+    haltScanning();
+    screen = 'error';
+    const out = decision.handle({ type: 'FAILURE', code, now: clock() });
+    if (out.speech !== null) speech.say(out.speech);
+    publish(out, null);
+    const detail = cause instanceof Error ? cause.message : undefined;
+    safely('ui.showError', () => ui.showError({ code, detail }));
+  }
+
+  /* ───── Vòng quét ───── */
+
+  /** Hạ fps một bậc khi độ trễ trung bình quá lớn so với khoảng cách lấy mẫu. */
+  function trackLatency(ms: number): void {
+    latencies.push(ms);
+    if (latencies.length > ADAPTIVE_FPS.window) latencies.shift();
+    if (latencies.length < ADAPTIVE_FPS.window) return;
+    const average = mean(latencies);
+    const limit = ADAPTIVE_FPS.latencyFactor * (MS_PER_SECOND / samplingFps);
+    if (average <= limit) return;
+    const next = Math.max(ADAPTIVE_FPS.minFps, samplingFps - ADAPTIVE_FPS.step);
+    if (next === samplingFps) return;
+    log.warn(`Độ trễ trung bình ${Math.round(average)} ms vượt ${Math.round(limit)} ms: hạ lấy mẫu ${samplingFps} → ${next} fps`);
+    samplingFps = next;
+    camera.setSampling(samplingFps);
+    latencies.length = 0;
+  }
+
+  function onInferenceError(e: unknown): void {
+    if (e instanceof AppError && e.fatal) return fail(e.code, e);
+    inferenceFailures += 1;
+    log.warn(`Suy luận lỗi (${inferenceFailures}/${INFERENCE_FAILURE_LIMIT})`, e);
+    if (inferenceFailures >= INFERENCE_FAILURE_LIMIT) fail(codeOf(e, 'INFERENCE_FAILED'), e);
+  }
+
+  async function onFrame(frame: CapturedFrame): Promise<void> {
+    if (!scanning) return discard(frame); // khung đến muộn sau khi tạm dừng: bên nhận phải đóng bitmap
+    const run = runId;
+    const startedAt = clock();
+    let result: InferenceResult | null;
+    try {
+      result = await inference.infer(frame);
+    } catch (e) {
+      if (!halted(run)) onInferenceError(e);
+      return;
+    }
+    if (halted(run) || !scanning) return;
+    inferenceFailures = 0; // infer trả lời được (kể cả null) nghĩa là bộ suy luận còn sống
+    if (result === null) return; // khung bị bỏ: không phân tích
+    const analysis = analyzer.analyze(result);
+    const out = decision.handle({ type: 'ANALYSIS', analysis, now: clock() });
+    if (out.speech !== null) speech.say(out.speech);
+    const latencyMs = clock() - startedAt;
+    publish(out, { meta: result.meta, detections: result.detections, timings: result.timings, latencyMs, samplingFps });
+    trackLatency(latencyMs);
+  }
+
+  function startLoop(): void {
+    frameOff?.();
+    frameOff = camera.onFrame(onFrame);
+  }
+
+  /** Đưa camera về đúng trạng thái app muốn: chạy khi đang hiện, ở màn camera; ngược lại tạm dừng. */
+  function syncCamera(): void {
+    if (!cameraUp) return;
+    const want = !backgrounded && screen === 'camera';
+    if (want === scanning) return;
+    scanning = want;
+    if (want) attempt(() => camera.resume()).catch((e: unknown) => log.warn('camera.resume lỗi', e));
+    else safely('camera.pause', () => camera.pause());
+  }
+
+  /* ───── Trình tự khởi động ───── */
+
+  async function checkAssets(): Promise<AssetCheck> {
+    try {
+      return await assets();
+    } catch (e) {
+      log.error('Kiểm tra gói tài nguyên bị lỗi', e);
+      return { ok: false, missing: ['(không kiểm tra được gói tài nguyên)'], warnings: [] };
+    }
+  }
+
+  async function loadSettings(): Promise<void> {
+    try {
+      await settings.load();
+      // Đèn luôn tắt khi mở app (app không tự bật đèn): đưa giá trị đã lưu về đúng thực tế, lúc giọng nói chưa sẵn sàng.
+      if (settings.get().torchEnabled) await settings.set({ torchEnabled: false });
+    } catch (e) {
+      log.warn('Không nạp được cài đặt, dùng giá trị hiện có', e);
+    }
+    speechOutput = settings.get().speechOutput;
+    settingsOff?.();
+    settingsOff = settings.subscribe(onSettings);
+  }
+
+  async function initSpeech(): Promise<TtsCapabilities> {
+    try {
+      return await speech.init();
+    } catch (e) {
+      log.error('speech.init lỗi', e);
+      return NO_SPEECH;
+    }
+  }
+
+  /** Đổi cách đọc (giọng app / trình đọc màn hình) thì phải chọn lại engine. */
+  function onSettings(s: Settings): void {
+    if (s.speechOutput === speechOutput) return;
+    speechOutput = s.speechOutput;
+    void initSpeech();
+  }
+
+  function waitForGate(): Promise<void> {
+    return new Promise<void>((resolve) => {
+      gateResolve = resolve;
+      try {
+        ui.showStartGate({
+          unlock: () => safely('speech.unlock', () => speech.unlock()), // trong chính sự kiện kích hoạt
+          onStart: () => {
+            gateResolve = null;
+            resolve();
+          },
+        });
+      } catch (e) {
+        log.error('Không hiện được cổng khởi động, tự bắt đầu', e);
+        gateResolve = null;
+        resolve();
+      }
+    });
+  }
+
+  function onCameraStarted(): void {
+    cameraUp = true;
+    scanning = true;
+    send('CAMERA_READY');
+    renderTorch();
+  }
+
+  /** Quyền camera: engine nói PERMISSION_PRIMER khi nhận PERMISSION_REQUESTED, rồi mới mở camera; mô hình nạp song song. */
+  async function begin(run: number): Promise<void> {
+    camera.setSampling(samplingFps);
+    send('PERMISSION_REQUESTED');
+    const model = attempt(() => inference.init()).then(
+      () => {
+        if (!halted(run)) send('MODEL_READY');
+      },
+      (e: unknown) => {
+        if (!halted(run)) fail(codeOf(e, 'MODEL_INIT_FAILED'), e);
+      },
+    );
+    const cam = attempt(() => camera.start()).then(
+      () => {
+        if (!halted(run)) onCameraStarted();
+      },
+      (e: unknown) => {
+        if (!halted(run)) fail(codeOf(e, 'CAMERA_FAILED'), e);
+      },
+    );
+    await Promise.all([model, cam]);
+    if (halted(run)) return;
+    startLoop();
+    syncCamera();
+  }
+
+  async function boot(run: number): Promise<void> {
+    bind();
+    screen = 'camera';
+    safely('ui.showCamera', () => ui.showCamera());
+    log.info(`Khởi động trên nền tảng ${platform}`);
+
+    // 1. Boot: kiểm tra gói, nạp cài đặt, chọn engine giọng nói (cần có trước khi nói được lỗi).
+    const check = await checkAssets();
+    if (stale(run)) return;
+    await loadSettings();
+    if (stale(run)) return;
+    const caps = await initSpeech();
+    if (stale(run)) return;
+    if (!check.ok) {
+      log.error('Gói thiếu tài nguyên', check.missing);
+      return fail('OFFLINE_NOT_READY');
+    }
+    if (!caps.available) return fail('TTS_UNAVAILABLE');
+    const welcome = send('APP_STARTED', true); // lời chào chỉ được nói SAU khi giọng nói đã được mở khóa
+
+    // 2. Bắt đầu: cần một lần chạm nếu engine đòi, hoặc nếu người dùng tắt "Tự bật camera".
+    if (!unlocked && (caps.requiresUserGesture || !settings.get().autoStartCamera)) {
+      await waitForGate();
+      if (stale(run)) return;
+    }
+    unlocked = true;
+    if (!caps.vietnameseVoice) speech.say({ kind: 'ERROR', code: 'TTS_NO_VIETNAMESE_VOICE' }); // vẫn chạy, qua engine dự phòng
+    if (welcome.speech !== null) speech.say(welcome.speech);
+    send('GESTURE_UNLOCKED');
+
+    // 3. Camera và mô hình.
+    await begin(run);
+  }
+
+  async function start(): Promise<void> {
+    if (disposed || started) return;
+    started = true;
+    const run = ++runId;
+    try {
+      await boot(run);
+    } catch (e) {
+      if (!stale(run)) fail(codeOf(e, STARTUP_FALLBACK_CODE), e);
+    }
+  }
+
+  /** Thử lại sau lỗi: làm lại từ đầu (không hiện lại cổng vì người dùng vừa chạm). */
+  async function retry(): Promise<void> {
+    if (disposed || screen !== 'error') return;
+    log.info('Thử lại sau lỗi');
+    safely('speech.cancelAll', () => speech.cancelAll());
+    decision.reset();
+    analyzer.reset();
+    lastResult = null;
+    started = false;
+    await start();
+  }
+
+  /* ───── Thao tác người dùng ───── */
+
+  function replay(): void {
+    const out = decision.handle({ type: 'USER_REPLAY', now: clock() });
+    if (out.speech !== null) speech.say(out.speech);
+    publish(out, null);
+  }
+
+  /** Đèn chỉ đổi khi người dùng bấm nút hoặc giữ màn hình; không được thì nói TORCH_UNSUPPORTED. */
+  async function toggleTorch(): Promise<void> {
+    if (torchBusy || screen !== 'camera') return;
+    torchBusy = true;
+    try {
+      const next = !torchOn;
+      let ok = false;
+      try {
+        ok = await camera.setTorch(next);
+      } catch (e) {
+        log.warn('camera.setTorch lỗi', e);
+      }
+      if (!ok) {
+        speech.say({ kind: 'SETTING_ACK', what: 'TORCH_UNSUPPORTED' });
+      } else {
+        torchOn = next;
+        await settings.set({ torchEnabled: next }); // settings-manager lưu rồi nói TORCH_ON / TORCH_OFF
+      }
+      renderTorch();
+    } catch (e) {
+      log.warn('Đổi cài đặt đèn lỗi', e);
+    } finally {
+      torchBusy = false;
+    }
+  }
+
+  function openSettings(): void {
+    if (screen !== 'camera') return;
+    screen = 'settings';
+    safely('ui.showSettings', () => ui.showSettings());
+    syncCamera(); // đang chỉnh cài đặt thì không quét: lời xác nhận không bị hướng dẫn chen ngang
+  }
+
+  function closeSettings(): void {
+    if (screen !== 'settings') return;
+    screen = 'camera';
+    safely('ui.showCamera', () => ui.showCamera());
+    analyzer.reset();
+    syncCamera();
+  }
+
+  function onAction(a: UiAction): void {
+    switch (a) {
+      case 'REPLAY':
+        replay();
+        break;
+      case 'TOGGLE_TORCH':
+        void toggleTorch();
+        break;
+      case 'OPEN_SETTINGS':
+        openSettings();
+        break;
+      case 'CLOSE_SETTINGS':
+        closeSettings();
+        break;
+      case 'RETRY':
+        void retry();
+        break;
+      default: {
+        const unsupported: never = a;
+        log.warn('Thao tác không được hỗ trợ', unsupported);
+      }
+    }
+  }
+
+  /* ───── Vòng đời, nút Back, trạng thái camera, lời nói ───── */
+
+  /** Hai nguồn (visibilitychange, appStateChange) có thể báo trùng: chỉ hành động khi trạng thái thật sự đổi. */
+  function onVisibility(visible: boolean): void {
+    if (disposed || backgrounded === !visible) return;
+    backgrounded = !visible;
+    syncCamera();
+    if (!visible) {
+      safely('speech.cancelAll', () => speech.cancelAll());
+      send('APP_BACKGROUNDED');
+      return;
+    }
+    analyzer.reset(); // cửa sổ ổn định cũ không còn đúng sau khi camera tạm dừng
+    send('APP_FOREGROUNDED');
+    if (scanning) haptics.play('START'); // báo bằng rung: quét đã tiếp tục (việc tiếp tục không có lời nói)
+  }
+
+  function onBack(): void {
+    if (screen === 'settings') return closeSettings();
+    attempt(() => lifecycle.minimize()).catch((e: unknown) => log.warn('Không thu nhỏ được ứng dụng', e));
+  }
+
+  /** Lỗi camera giữa chừng (mất camera, không mở lại được) cũng phải báo, không để màn hình đen im lặng. */
+  function onCameraStatus(status: CameraStatus, error?: AppError): void {
+    if (status === 'ERROR' && error !== undefined) fail(error.code, error);
+  }
+
+  /** RESULT_SPEECH_ENDED chỉ gửi khi một câu RESULT hoặc REPLAY vừa đọc xong. */
+  function onUtterance(e: UtteranceEvent): void {
+    if (e.phase === 'end' && (e.kind === 'RESULT' || e.kind === 'REPLAY')) send('RESULT_SPEECH_ENDED');
+  }
+
+  function bind(): void {
+    if (bound) return;
+    bound = true;
+    permanent.push(ui.onAction(onAction));
+    permanent.push(speech.onUtterance(onUtterance));
+    permanent.push(camera.onStatus(onCameraStatus));
+    permanent.push(lifecycle.onVisibilityChange(onVisibility));
+    if (platform === 'android-native') permanent.push(lifecycle.onBackButton(onBack)); // Back chỉ có trên Android
+  }
+
+  function dispose(): void {
+    if (disposed) return;
+    disposed = true;
+    runId += 1;
+    const pendingGate = gateResolve;
+    gateResolve = null;
+    pendingGate?.(); // start() đang chờ cổng thì được thả ra rồi tự thoát
+    safely('ui.hideStartGate', () => ui.hideStartGate());
+    for (const off of permanent.splice(0)) safely('gỡ listener', off);
+    settingsOff?.();
+    settingsOff = null;
+    const lightWasOn = torchOn;
+    haltScanning();
+    safely('speech.cancelAll', () => speech.cancelAll());
+    if (lightWasOn && torchPort !== undefined) attempt(() => torchPort.set(false)).catch((e: unknown) => log.warn('Không tắt được đèn', e));
+  }
+
+  return { start, dispose };
+}
+</file>
+
+<file path="src/config/app-config.ts">
+import type { AppConfig, Settings } from '../contracts';
+
+/** Mọi ngưỡng ở đây là điểm xuất phát để thử nghiệm, chưa phải giá trị đã được chứng minh. */
+export const DEFAULT_CONFIG: AppConfig = {
+  inference: { confLow: 0.25, confSure: 0.7, nmsIou: 0.45, agnosticNms: true, maxDetections: 20, targetFps: 5, preferWebGpu: false, verifyChecksum: true },
+  analyzer: {
+    grayThumbWidth: 256, overlapRatio: 0.25, conflictIou: 0.5, minAreaRatio: 0.04, edgeMarginRatio: 0.05,
+    blurThreshold: 60,   // phương sai Laplacian: PHẢI hiệu chỉnh trên điện thoại thật
+    lowLightMean: 60,    // độ sáng trung bình 0..255
+    stabilizer: { windowSize: 5, minAgree: 4, matchIou: 0.5, maxAgeMs: 2500 },
+  },
+  decision: {
+    multiNotePolicy: 'MULTI', blockOnPartial: true, blockOnBlur: false, blockOnLowLight: false,
+    emptyFramesToReset: 6, noMoneyGuidanceDelayMs: 4000, unstableGuidanceMs: 5000, guidanceCooldownMs: 6000,
+    guidancePriority: ['CLASS_CONFLICT', 'OVERLAP', 'PARTIAL_IN_FRAME', 'TOO_FAR', 'LOW_LIGHT', 'BLUR', 'LOW_CONFIDENCE', 'MULTI_NOT_ALLOWED', 'HOLD_STEADY', 'NO_MONEY'],
+  },
+  speech: { dedupeWindowMs: 5000, minGapMs: 400, guidanceStaleMs: 3000, maxUtteranceMs: 15000 },
+  settings: { fontScaleMin: 1, fontScaleMax: 2, speechRates: [0.8, 1.0, 1.2], modelVersionMaxLength: 32 },
+};
+
+export const DEFAULT_SETTINGS: Settings = {
+  schemaVersion: 1, voiceEnabled: true, voiceLanguage: 'vi-VN', speechRate: 1.0, verbosity: 'DETAILED',
+  speechOutput: 'APP_TTS', vibrationEnabled: true, torchEnabled: false, fontScale: 1,
+  highContrast: false, autoStartCamera: true, modelVersion: '1.0.0',
+};
+</file>
+
+<file path="src/vision/model-manager.ts">
+import { AppError } from '../contracts';
+import type { AppConfig, ClassesJson, ModelConfigJson, ModelInfo, ModelManifest, RawModelOutput } from '../contracts';
+import { createLogger } from '../utils/logger';
+import { systemClock } from '../utils/time';
+import type { Clock } from '../utils/time';
+import type { InferenceSession } from 'onnxruntime-web/wasm';
+
+/**
+ * Nạp và chạy mô hình ONNX bằng onnxruntime-web. Thuần logic, không phụ thuộc trình duyệt nên chạy được
+ * trong Worker lẫn Node; fetch, ORT và thông tin môi trường đều nhận qua tham số để test bằng đồ giả.
+ */
+const log = createLogger('model-manager');
+
+/** Số luồng WASM tối đa khi trang được cô lập đa nguồn gốc (crossOriginIsolated). */
+const MAX_WASM_THREADS = 4;
+
+type Backend = ModelInfo['backend'];
+
+/** Phần của onnxruntime-web mà module này dùng; đồ giả trong test chỉ cần thỏa cấu trúc này. */
+export type OrtModule = Pick<typeof import('onnxruntime-web/wasm'), 'env' | 'InferenceSession' | 'Tensor'>;
+/** Phần của Response mà module cần; fetch thật thỏa cấu trúc này. */
+export interface FetchResponseLike { ok: boolean; status: number; json(): Promise<unknown>; arrayBuffer(): Promise<ArrayBuffer> }
+export type FetchLike = (url: string) => Promise<FetchResponseLike>;
+/** Thông tin môi trường chạy, đọc từ globalThis (test tiêm giá trị giả). */
+export interface RuntimeEnv { crossOriginIsolated: boolean; hardwareConcurrency: number; hasWebGpu: boolean; userAgent: string }
+
+export interface LoadModelOptions {
+  baseUrl: string;
+  ortBaseUrl: string;
+  config: AppConfig['inference'];
+  fetchFn?: FetchLike;
+  /** Nạp ORT theo backend; mặc định import động onnxruntime-web/wasm hoặc onnxruntime-web/webgpu. */
+  ortLoader?: (backend: Backend) => Promise<OrtModule>;
+  runtime?: RuntimeEnv;
+  now?: Clock;
+}
+
+/** Phần worker-core cần của một mô hình đã nạp. */
+export interface ModelRunner {
+  readonly info: ModelInfo;
+  predict(tensor: Float32Array): Promise<RawModelOutput>;
+  dispose(): Promise<void>;
+}
+export interface LoadedModel extends ModelRunner {
+  readonly manifest: ModelManifest;
+  readonly config: ModelConfigJson;
+  /** Nguyên văn classes.json; giá trị được kiểm bằng buildClassMap ở nơi dùng. */
+  readonly classes: ClassesJson;
+}
+
+const withSlash = (url: string): string => (url.endsWith('/') ? url : `${url}/`);
+const fileName = (url: string): string => url.slice(url.lastIndexOf('/') + 1);
+const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
+const isClasses = (v: unknown): v is ClassesJson => isRecord(v);
+const isModelConfig = (v: unknown): v is ModelConfigJson => isRecord(v) && Number.isInteger(v.inputSize) && Number(v.inputSize) > 0;
+const isManifest = (v: unknown): v is ModelManifest =>
+  isRecord(v) && typeof v.file === 'string' && typeof v.sha256 === 'string' && typeof v.version === 'string' &&
+  typeof v.inputName === 'string' && typeof v.outputName === 'string' && Array.isArray(v.inputShape) &&
+  Number.isInteger(v.sizeBytes) && Number.isInteger(v.classCount);
+
+function readRuntimeEnv(): RuntimeEnv {
+  const g = globalThis as { crossOriginIsolated?: boolean; navigator?: { hardwareConcurrency?: number; userAgent?: string; gpu?: unknown } };
+  return {
+    crossOriginIsolated: g.crossOriginIsolated === true,
+    hardwareConcurrency: g.navigator?.hardwareConcurrency ?? 1,
+    hasWebGpu: g.navigator?.gpu !== undefined,
+    userAgent: g.navigator?.userAgent ?? '',
+  };
+}
+
+function describeRuntime(r: RuntimeEnv): string {
+  const chrome = /Chrome\/([\d.]+)/.exec(r.userAgent)?.[1] ?? 'không rõ';
+  const kind = /;\s*wv\)/.test(r.userAgent) ? 'Android WebView' : 'Chrome';
+  return `Môi trường: ${kind} ${chrome}; crossOriginIsolated=${r.crossOriginIsolated}; CPU=${r.hardwareConcurrency}; WebGPU=${r.hasWebGpu}`;
+}
+
+/** WebView thường không cô lập đa nguồn gốc nên chỉ dùng đa luồng khi crossOriginIsolated. */
+function pickThreads(r: RuntimeEnv): number {
+  if (!r.crossOriginIsolated) return 1;
+  return Math.max(1, Math.min(MAX_WASM_THREADS, Math.floor(r.hardwareConcurrency) || 1));
+}
+
+/** Bản wasm-only dùng ort-wasm-simd-threaded.{mjs,wasm}: đúng các file scripts/copy-ort-wasm.mjs chép vào public/ort. */
+function importOrt(backend: Backend): Promise<OrtModule> {
+  return backend === 'webgpu' ? import('onnxruntime-web/webgpu') : import('onnxruntime-web/wasm');
+}
+
+async function fetchOk(fetchFn: FetchLike, url: string): Promise<FetchResponseLike> {
+  let res: FetchResponseLike;
+  try {
+    res = await fetchFn(url);
+  } catch (e) {
+    throw new AppError('MODEL_MISSING', `Không đọc được tệp mô hình "${fileName(url)}".`, true, e);
+  }
+  if (!res.ok) throw new AppError('MODEL_MISSING', `Không tìm thấy tệp mô hình "${fileName(url)}" (HTTP ${res.status}).`, true);
+  return res;
+}
+
+async function fetchJson<T>(fetchFn: FetchLike, url: string, guard: (v: unknown) => v is T): Promise<T> {
+  const res = await fetchOk(fetchFn, url);
+  let value: unknown;
+  try {
+    value = await res.json();
+  } catch (e) {
+    throw new AppError('MODEL_CORRUPT', `Tệp "${fileName(url)}" không phải JSON hợp lệ.`, true, e);
+  }
+  if (!guard(value)) throw new AppError('MODEL_CORRUPT', `Tệp "${fileName(url)}" thiếu hoặc sai trường bắt buộc.`, true);
+  return value;
+}
+
+async function fetchBytes(fetchFn: FetchLike, url: string): Promise<ArrayBuffer> {
+  const res = await fetchOk(fetchFn, url);
+  try {
+    return await res.arrayBuffer();
+  } catch (e) {
+    throw new AppError('MODEL_MISSING', `Đọc dở tệp mô hình "${fileName(url)}".`, true, e);
+  }
+}
+
+async function verifyBytes(buffer: ArrayBuffer, manifest: ModelManifest, checksum: boolean): Promise<void> {
+  if (buffer.byteLength !== manifest.sizeBytes) {
+    throw new AppError('MODEL_CORRUPT', `Tệp mô hình sai kích thước: nhận ${buffer.byteLength} byte, manifest ghi ${manifest.sizeBytes}.`, true);
+  }
+  if (!checksum) return;
+  const subtle = globalThis.crypto?.subtle;
+  if (!subtle) {
+    throw new AppError('UNSUPPORTED_BROWSER', 'Thiếu crypto.subtle (cần HTTPS hoặc localhost) nên không kiểm tra được sha256; đặt verifyChecksum=false khi chạy thử qua http.', true);
+  }
+  const bytes = new Uint8Array(await subtle.digest('SHA-256', buffer));
+  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+  if (hex !== manifest.sha256.toLowerCase()) {
+    throw new AppError('MODEL_CORRUPT', `Tệp mô hình sai sha256: nhận ${hex.slice(0, 12)}…, manifest ghi ${manifest.sha256.slice(0, 12)}….`, true);
+  }
+}
+
+/** F4: tạo ort.Tensor [1,3,S,S], chạy session, trả RawModelOutput; luôn giải phóng tensor tạm. */
+function makePredict(ort: OrtModule, session: InferenceSession, manifest: ModelManifest, size: number) {
+  const dims = [1, 3, size, size];
+  const expected = 3 * size * size;
+  return async (tensor: Float32Array): Promise<RawModelOutput> => {
+    if (tensor.length !== expected) {
+      throw new AppError('INFERENCE_FAILED', `Tensor đầu vào có ${tensor.length} phần tử, cần ${expected} (1×3×${size}×${size}).`);
+    }
+    const input = new ort.Tensor('float32', tensor, dims);
+    let outputs: InferenceSession.ReturnType | undefined;
+    try {
+      outputs = await session.run({ [manifest.inputName]: input }, [manifest.outputName]);
+      const out = outputs[manifest.outputName];
+      if (!out || !(out.data instanceof Float32Array)) {
+        throw new AppError('INFERENCE_FAILED', `Đầu ra "${manifest.outputName}" thiếu hoặc không phải float32.`);
+      }
+      return { data: out.data, dims: [...out.dims] };
+    } finally {
+      input.dispose();
+      if (outputs) for (const t of Object.values(outputs)) t.dispose();
+    }
+  };
+}
+
+/**
+ * F1-F3: đọc manifest/config/classes, tải onnx, kiểm kích thước và sha256, khởi tạo ORT (WASM, hoặc thử WebGPU trước
+ * nếu config.preferWebGpu và có navigator.gpu), chạy nóng một lần. Lỗi: MODEL_MISSING, MODEL_CORRUPT, MODEL_INIT_FAILED.
+ */
+export async function loadModel(o: LoadModelOptions): Promise<LoadedModel> {
+  const now = o.now ?? systemClock;
+  const fetchFn = o.fetchFn ?? ((url: string) => fetch(url));
+  const runtime = o.runtime ?? readRuntimeEnv();
+  const t0 = now();
+  log.info(describeRuntime(runtime));
+
+  const base = withSlash(o.baseUrl);
+  const manifest = await fetchJson(fetchFn, `${base}model-manifest.json`, isManifest);
+  const modelConfig = await fetchJson(fetchFn, `${base}model-config.json`, isModelConfig);
+  const classes = await fetchJson(fetchFn, `${base}classes.json`, isClasses);
+  const size = modelConfig.inputSize;
+  const shape = manifest.inputShape;
+  if (shape.length !== 4 || shape[2] !== size || shape[3] !== size) {
+    throw new AppError('MODEL_CORRUPT', `model-manifest.json (inputShape ${shape.join('×')}) không khớp model-config.json (inputSize ${size}).`, true);
+  }
+  const buffer = await fetchBytes(fetchFn, `${base}${manifest.file}`);
+  await verifyBytes(buffer, manifest, o.config.verifyChecksum);
+
+  const threads = pickThreads(runtime);
+  const backends: Backend[] = o.config.preferWebGpu && runtime.hasWebGpu ? ['webgpu', 'wasm'] : ['wasm'];
+  let lastError: unknown;
+  for (const backend of backends) {
+    let session: InferenceSession | undefined;
+    try {
+      const ort = await (o.ortLoader ?? importOrt)(backend);
+      ort.env.wasm.wasmPaths = withSlash(o.ortBaseUrl);
+      ort.env.wasm.numThreads = threads;
+      ort.env.wasm.simd = true;
+      session = await ort.InferenceSession.create(new Uint8Array(buffer), { executionProviders: [backend], graphOptimizationLevel: 'all' });
+      const tLoaded = now();
+      const predict = makePredict(ort, session, manifest, size);
+      await predict(new Float32Array(3 * size * size)); // F3: chạy nóng với tensor toàn 0
+      const tWarm = now();
+      const live = session;
+      const info: ModelInfo = {
+        version: manifest.version, inputSize: size, classCount: manifest.classCount,
+        backend, threads, loadMs: tLoaded - t0, warmupMs: tWarm - tLoaded,
+      };
+      log.info('Mô hình sẵn sàng', info);
+      return {
+        info, manifest, config: modelConfig, classes, predict,
+        dispose: async () => {
+          try {
+            await live.release();
+          } catch (e) {
+            log.warn('Giải phóng phiên ORT lỗi', e);
+          }
+        },
+      };
+    } catch (e) {
+      lastError = e;
+      log.warn(`Backend ${backend} không dùng được`, e);
+      await session?.release().catch(() => undefined);
+    }
+  }
+  const reason = lastError instanceof Error ? lastError.message : String(lastError);
+  throw new AppError('MODEL_INIT_FAILED', `Không khởi tạo được ONNX Runtime: ${reason}`, true, lastError);
+}
+</file>
+
+<file path="src/voice/audio-clip-engine.ts">
+import { AppError } from '../contracts';
+import type { ITtsEngine, TtsCapabilities, TtsHooks } from '../contracts';
+import { createLogger } from '../utils/logger';
+
+const log = createLogger('audio-clip');
+
+/** Engine phát file mp3 ghi sẵn theo audioKey; canSpeak cho biết khóa nào thực sự có file. */
+export interface AudioClipEngine extends ITtsEngine {
+  canSpeak(audioKey: string): boolean;
+}
+
+/** Phần của fetch mà engine dùng (fetch thật thỏa mãn kiểu này). */
+export type AudioFetch = (url: string, init?: { method: string }) => Promise<{ ok: boolean; json(): Promise<unknown> }>;
+
+export interface AudioClipDeps {
+  /** Thư mục gốc của ứng dụng (Vite base), ví dụ "./". Manifest nằm ở <baseUrl>audio/manifest.json. */
+  baseUrl: string;
+  fetchFn: AudioFetch;
+  createAudio: () => HTMLAudioElement;
+}
+
+const UNAVAILABLE: TtsCapabilities = {
+  available: false,
+  vietnameseVoice: false,
+  offlineVietnamese: false,
+  requiresUserGesture: false,
+};
+
+/** Tên file hợp lệ: không có dấu gạch chéo, không bắt đầu bằng dấu chấm (chặn đường dẫn lạ trong manifest). */
+const SAFE_FILE_NAME = /^[A-Za-z0-9_-][A-Za-z0-9_.-]*$/;
+
+/** WAV im lặng 2 mẫu, dựng từ byte: dùng để "mở khóa" phần tử audio trong lần chạm đầu tiên. */
+export function silentWavDataUri(): string {
+  const bytes = [
+    0x52, 0x49, 0x46, 0x46, 0x26, 0x00, 0x00, 0x00, 0x57, 0x41, 0x56, 0x45, // "RIFF", 38, "WAVE"
+    0x66, 0x6d, 0x74, 0x20, 0x10, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, // "fmt ", 16, PCM, mono
+    0x40, 0x1f, 0x00, 0x00, 0x40, 0x1f, 0x00, 0x00, 0x01, 0x00, 0x08, 0x00, // 8000 Hz, 8000 byte/s, 1, 8 bit
+    0x64, 0x61, 0x74, 0x61, 0x02, 0x00, 0x00, 0x00, 0x80, 0x80, // "data", 2 byte im lặng
+  ];
+  return `data:audio/wav;base64,${btoa(String.fromCharCode(...bytes))}`;
+}
+
+function parseManifest(data: unknown): Array<[string, string]> {
+  if (typeof data !== 'object' || data === null || Array.isArray(data)) return [];
+  return Object.entries(data).filter(
+    (entry): entry is [string, string] => typeof entry[1] === 'string' && SAFE_FILE_NAME.test(entry[1]),
+  );
+}
+
+/** Engine audio-clip với các thành phần tiêm vào (dùng cho test và cho createAudioClipEngine). */
+export function createAudioClipEngineWith(deps: AudioClipDeps): AudioClipEngine {
+  const base = deps.baseUrl.endsWith('/') ? deps.baseUrl : `${deps.baseUrl}/`;
+  const clips = new Map<string, string>(); // khóa → URL của file đã xác nhận tồn tại
+  let audio: HTMLAudioElement | null = null; // MỘT phần tử audio, tạo lười và dùng lại cho mọi câu
+  let counter = 0;
+  let current = 0; // id của clip đang phát; 0 = không có
+  let unlocked = false;
+
+  function getAudio(): HTMLAudioElement {
+    audio ??= deps.createAudio();
+    return audio;
+  }
+
+  async function init(): Promise<TtsCapabilities> {
+    clips.clear();
+    try {
+      const res = await deps.fetchFn(`${base}audio/manifest.json`);
+      if (res.ok) {
+        const entries = parseManifest(await res.json());
+        await Promise.all(
+          entries.map(async ([key, file]) => {
+            const url = `${base}audio/${file}`;
+            try {
+              if ((await deps.fetchFn(url, { method: 'HEAD' })).ok) clips.set(key, url);
+            } catch (e) {
+              log.warn(`Không kiểm tra được file ${file}:`, e);
+            }
+          }),
+        );
+      }
+    } catch (e) {
+      log.warn('Không đọc được manifest âm thanh ghi sẵn:', e);
+    }
+    if (clips.size === 0) return { ...UNAVAILABLE };
+    // requiresUserGesture = true: giả định chính sách tự phát của WebView chưa được nới (nếu đã nới thì để false).
+    return { available: true, vietnameseVoice: true, offlineVietnamese: true, requiresUserGesture: true };
+  }
+
+  /** Gọi trong lần chạm đầu tiên: phát một clip im lặng trên chính phần tử audio sẽ dùng về sau. */
+  function unlock(): void {
+    if (unlocked) return;
+    unlocked = true;
+    try {
+      const el = getAudio();
+      el.src = silentWavDataUri();
+      const started: Promise<void> | undefined = el.play();
+      started?.catch((e: unknown) => {
+        if (e instanceof Error && e.name === 'NotAllowedError') unlocked = false; // vẫn bị khóa: thử lại lần chạm sau
+      });
+    } catch (e) {
+      unlocked = false;
+      log.warn('unlock lỗi:', e);
+    }
+  }
+
+  function speak(_text: string, opts: { rate: number; lang: string; audioKey?: string }, hooks: TtsHooks): void {
+    const url = opts.audioKey === undefined ? undefined : clips.get(opts.audioKey);
+    if (url === undefined) {
+      hooks.onError(new AppError('TTS_UNAVAILABLE', `Không có âm thanh ghi sẵn cho khóa ${String(opts.audioKey)}`));
+      return;
+    }
+    const el = getAudio();
+    if (current !== 0) el.pause(); // không để hai clip chồng nhau
+    counter += 1;
+    const id = counter;
+    current = id;
+    el.onended = () => {
+      if (current !== id) return;
+      current = 0;
+      hooks.onEnd();
+    };
+    el.onerror = () => {
+      if (current !== id) return;
+      current = 0;
+      hooks.onError(new AppError('TTS_UNAVAILABLE', 'Không phát được file âm thanh ghi sẵn'));
+    };
+    const fail = (e: unknown): void => {
+      if (current !== id) return;
+      current = 0;
+      hooks.onError(new AppError('TTS_UNAVAILABLE', 'Trình duyệt từ chối phát âm thanh ghi sẵn', false, e));
+    };
+    try {
+      el.src = url;
+      el.playbackRate = opts.rate;
+      const started: Promise<void> | undefined = el.play();
+      if (started === undefined) hooks.onStart();
+      else {
+        started.then(() => {
+          if (current === id) hooks.onStart();
+        }, fail);
+      }
+    } catch (e) {
+      fail(e);
+    }
+  }
+
+  function cancel(): void {
+    current = 0;
+    audio?.pause();
+  }
+
+  return { name: 'audio-clip', init, unlock, speak, cancel, canSpeak: (audioKey) => clips.has(audioKey) };
+}
+
+/** Engine audio-clip thật: phát mp3 trong public/audio (đã nằm sẵn trong APK, chạy được khi không có mạng). */
+export function createAudioClipEngine(o?: { baseUrl?: string }): AudioClipEngine {
+  return createAudioClipEngineWith({
+    baseUrl: o?.baseUrl ?? './',
+    fetchFn: (url, init) => fetch(url, init),
+    createAudio: () => new Audio(),
+  });
+}
+</file>
+
+<file path="src/voice/native-tts-engine.ts">
+import { DEFAULT_SETTINGS } from '../config/app-config';
+import { AppError } from '../contracts';
+import type { ITtsEngine, TtsCapabilities, TtsHooks } from '../contracts';
+import { createLogger } from '../utils/logger';
+import { getPlatform } from '../utils/platform';
+import { createCapacitorTtsPort } from './native-tts-adapter';
+
+const log = createLogger('native-tts');
+
+const VIETNAMESE_LANG = DEFAULT_SETTINGS.voiceLanguage;
+
+export interface NativeTtsVoice {
+  lang: string;
+  name?: string;
+  /** true nếu giọng chạy cục bộ (không cần Internet); undefined nếu plugin không cho biết. */
+  localService?: boolean;
+}
+
+/**
+ * Cổng nhỏ che plugin TTS native. Mọi lỗi của plugin phải ra ngoài dưới dạng AppError TTS_UNAVAILABLE.
+ * speak luôn dùng hàng đợi kiểu flush: câu mới thay câu đang đọc; promise hoàn tất khi đọc xong.
+ */
+export interface NativeTtsPort {
+  isLanguageSupported(lang: string): Promise<boolean>;
+  listVoices(): Promise<NativeTtsVoice[]>;
+  speak(o: { text: string; lang: string; rate: number }): Promise<void>;
+  stop(): Promise<void>;
+}
+
+export interface NativeTtsDeps {
+  port: NativeTtsPort;
+  isNative: () => boolean;
+}
+
+const UNAVAILABLE: TtsCapabilities = {
+  available: false,
+  vietnameseVoice: false,
+  offlineVietnamese: false,
+  requiresUserGesture: false,
+};
+
+function isVietnamese(lang: string): boolean {
+  return lang.toLowerCase().replace('_', '-').startsWith('vi');
+}
+
+function toAppError(e: unknown): AppError {
+  return e instanceof AppError ? e : new AppError('TTS_UNAVAILABLE', 'Engine đọc của điện thoại gặp lỗi', false, e);
+}
+
+/** Engine TTS native với cổng tiêm vào (dùng cho test và cho createNativeTtsEngine). */
+export function createNativeTtsEngineWith(deps: NativeTtsDeps): ITtsEngine {
+  const { port } = deps;
+  let counter = 0;
+  let current = 0; // id của câu đang chờ plugin; 0 = không có câu nào
+
+  function stopQuietly(): void {
+    try {
+      port.stop().catch((e: unknown) => log.warn('port.stop lỗi:', e));
+    } catch (e) {
+      log.warn('port.stop ném lỗi:', e);
+    }
+  }
+
+  async function init(): Promise<TtsCapabilities> {
+    if (!deps.isNative()) return { ...UNAVAILABLE };
+    try {
+      const supported = await port.isLanguageSupported(VIETNAMESE_LANG);
+      let viVoices: NativeTtsVoice[] = [];
+      try {
+        viVoices = (await port.listVoices()).filter((v) => isVietnamese(v.lang));
+      } catch (e) {
+        log.warn('Không liệt kê được giọng của máy:', e);
+      }
+      // KHÔNG CHẮC: nếu plugin không cho biết giọng nào chạy cục bộ thì coi giọng Việt là chạy ngoại tuyến (xem Giả định).
+      const localKnown = viVoices.some((v) => typeof v.localService === 'boolean');
+      const offlineVietnamese = supported && (localKnown ? viVoices.some((v) => v.localService === true) : true);
+      const voiceName = (viVoices.find((v) => v.localService === true) ?? viVoices[0])?.name;
+      return {
+        available: true,
+        vietnameseVoice: supported,
+        offlineVietnamese,
+        requiresUserGesture: false,
+        ...(voiceName === undefined ? {} : { voiceName }),
+      };
+    } catch (e) {
+      log.warn('Plugin TTS không dùng được:', toAppError(e));
+      return { ...UNAVAILABLE };
+    }
+  }
+
+  function speak(text: string, opts: { rate: number; lang: string; audioKey?: string }, hooks: TtsHooks): void {
+    if (current !== 0) {
+      current = 0; // câu cũ bị thay: kết quả muộn của nó sẽ bị bỏ qua
+      stopQuietly();
+    }
+    counter += 1;
+    const id = counter;
+    current = id;
+    hooks.onStart();
+    let pending: Promise<void>;
+    try {
+      pending = port.speak({ text, lang: opts.lang, rate: opts.rate });
+    } catch (e) {
+      current = 0;
+      hooks.onError(toAppError(e));
+      return;
+    }
+    pending.then(
+      () => {
+        if (current !== id) return;
+        current = 0;
+        hooks.onEnd();
+      },
+      (e: unknown) => {
+        if (current !== id) return;
+        current = 0;
+        hooks.onError(toAppError(e));
+      },
+    );
+  }
+
+  function cancel(): void {
+    current = 0;
+    stopQuietly();
+  }
+
+  return { name: 'native-tts', init, unlock: () => undefined, speak, cancel };
+}
+
+/** Engine TTS native thật: chỉ available trong APK Android. */
+export function createNativeTtsEngine(): ITtsEngine {
+  return createNativeTtsEngineWith({
+    port: createCapacitorTtsPort(),
+    isNative: () => getPlatform() === 'android-native',
+  });
+}
+</file>
+
+<file path="src/voice/speech-manager.ts">
+import type {
+  AppConfig,
+  HapticEvent,
+  IHaptics,
+  ISpeech,
+  ITtsEngine,
+  RecognitionResult,
+  Settings,
+  SpeechIntent,
+  TtsCapabilities,
+  TtsHooks,
+  UtteranceEvent,
+} from '../contracts';
+import { createLogger } from '../utils/logger';
+import { systemClock } from '../utils/time';
+import { buildPrompt } from './prompt-manager';
+import type { Prompt } from './prompt-manager';
+
+const log = createLogger('speech');
+
+/**
+ * Ước lượng thời gian đọc để đặt watchdog: độ dài chữ × hệ số / tốc độ + đệm.
+ * AppConfig.speech chưa có các tham số này nên tạm đặt ở đây (xem "Đề xuất sửa hợp đồng").
+ */
+export const WATCHDOG_MS_PER_CHAR = 120;
+export const WATCHDOG_MARGIN_MS = 1000;
+
+export interface SpeechManagerOptions {
+  engines: ITtsEngine[];
+  haptics: IHaptics;
+  getSettings: () => Settings;
+  config: AppConfig['speech'];
+  now?: () => number;
+}
+
+/** Hẹn giờ được tiêm vào để test không phải chờ thật. */
+export interface SpeechTimers {
+  setTimeout(handler: () => void, ms: number): unknown;
+  clearTimeout(handle: unknown): void;
+}
+
+const REAL_TIMERS: SpeechTimers = {
+  setTimeout: (handler, ms) => globalThis.setTimeout(handler, ms),
+  clearTimeout: (handle) => globalThis.clearTimeout(handle as number),
+};
+
+const UNAVAILABLE: TtsCapabilities = {
+  available: false,
+  vietnameseVoice: false,
+  offlineVietnamese: false,
+  requiresUserGesture: false,
+};
+
+/** Cắt câu dài theo dấu chấm thành các câu ngắn (mỗi câu giữ dấu chấm của nó). */
+export function splitIntoUtterances(text: string): string[] {
+  return (text.match(/[^.]+\.?/g) ?? []).map((s) => s.trim()).filter((s) => s !== '' && s !== '.');
+}
+
+/** Thời gian chờ tối đa cho một câu: số lớn hơn giữa maxUtteranceMs và ước lượng theo độ dài chữ. */
+export function utteranceTimeoutMs(text: string, rate: number, maxUtteranceMs: number): number {
+  const safeRate = Number.isFinite(rate) && rate > 0 ? rate : 1;
+  const estimate = Math.ceil((text.length * WATCHDOG_MS_PER_CHAR) / safeRate) + WATCHDOG_MARGIN_MS;
+  return Math.max(maxUtteranceMs, estimate);
+}
+
+function hapticFor(intent: SpeechIntent): HapticEvent | null {
+  switch (intent.kind) {
+    case 'CAMERA_READY':
+      return 'START';
+    case 'RESULT':
+      return 'SUCCESS';
+    case 'ERROR':
+      return 'ERROR';
+    case 'GUIDANCE':
+      return intent.code === 'LOW_CONFIDENCE' || intent.code === 'CLASS_CONFLICT' ? 'UNCERTAIN' : null;
+    default:
+      return null;
+  }
+}
+
+interface QueueItem {
+  readonly kind: SpeechIntent['kind'];
+  readonly prompt: Prompt;
+  readonly chunks: readonly string[];
+  readonly enqueuedAt: number;
+  next: number;
+  started: boolean;
+}
+
+interface ActiveUtterance {
+  readonly id: number;
+  readonly item: QueueItem;
+  readonly watchdog: unknown;
+}
+
+interface ProbedEngine {
+  engine: ITtsEngine;
+  caps: TtsCapabilities;
+}
+
+type EndOutcome = 'ended' | 'error' | 'cancelled' | 'watchdog';
+
+/** Chọn engine: aria-live (nếu chọn đọc qua trình đọc màn hình) → engine đầu tiên có giọng Việt → audio-clip → engine nào dùng được. */
+function chooseEngine(probed: ProbedEngine[], speechOutput: Settings['speechOutput']): ProbedEngine | null {
+  const usable = probed.filter((p) => p.caps.available);
+  if (speechOutput === 'SCREEN_READER') {
+    const reader = usable.find((p) => p.engine.name === 'aria-live');
+    if (reader !== undefined) return reader;
+  }
+  const voiced = usable.find((p) => p.engine.name !== 'audio-clip' && p.caps.vietnameseVoice);
+  if (voiced !== undefined) return voiced;
+  const clip = usable.find((p) => p.engine.name === 'audio-clip');
+  if (clip !== undefined) return clip;
+  const any = usable[0];
+  return any === undefined ? null : { engine: any.engine, caps: { ...any.caps, vietnameseVoice: false } };
+}
+
+/**
+ * Bộ điều phối giọng nói với hẹn giờ tiêm vào (dùng cho test và cho createSpeechManager).
+ * Bảo đảm: tại mọi thời điểm chỉ có MỘT utterance đang phát; mỗi utterance có đúng một sự kiện start và một end
+ * (kể cả khi bị hủy, lỗi hay watchdog); hook muộn của utterance cũ bị bỏ qua. Phải await init() trước khi say().
+ */
+export function createSpeechManagerWithTimers(o: SpeechManagerOptions, timers: SpeechTimers): ISpeech {
+  const { engines, haptics, getSettings, config } = o;
+  const now = o.now ?? systemClock;
+  const handlers = new Set<(e: UtteranceEvent) => void>();
+  const spokenAt = new Map<string, number>(); // câu → lần cuối người dùng được báo (bắt đầu đọc hoặc đọc xong)
+  let selected: ProbedEngine | null = null;
+  let queue: QueueItem[] = []; // luôn sắp theo ưu tiên giảm dần; đầu hàng là mục đang đọc dở hoặc sắp đọc
+  let active: ActiveUtterance | null = null;
+  let gapTimer: unknown = null;
+  let lastEndAt = Number.NEGATIVE_INFINITY;
+  let lastResult: RecognitionResult | null = null;
+  let nextId = 1;
+
+  function safely(label: string, fn: () => void): void {
+    try {
+      fn();
+    } catch (e) {
+      log.error(`${label} ném lỗi`, e);
+    }
+  }
+
+  function emit(phase: UtteranceEvent['phase'], kind: UtteranceEvent['kind']): void {
+    for (const handler of [...handlers]) {
+      safely('Bộ nghe sự kiện utterance', () => handler({ phase, kind }));
+    }
+  }
+
+  function playHaptic(intent: SpeechIntent): void {
+    const event = hapticFor(intent);
+    if (event !== null) safely('haptics.play', () => haptics.play(event));
+  }
+
+  function isActive(id: number): boolean {
+    return active !== null && active.id === id;
+  }
+
+  function removeItem(item: QueueItem): void {
+    queue = queue.filter((q) => q !== item);
+  }
+
+  /** Bỏ hướng dẫn chờ quá guidanceStaleMs (chỉ mục chưa đọc câu nào) và quên các câu đã quá cửa sổ chống lặp. */
+  function dropStale(): void {
+    const t = now();
+    queue = queue.filter((item) => {
+      const stale = item.kind === 'GUIDANCE' && !item.started && t - item.enqueuedAt > config.guidanceStaleMs;
+      if (stale) log.debug('Bỏ hướng dẫn quá hạn:', item.prompt.text);
+      return !stale;
+    });
+    for (const [text, at] of spokenAt) {
+      if (t - at >= config.dedupeWindowMs) spokenAt.delete(text);
+    }
+  }
+
+  function isRepeat(text: string): boolean {
+    if (queue.some((item) => item.prompt.text === text)) return true;
+    const at = spokenAt.get(text);
+    return at !== undefined && now() - at < config.dedupeWindowMs;
+  }
+
+  function remainingGapMs(): number {
+    return Math.max(0, Math.min(config.minGapMs, lastEndAt + config.minGapMs - now()));
+  }
+
+  /** Kết thúc utterance đang phát (đúng một lần), rồi đọc tiếp. Hook của utterance cũ (id lệch) bị bỏ qua. */
+  function endUtterance(id: number, outcome: EndOutcome): void {
+    const current = active;
+    if (current === null || current.id !== id) return;
+    timers.clearTimeout(current.watchdog);
+    active = null;
+    lastEndAt = now();
+    const { item } = current;
+    if (outcome !== 'ended' || item.next >= item.chunks.length) removeItem(item); // lỗi, hủy, watchdog: bỏ phần còn lại
+    if (outcome === 'error' && item.next === 1) spokenAt.delete(item.prompt.text); // chưa nghe được gì: cho phép thử lại
+    else spokenAt.set(item.prompt.text, lastEndAt);
+    emit('end', item.kind);
+    pump();
+  }
+
+  function cancelActive(): void {
+    const current = active;
+    if (current === null) return;
+    safely('engine.cancel', () => selected?.engine.cancel());
+    endUtterance(current.id, 'cancelled');
+  }
+
+  function cancelEverything(): void {
+    queue = [];
+    if (gapTimer !== null) {
+      timers.clearTimeout(gapTimer);
+      gapTimer = null;
+    }
+    cancelActive();
+  }
+
+  function onWatchdog(id: number): void {
+    if (!isActive(id)) return;
+    log.warn('Watchdog: engine không báo kết thúc, tự kết thúc câu');
+    safely('engine.cancel', () => selected?.engine.cancel());
+    endUtterance(id, 'watchdog');
+  }
+
+  function startChunk(engine: ITtsEngine, item: QueueItem): void {
+    const text = item.chunks[item.next];
+    if (text === undefined) {
+      removeItem(item);
+      pump();
+      return;
+    }
+    const settings = getSettings();
+    item.next += 1;
+    item.started = true;
+    spokenAt.set(item.prompt.text, now());
+    const id = nextId;
+    nextId += 1;
+    const timeout = utteranceTimeoutMs(text, settings.speechRate, config.maxUtteranceMs);
+    const watchdog = timers.setTimeout(() => safely('watchdog', () => onWatchdog(id)), timeout);
+    active = { id, item, watchdog };
+    emit('start', item.kind);
+    if (!isActive(id)) return; // một bộ nghe đã hủy hoặc ngắt ngay trong sự kiện start
+    const hooks: TtsHooks = {
+      onStart: () => undefined,
+      onEnd: () => safely('onEnd', () => endUtterance(id, 'ended')),
+      onError: (e) =>
+        safely('onError', () => {
+          log.warn('Engine báo lỗi khi đọc:', e);
+          endUtterance(id, 'error');
+        }),
+    };
+    const base = { rate: settings.speechRate, lang: settings.voiceLanguage };
+    const opts =
+      engine.name === 'audio-clip' && item.prompt.audioKey !== undefined ? { ...base, audioKey: item.prompt.audioKey } : base;
+    try {
+      engine.speak(text, opts, hooks);
+    } catch (e) {
+      log.warn('engine.speak ném lỗi:', e);
+      endUtterance(id, 'error');
+    }
+  }
+
+  /** Đọc mục đầu hàng đợi nếu đang rảnh và đã đủ khoảng lặng; chưa đủ thì hẹn giờ. */
+  function pump(): void {
+    if (active !== null || gapTimer !== null) return;
+    dropStale();
+    const item = queue[0];
+    if (item === undefined) return;
+    if (selected === null || !getSettings().voiceEnabled) {
+      queue = [];
+      return;
+    }
+    const wait = remainingGapMs();
+    if (wait > 0) {
+      gapTimer = timers.setTimeout(
+        () =>
+          safely('gap', () => {
+            gapTimer = null;
+            pump();
+          }),
+        wait,
+      );
+      return;
+    }
+    startChunk(selected.engine, item);
+  }
+
+  function accept(intent: SpeechIntent, prompt: Prompt, settings: Settings): void {
+    dropStale();
+    if (intent.kind !== 'REPLAY' && isRepeat(prompt.text)) {
+      log.debug('Bỏ câu lặp:', prompt.text);
+      return;
+    }
+    const head = queue[0];
+    const inProgress = head !== undefined && head.started ? head : undefined;
+    if (intent.kind === 'GUIDANCE' && inProgress !== undefined && (inProgress.kind === 'RESULT' || inProgress.kind === 'REPLAY')) {
+      log.debug('Hướng dẫn không được ngắt kết quả đang đọc:', prompt.text);
+      return;
+    }
+
+    playHaptic(intent);
+
+    const engine = selected === null ? null : selected.engine;
+    const canSpeak =
+      settings.voiceEnabled && engine !== null && (engine.name !== 'audio-clip' || prompt.audioKey !== undefined);
+    if (engine === null || !canSpeak) {
+      if (!settings.voiceEnabled) cancelEverything();
+      spokenAt.set(prompt.text, now());
+      return;
+    }
+
+    // Ưu tiên cao hơn: xóa mục thấp hơn (kể cả mục đang đọc). Cùng supersedeKey: thay mục đang chờ.
+    const lowered = queue.filter((q) => q.prompt.priority < prompt.priority);
+    queue = queue.filter(
+      (q) => q.prompt.priority >= prompt.priority && !(q.prompt.supersedeKey === prompt.supersedeKey && !q.started),
+    );
+    queue.push({
+      kind: intent.kind,
+      prompt,
+      chunks: engine.name === 'audio-clip' ? [prompt.text] : splitIntoUtterances(prompt.text),
+      enqueuedAt: now(),
+      next: 0,
+      started: false,
+    });
+    if (active !== null && lowered.some((q) => q === active?.item)) cancelActive();
+    pump();
+  }
+
+  function say(intent: SpeechIntent): void {
+    safely('say', () => {
+      const settings = getSettings();
+      let prompt: Prompt;
+      try {
+        prompt = buildPrompt(intent, settings);
+      } catch (e) {
+        // Fail Safe: dữ liệu không đáng tin thì KHÔNG đọc số tiền; kết quả hỏng được thay bằng lời từ chối an toàn.
+        log.error('Không dựng được câu nói, bỏ qua:', e);
+        if (intent.kind === 'RESULT') say({ kind: 'GUIDANCE', code: 'LOW_CONFIDENCE' });
+        return;
+      }
+      if (intent.kind === 'RESULT') lastResult = intent.result;
+      accept(intent, prompt, settings);
+    });
+  }
+
+  async function probe(engine: ITtsEngine): Promise<ProbedEngine> {
+    try {
+      return { engine, caps: { ...(await engine.init()) } };
+    } catch (e) {
+      log.warn(`Engine ${engine.name} init lỗi, coi như không dùng được:`, e);
+      return { engine, caps: { ...UNAVAILABLE } };
+    }
+  }
+
+  async function init(): Promise<TtsCapabilities> {
+    safely('init', cancelEverything);
+    selected = null;
+    try {
+      const speechOutput = getSettings().speechOutput;
+      selected = chooseEngine(await Promise.all(engines.map(probe)), speechOutput);
+    } catch (e) {
+      log.error('Chọn engine lỗi:', e);
+    }
+    if (selected === null) log.warn('Không có engine đọc nào dùng được');
+    else log.info(`Chọn engine ${selected.engine.name}`);
+    return selected === null ? { ...UNAVAILABLE } : { ...selected.caps };
+  }
+
+  return {
+    /** true khi có một utterance đang phát (từ start đến end); không tính khoảng lặng giữa hai câu. */
+    get isSpeaking(): boolean {
+      return active !== null;
+    },
+    init,
+    unlock(): void {
+      for (const engine of engines) safely(`${engine.name}.unlock`, () => engine.unlock());
+    },
+    say,
+    replayLast(): void {
+      say(lastResult !== null ? { kind: 'REPLAY', result: lastResult } : { kind: 'REPLAY_EMPTY' });
+    },
+    cancelAll(): void {
+      safely('cancelAll', cancelEverything);
+    },
+    onUtterance(handler: (e: UtteranceEvent) => void): () => void {
+      handlers.add(handler);
+      return () => {
+        handlers.delete(handler);
+      };
+    },
+  };
+}
+
+/** Bộ điều phối giọng nói thật (hẹn giờ của hệ thống). */
+export function createSpeechManager(o: SpeechManagerOptions): ISpeech {
+  return createSpeechManagerWithTimers(o, REAL_TIMERS);
+}
+</file>
+
+<file path="src/main.ts">
+/**
+ * Điểm vào của ứng dụng: dựng các bản cài THẬT rồi nối vào createApp. Không có logic nghiệp vụ ở đây.
+ * Thứ tự dựng: cài đặt → giao diện (cho thẻ video) → camera → suy luận → rung → giọng nói → app.
+ * Lớp debug chỉ bật khi có ?debug=1 hoặc khi dựng ở chế độ development (vite --mode development); bản release không có.
+ */
+import './ui/styles.css';
+import { createAriaLiveEngine } from './accessibility/aria-live-engine';
+import { createSettingsManager } from './accessibility/settings-manager';
+import { createFrameAnalyzer } from './analyzer/frame-analyzer';
+import { createApp } from './app/app';
+import type { App } from './app/app';
+import { createAppLifecyclePort } from './app/app-lifecycle-adapter';
+import { createNativeTorchPort } from './app/native-torch';
+import { createCameraService } from './camera/camera-controller';
+import { DEFAULT_CONFIG } from './config/app-config';
+import type { SettingAck } from './contracts';
+import { createDecisionEngine } from './decision/decision-engine';
+import { checkBundledAssets } from './offline/asset-check';
+import { createSettingsStore } from './offline/settings-store';
+import { createAppUi } from './ui/app-ui';
+import { createLogger } from './utils/logger';
+import { getPlatform } from './utils/platform';
+import { systemClock } from './utils/time';
+import { createInferenceClient } from './vision/inference-client';
+import { createAudioClipEngine } from './voice/audio-clip-engine';
+import { createHaptics } from './voice/haptic-service';
+import { createNativeTtsEngine } from './voice/native-tts-engine';
+import { createSpeechManager } from './voice/speech-manager';
+import { createWebSpeechEngine } from './voice/web-speech-engine';
+
+const log = createLogger('main');
+
+function bootstrap(): App {
+  const root = document.getElementById('app');
+  if (root === null) throw new Error('Thiếu phần tử #app trong index.html');
+  const config = DEFAULT_CONFIG;
+  const base = import.meta.env.BASE_URL; // './' (Vite base): mọi tài nguyên nằm sẵn trong APK
+  const debug = new URLSearchParams(window.location.search).get('debug') === '1' || import.meta.env.MODE === 'development';
+
+  // Lời xác nhận khi đổi cài đặt đi qua bộ nói; bộ nói được dựng sau cài đặt nên nối muộn.
+  let acknowledge: (what: SettingAck) => void = () => undefined;
+  const settings = createSettingsManager(createSettingsStore(), (what) => acknowledge(what));
+
+  const ui = createAppUi({ root, settings, debug, now: systemClock, onReplayGuide: () => speech.say({ kind: 'WELCOME' }) });
+  const torchPort = createNativeTorchPort();
+  const camera = createCameraService({ video: ui.video, fps: config.inference.targetFps, torchPort });
+  const inference = createInferenceClient({ modelBaseUrl: `${base}models/`, ortBaseUrl: `${base}ort/`, config: config.inference });
+  const haptics = createHaptics({ isEnabled: () => settings.get().vibrationEnabled });
+  const speech = createSpeechManager({
+    engines: [createNativeTtsEngine(), createWebSpeechEngine(), createAudioClipEngine({ baseUrl: base }), createAriaLiveEngine({ root })],
+    haptics,
+    getSettings: () => settings.get(),
+    config: config.speech,
+  });
+  acknowledge = (what) => speech.say({ kind: 'SETTING_ACK', what });
+
+  return createApp({
+    camera, inference, analyzer: createFrameAnalyzer(config), decision: createDecisionEngine(config.decision),
+    speech, haptics, settings, ui, torchPort, platform: getPlatform(), clock: systemClock,
+    assets: () => checkBundledAssets({ baseUrl: base }), lifecycle: createAppLifecyclePort(), config,
+  });
+}
+
+/** Lưới an toàn cuối cùng: nếu không dựng nổi giao diện thì vẫn phải có chữ (không để màn hình đen im lặng). */
+function showFatal(message: string): void {
+  const note = document.createElement('p');
+  note.setAttribute('role', 'alert');
+  note.style.cssText = 'margin:0;padding:1rem;color:#fff;font:700 1.5rem/1.4 system-ui,sans-serif';
+  note.textContent = message;
+  (document.getElementById('app') ?? document.body).replaceChildren(note);
+}
+
+try {
+  void bootstrap().start(); // không dispose ở pagehide: WebView đóng thì camera và worker tự dừng, còn dispose nhầm là tắt app vĩnh viễn
+} catch (e) {
+  log.error('Không dựng được ứng dụng', e);
+  showFatal('Không khởi động được ứng dụng. Hãy đóng ứng dụng rồi mở lại.');
+}
+</file>
+
+<file path="src/decision/decision-engine.ts">
+import type {
+  AppConfig, AppErrorCode, DecisionInput, DecisionOutput, DecisionStatus, Denomination, FrameAnalysis,
+  GuidanceCode, IDecisionEngine, RecognitionResult, SpeechIntent, SystemEvent,
+} from '../contracts';
+import { INITIAL_SNAPSHOT, phaseOf, transition } from './state-manager';
+import type { AnalysisTrigger, StateTrigger, TransitionResult } from './state-manager';
+import { calculateTotal } from './total-calculator';
+import type { TotalCalculation } from './total-calculator';
+
+/** Bộ nhớ ngắn hạn của việc quét. Xóa khi APP_FOREGROUNDED và reset(). */
+interface ShortTermMemory {
+  /** Chữ ký (mệnh giá từ trái sang phải) của kết quả đã công bố; null = chưa có hoặc tiền đã rời khung. */
+  announcedSignature: string | null;
+  /** `now` của khung đầu chuỗi khung trống hiện tại; null = đang không trống. */
+  emptySince: number | null;
+  /** `now` của khung đầu chuỗi khung chưa ổn định hiện tại; null = đang ổn định hoặc đã rẽ sang nhánh khác. */
+  unstableSince: number | null;
+  /** `now` lần cuối phát mỗi mã guidance (cooldown tính riêng theo từng mã). */
+  guidanceAt: Partial<Record<GuidanceCode, number>>;
+}
+
+/** Lý do chặn ở nhánh 5; vừa là DecisionStatus vừa là GuidanceCode. */
+type Block = 'PARTIAL_IN_FRAME' | 'BLUR' | 'LOW_LIGHT' | 'MULTI_NOT_ALLOWED';
+
+const freshMemory = (): ShortTermMemory => ({ announcedSignature: null, emptySince: null, unstableSince: null, guidanceAt: {} });
+
+/** Sao chép để module khác không sửa nhầm bản engine giữ: đọc lại phải y hệt lần đã đọc. */
+const cloneResult = (r: RecognitionResult): RecognitionResult => ({ ...r, denominations: [...r.denominations] });
+
+const guidanceReason = (speech: SpeechIntent | null): string => (speech === null ? 'GUIDANCE_COOLDOWN' : 'GUIDANCE_SPOKEN');
+
+/** calculateTotal nhưng không ném lỗi: null nếu danh sách chốt hỏng (rỗng hoặc có giá trị lạ). */
+function safeTotal(denominations: Denomination[]): TotalCalculation | null {
+  try {
+    return calculateTotal(denominations);
+  } catch {
+    return null;
+  }
+}
+
+/** Lời nói khi VÀO một trạng thái khởi động mới; null nếu trạng thái không đổi hoặc không có lời. */
+function entrySpeech(t: TransitionResult): SpeechIntent | null {
+  if (t.from === t.to) return null;
+  if (t.to === 'AWAITING_START') return { kind: 'WELCOME' };
+  if (t.to === 'WAITING_PERMISSION') return { kind: 'PERMISSION_PRIMER' };
+  if (t.to === 'READY') return { kind: 'CAMERA_READY' };
+  return null;
+}
+
+/**
+ * DecisionEngine (Module 6). XÁC ĐỊNH: cùng chuỗi đầu vào cho cùng chuỗi đầu ra; không đồng hồ, không DOM,
+ * không I/O; thời gian chỉ đến từ trường `now` của đầu vào. Fail Safe: result khác null (và shouldCalculateTotal)
+ * CHỈ xảy ra ở nhánh 7 của ANALYSIS, sau khi nhánh 1..6 đều đã loại trừ mọi nghi ngờ.
+ *
+ * Mã lý do (`reasons`) = [mã chính, ...mã phụ]:
+ * - SYSTEM hợp lệ: [tên sự kiện] + BOTH_READY | WAIT_CAMERA | WAIT_MODEL | MEMORY_CLEARED;
+ *   trái phép: ['ILLEGAL_TRANSITION', 'SỰ_KIỆN@TRẠNG_THÁI'] (bỏ qua, không đổi trạng thái).
+ * - FAILURE: ['FAILURE', mã lỗi] (+ DUPLICATE khi đang ERROR cùng mã: im lặng). USER_REPLAY: ['USER_REPLAY', HAS_RESULT | NO_RESULT].
+ * - ANALYSIS bị bỏ qua: ['ANALYSIS_IGNORED', ERROR_STATE | NOT_READY | BACKGROUNDED | SPEAKING] (+ SIGNATURE_RESET).
+ * - ANALYSIS nhánh 1..7: NO_DETECTIONS (+ SIGNATURE_RESET) · CONFLICT · OVERLAP · UNSURE_PRESENT + CAUSE_<mã> ·
+ *   BLOCKED_<PARTIAL_IN_FRAME | BLUR | LOW_LIGHT | MULTI_NOT_ALLOWED> · UNSTABLE (+ NO_CONSENSUS | TOTAL_FAILED) ·
+ *   ANTI_REPEAT · CONFIRMED; nhánh có lời hướng dẫn kèm GUIDANCE_SPOKEN | GUIDANCE_COOLDOWN | GUIDANCE_WAIT (chưa đủ thời gian chờ).
+ *
+ * ERROR là trạng thái cuối: mọi FAILURE dẫn tới đó; thoát bằng reset() rồi APP_STARTED.
+ * Trạng thái sau nhánh 4 và 5 đều là UNCERTAIN; sau anti-repeat là DETECTING.
+ */
+export function createDecisionEngine(config: AppConfig['decision']): IDecisionEngine {
+  let snapshot = INITIAL_SNAPSHOT;
+  let lastResult: RecognitionResult | null = null;
+  let memory = freshMemory();
+  let errorCode: AppErrorCode | null = null;
+
+  function apply(trigger: StateTrigger): TransitionResult {
+    const t = transition(snapshot, trigger);
+    snapshot = t.snapshot;
+    return t;
+  }
+
+  /** Dựng đầu ra. shouldCalculateTotal luôn đi cùng result: chỉ nhánh công bố mới truyền result. */
+  function outputOf(
+    reasons: string[],
+    speech: SpeechIntent | null = null,
+    status: DecisionStatus | null = null,
+    result: RecognitionResult | null = null,
+  ): DecisionOutput {
+    return { state: snapshot.state, status, reasons, speech, result, shouldCalculateTotal: result !== null };
+  }
+
+  function systemReasons(event: SystemEvent, t: TransitionResult): string[] {
+    const reasons: string[] = [event];
+    if (t.to === 'READY' && t.from !== 'READY') {
+      reasons.push('BOTH_READY');
+    } else if ((event === 'MODEL_READY' || event === 'CAMERA_READY') && phaseOf(t.to) === 'STARTUP') {
+      if (!snapshot.cameraReady) reasons.push('WAIT_CAMERA');
+      if (!snapshot.modelReady) reasons.push('WAIT_MODEL');
+    }
+    if (event === 'APP_FOREGROUNDED') reasons.push('MEMORY_CLEARED');
+    return reasons;
+  }
+
+  function onSystem(event: SystemEvent): DecisionOutput {
+    const t = apply(event);
+    if (!t.accepted) return outputOf([...t.reasons]);
+    if (event === 'APP_FOREGROUNDED') memory = freshMemory();
+    return outputOf(systemReasons(event, t), entrySpeech(t));
+  }
+
+  function onFailure(code: AppErrorCode): DecisionOutput {
+    apply('FAILURE'); // hợp lệ ở mọi trạng thái: ưu tiên cao nhất
+    if (errorCode === code) return outputOf(['FAILURE', code, 'DUPLICATE']);
+    errorCode = code;
+    return outputOf(['FAILURE', code], { kind: 'ERROR', code });
+  }
+
+  function onReplay(): DecisionOutput {
+    if (lastResult === null) return outputOf(['USER_REPLAY', 'NO_RESULT'], { kind: 'REPLAY_EMPTY' });
+    return outputOf(['USER_REPLAY', 'HAS_RESULT'], { kind: 'REPLAY', result: cloneResult(lastResult) });
+  }
+
+  /** Ghi nhận khung trống/không trống. Trả true nếu vừa xóa chữ ký đã công bố (tiền đã rời khung đủ lâu). */
+  function trackEmpty(a: FrameAnalysis, now: number): boolean {
+    if (a.detections.length > 0) {
+      memory.emptySince = null;
+      return false;
+    }
+    if (memory.emptySince === null) memory.emptySince = now;
+    if (a.emptyStreak < config.emptyFramesToReset || memory.announcedSignature === null) return false;
+    memory.announcedSignature = null;
+    return true;
+  }
+
+  /** Phát guidance nếu mã này đã qua cooldown (tính riêng từng mã); ngược lại null. */
+  function guide(code: GuidanceCode, now: number): SpeechIntent | null {
+    const last = memory.guidanceAt[code];
+    if (last !== undefined && now - last < config.guidanceCooldownMs) return null;
+    memory.guidanceAt[code] = now;
+    return { kind: 'GUIDANCE', code };
+  }
+
+  /** Nhánh 4: lời hướng dẫn hữu ích nhất cho khung còn tờ chưa chắc, xét theo thứ tự config.guidancePriority. */
+  function unsureGuidance(a: FrameAnalysis): GuidanceCode {
+    const active = new Set<GuidanceCode>(['LOW_CONFIDENCE']);
+    if (a.position.partial) active.add('PARTIAL_IN_FRAME');
+    if (a.position.tooSmall) active.add('TOO_FAR');
+    if (a.quality.lowLight) active.add('LOW_LIGHT');
+    if (a.quality.blurry) active.add('BLUR');
+    return config.guidancePriority.find((code) => active.has(code)) ?? 'LOW_CONFIDENCE';
+  }
+
+  /** Nhánh 5: khung chỉ có tờ chắc nhưng bị chặn theo cờ cấu hình; null nếu không bị chặn. */
+  function blockOf(a: FrameAnalysis, noteCount: number): Block | null {
+    if (a.position.partial && config.blockOnPartial) return 'PARTIAL_IN_FRAME';
+    if (a.quality.blurry && config.blockOnBlur) return 'BLUR';
+    if (a.quality.lowLight && config.blockOnLowLight) return 'LOW_LIGHT';
+    if (noteCount > 1 && config.multiNotePolicy === 'SINGLE_ONLY') return 'MULTI_NOT_ALLOWED';
+    return null;
+  }
+
+  /** Đầu ra của một nhánh KHÔNG công bố: đổi trạng thái theo `trigger`, ngắt chuỗi "chưa ổn định". */
+  function observe(trigger: AnalysisTrigger, status: DecisionStatus, reasons: string[], speech: SpeechIntent | null = null): DecisionOutput {
+    memory.unstableSince = null;
+    apply(trigger);
+    return outputOf(reasons, speech, status);
+  }
+
+  function onAnalysis(a: FrameAnalysis, now: number): DecisionOutput {
+    const phase = phaseOf(snapshot.state);
+    if (phase === 'ERROR') return outputOf(['ANALYSIS_IGNORED', 'ERROR_STATE']);
+    if (phase === 'STARTUP') return outputOf(['ANALYSIS_IGNORED', 'NOT_READY']);
+    if (snapshot.backgrounded) return outputOf(['ANALYSIS_IGNORED', 'BACKGROUNDED']);
+    const signatureReset = trackEmpty(a, now);
+    if (phase === 'SPEAKING') return outputOf(['ANALYSIS_IGNORED', 'SPEAKING', ...(signatureReset ? ['SIGNATURE_RESET'] : [])]);
+
+    // 1. Không có detection nào: NO_MONEY chỉ được nói sau khi trống liên tục đủ noMoneyGuidanceDelayMs.
+    if (a.detections.length === 0) {
+      const waited = memory.emptySince !== null && now - memory.emptySince >= config.noMoneyGuidanceDelayMs;
+      const speech = waited ? guide('NO_MONEY', now) : null;
+      const reasons = signatureReset ? ['NO_DETECTIONS', 'SIGNATURE_RESET'] : ['NO_DETECTIONS'];
+      reasons.push(waited ? guidanceReason(speech) : 'GUIDANCE_WAIT');
+      return observe('NO_MONEY_SEEN', 'NO_MONEY_CANDIDATE', reasons, speech);
+    }
+    // 2. Xung đột lớp.
+    if (a.conflict.detected) {
+      const speech = guide('CLASS_CONFLICT', now);
+      return observe('UNCERTAIN_SEEN', 'CLASS_CONFLICT', ['CONFLICT', guidanceReason(speech)], speech);
+    }
+    // 3. Chồng lấn.
+    if (a.overlap.detected) {
+      const speech = guide('OVERLAP', now);
+      return observe('OVERLAP_SEEN', 'OVERLAP', ['OVERLAP', guidanceReason(speech)], speech);
+    }
+    // 4. Còn tờ chưa chắc.
+    if (a.unsure.length > 0) {
+      const code = unsureGuidance(a);
+      const speech = guide(code, now);
+      return observe('UNCERTAIN_SEEN', 'LOW_CONFIDENCE', ['UNSURE_PRESENT', `CAUSE_${code}`, guidanceReason(speech)], speech);
+    }
+    // 5. Chỉ có tờ chắc nhưng bị chặn. Số tờ lấy số lớn hơn giữa detections và consensus để khung không nhất quán không lọt chính sách.
+    const consensus = a.stability.stable ? a.stability.consensus : null;
+    const block = blockOf(a, Math.max(a.detections.length, consensus?.length ?? 0));
+    if (block !== null) {
+      const speech = guide(block, now);
+      return observe('UNCERTAIN_SEEN', block, [`BLOCKED_${block}`, guidanceReason(speech)], speech);
+    }
+    // 6. Chưa ổn định (hoặc "ổn định" mà không có danh sách chốt dùng được): im lặng, quá unstableGuidanceMs thì HOLD_STEADY.
+    if (consensus === null || consensus.length === 0) {
+      if (memory.unstableSince === null) memory.unstableSince = now;
+      const waited = now - memory.unstableSince >= config.unstableGuidanceMs;
+      const speech = waited ? guide('HOLD_STEADY', now) : null;
+      apply('UNSTABLE_SEEN');
+      const reasons = a.stability.stable ? ['UNSTABLE', 'NO_CONSENSUS'] : ['UNSTABLE'];
+      return outputOf([...reasons, waited ? guidanceReason(speech) : 'GUIDANCE_WAIT'], speech, 'UNSTABLE');
+    }
+    // 7. Danh sách chốt: trùng chữ ký đã công bố thì im lặng (anti-repeat), ngược lại công bố kết quả mới.
+    const denominations = consensus.map((d) => d.denomination);
+    const signature = denominations.join(',');
+    const status = denominations.length === 1 ? 'CONFIDENT_SINGLE' : 'CONFIDENT_MULTI';
+    if (signature === memory.announcedSignature) return observe('STEADY_SEEN', status, ['ANTI_REPEAT']);
+    const total = safeTotal(denominations);
+    if (total === null) return observe('UNSTABLE_SEEN', 'UNSTABLE', ['UNSTABLE', 'TOTAL_FAILED']);
+
+    const published = apply('RESULT_PUBLISHED');
+    if (!published.accepted) return outputOf([...published.reasons]);
+    const result: RecognitionResult = {
+      status, count: total.count, denominations: total.denominations, total: total.total, formattedTotal: total.formattedTotal, timestamp: now,
+    };
+    memory.unstableSince = null;
+    memory.announcedSignature = signature;
+    lastResult = cloneResult(result);
+    return outputOf(['CONFIRMED'], { kind: 'RESULT', result }, status, result);
+  }
+
+  return {
+    get state() {
+      return snapshot.state;
+    },
+    get lastResult() {
+      return lastResult === null ? null : cloneResult(lastResult);
+    },
+    handle(input: DecisionInput): DecisionOutput {
+      switch (input.type) {
+        case 'FAILURE': return onFailure(input.code);
+        case 'SYSTEM': return onSystem(input.event);
+        case 'USER_REPLAY': return onReplay();
+        case 'ANALYSIS': return onAnalysis(input.analysis, input.now);
+        default: return outputOf(['UNKNOWN_INPUT']);
+      }
+    },
+    reset(): void {
+      snapshot = INITIAL_SNAPSHOT;
+      lastResult = null;
+      memory = freshMemory();
+      errorCode = null;
+    },
+  };
+}
+</file>
+
+<file path="src/vision/inference-worker.ts">
+import { DEFAULT_CONFIG } from '../config/app-config';
+import { buildClassMap } from '../config/denominations';
+import { AppError } from '../contracts';
+import type { WorkerRequest, WorkerResponse } from '../contracts';
+import { createLogger, setLogLevel } from '../utils/logger';
+import { createPreprocessor } from './image-processor';
+import { loadModel } from './model-manager';
+import type { LoadedModel } from './model-manager';
+import { createPostProcessor } from './post-processor';
+import { closeBitmap, createWorkerCore } from './worker-core';
+import type { WorkerCore } from './worker-core';
+
+/**
+ * File keo chạy TRONG Web Worker (F6): nhận WorkerRequest, trả WorkerResponse.
+ * Worker có bản logger riêng, mặc định production chỉ ghi warn nên sẽ giấu dòng chẩn đoán lúc khởi tạo
+ * (phiên bản WebView, crossOriginIsolated, backend...). Nâng lên info; log từng khung vẫn ở mức debug.
+ */
+setLogLevel(import.meta.env.DEV ? 'debug' : 'info');
+const log = createLogger('inference-worker');
+
+interface WorkerScope {
+  postMessage(message: WorkerResponse): void;
+  onmessage: ((event: MessageEvent<WorkerRequest>) => void) | null;
+}
+const scope = self as unknown as WorkerScope;
+
+let core: WorkerCore | null = null;
+let initPromise: Promise<WorkerResponse> | null = null;
+
+async function init(req: Extract<WorkerRequest, { type: 'INIT' }>): Promise<WorkerResponse> {
+  let model: LoadedModel | undefined;
+  try {
+    model = await loadModel({ baseUrl: req.modelBaseUrl, ortBaseUrl: req.ortBaseUrl, config: req.config });
+    const classMap = buildClassMap(model.classes);
+    // INIT không mang AppConfig['analyzer'] nên bề rộng ảnh xám lấy từ DEFAULT_CONFIG (xem "Đề xuất sửa hợp đồng").
+    const preprocessor = createPreprocessor({
+      inputSize: model.config.inputSize,
+      padValue: model.config.padValue,
+      grayThumbWidth: DEFAULT_CONFIG.analyzer.grayThumbWidth,
+    });
+    const postProcessor = createPostProcessor({ classMap, inference: req.config, layoutHint: model.config.outputLayout });
+    core = createWorkerCore({ model, preprocessor, postProcessor });
+    return { type: 'READY', info: model.info };
+  } catch (e) {
+    await model?.dispose().catch(() => undefined);
+    initPromise = null; // cho phép INIT lại
+    log.error('INIT thất bại', e);
+    return {
+      type: 'ERROR',
+      code: e instanceof AppError ? e.code : 'MODEL_INIT_FAILED',
+      message: e instanceof Error ? e.message : String(e),
+      fatal: true,
+    };
+  }
+}
+
+async function dispatch(req: WorkerRequest): Promise<WorkerResponse | null> {
+  if (req.type === 'INIT') {
+    initPromise ??= init(req);
+    return initPromise;
+  }
+  if (core) return core.handle(req);
+  if (req.type === 'INFER') {
+    closeBitmap(req.bitmap);
+    return { type: 'ERROR', code: 'INFERENCE_FAILED', message: 'Worker chưa nạp xong mô hình.', fatal: false, frameId: req.meta.frameId };
+  }
+  return null;
+}
+
+scope.onmessage = (event) => {
+  dispatch(event.data)
+    .then((response) => {
+      if (response) scope.postMessage(response);
+    })
+    .catch((e: unknown) => log.error('Xử lý yêu cầu lỗi', e));
+};
+</file>
+
+<file path="src/vision/inference-client.ts">
+import { AppError } from '../contracts';
+import type { AppConfig, CapturedFrame, IInferenceClient, InferenceResult, ModelInfo, WorkerRequest, WorkerResponse } from '../contracts';
+import { createLogger } from '../utils/logger';
+
+const log = createLogger('inference-client');
+
+/** Quá hạn này mà worker chưa báo READY thì khởi tạo bị coi là thất bại (đề bài P05: 30 giây). */
+const INIT_TIMEOUT_MS = 30_000;
+
+export interface InferenceClientOptions {
+  modelBaseUrl: string;
+  ortBaseUrl: string;
+  config: AppConfig['inference'];
+  workerFactory?: () => Worker;
+}
+
+interface Slot<T> { resolve(value: T): void; reject(error: AppError): void }
+interface InferSlot extends Slot<InferenceResult | null> { frameId: number }
+
+/**
+ * Worker hiểu URL tương đối theo vị trí file worker (bản build nằm trong assets/), không theo trang.
+ * Nên đổi sang URL tuyệt đối cùng nguồn (vẫn là file trong APK) ngay ở main thread, và luôn kết thúc bằng '/'.
+ */
+function toAbsoluteDir(path: string): string {
+  let url = path;
+  if (typeof document !== 'undefined') {
+    try {
+      url = new URL(path, document.baseURI).href;
+    } catch {
+      // giữ nguyên chuỗi gốc
+    }
+  }
+  return url.endsWith('/') ? url : `${url}/`;
+}
+
+function closeBitmap(bitmap: ImageBitmap): void {
+  try {
+    bitmap.close();
+  } catch (e) {
+    log.warn('Không đóng được bitmap', e);
+  }
+}
+
+/** Client mỏng trên main thread (F7): mọi việc nặng chạy trong inference-worker. Chỉ một yêu cầu infer bay cùng lúc. */
+export function createInferenceClient(o: InferenceClientOptions): IInferenceClient {
+  const makeWorker = o.workerFactory ?? (() => new Worker(new URL('./inference-worker.ts', import.meta.url), { type: 'module' }));
+  let worker: Worker | null = null;
+  let isReady = false;
+  let initPromise: Promise<ModelInfo> | null = null;
+  let initSlot: Slot<ModelInfo> | null = null;
+  let inferSlot: InferSlot | null = null;
+
+  /** Dừng worker và xử lý mọi lời hứa đang chờ: có reason thì reject, không có (dispose) thì infer trả null. */
+  function teardown(reason: AppError | null): void {
+    const w = worker;
+    const init = initSlot;
+    const run = inferSlot;
+    worker = null;
+    isReady = false;
+    initPromise = null;
+    initSlot = null;
+    inferSlot = null;
+    if (w) {
+      w.onmessage = null;
+      w.onerror = null;
+      w.onmessageerror = null;
+      w.terminate();
+    }
+    init?.reject(reason ?? new AppError('MODEL_INIT_FAILED', 'Bộ suy luận bị hủy khi đang khởi tạo.', true));
+    if (run) {
+      if (reason) run.reject(reason);
+      else run.resolve(null);
+    }
+  }
+
+  function settle(frameId: number, done: (slot: InferSlot) => void): void {
+    const slot = inferSlot;
+    if (!slot || slot.frameId !== frameId) {
+      log.warn(`Bỏ qua phản hồi lạc của khung ${frameId}`);
+      return;
+    }
+    inferSlot = null;
+    done(slot);
+  }
+
+  function onMessage(msg: WorkerResponse): void {
+    switch (msg.type) {
+      case 'READY': {
+        const slot = initSlot;
+        initSlot = null;
+        if (slot) {
+          isReady = true;
+          slot.resolve(msg.info);
+        }
+        break;
+      }
+      case 'RESULT':
+        settle(msg.result.meta.frameId, (s) => s.resolve(msg.result));
+        break;
+      case 'DROPPED':
+        settle(msg.frameId, (s) => s.resolve(null));
+        break;
+      case 'ERROR': {
+        const error = new AppError(msg.code, msg.message, msg.fatal);
+        if (initSlot || msg.fatal) teardown(error);
+        else if (msg.frameId === undefined) log.warn('Worker báo lỗi không kèm khung', msg.message);
+        else settle(msg.frameId, (s) => s.reject(error));
+        break;
+      }
+    }
+  }
+
+  function crash(what: string): void {
+    log.error('Worker suy luận chết bất ngờ', what);
+    const code = initSlot ? 'MODEL_INIT_FAILED' : 'INFERENCE_FAILED'; // chết lúc khởi tạo = khởi tạo thất bại
+    teardown(new AppError(code, `Worker suy luận dừng bất ngờ: ${what}`, true));
+  }
+
+  function init(): Promise<ModelInfo> {
+    if (initPromise) return initPromise;
+    initPromise = new Promise<ModelInfo>((resolve, reject) => {
+      const timer = setTimeout(
+        () => teardown(new AppError('MODEL_INIT_FAILED', `Khởi tạo mô hình quá ${INIT_TIMEOUT_MS / 1000} giây.`, true)),
+        INIT_TIMEOUT_MS,
+      );
+      initSlot = {
+        resolve: (info) => {
+          clearTimeout(timer);
+          resolve(info);
+        },
+        reject: (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      };
+      try {
+        const w = makeWorker();
+        worker = w;
+        w.onmessage = (ev: MessageEvent<WorkerResponse>) => onMessage(ev.data);
+        w.onerror = (ev: ErrorEvent) => crash(ev.message || 'lỗi không rõ');
+        w.onmessageerror = () => crash('không đọc được thông điệp');
+        const request: WorkerRequest = {
+          type: 'INIT',
+          modelBaseUrl: toAbsoluteDir(o.modelBaseUrl),
+          ortBaseUrl: toAbsoluteDir(o.ortBaseUrl),
+          config: o.config,
+        };
+        w.postMessage(request);
+      } catch (e) {
+        teardown(new AppError('MODEL_INIT_FAILED', 'Không tạo được Web Worker suy luận.', true, e));
+      }
+    });
+    return initPromise;
+  }
+
+  function infer(frame: CapturedFrame): Promise<InferenceResult | null> {
+    const w = worker;
+    if (!isReady || !w) {
+      closeBitmap(frame.bitmap);
+      return Promise.reject(new AppError('INFERENCE_FAILED', 'Bộ suy luận chưa sẵn sàng: cần gọi init() trước.'));
+    }
+    if (inferSlot) {
+      closeBitmap(frame.bitmap); // đang xử lý một khung: bỏ khung này
+      return Promise.resolve(null);
+    }
+    return new Promise<InferenceResult | null>((resolve, reject) => {
+      inferSlot = { frameId: frame.meta.frameId, resolve, reject };
+      const request: WorkerRequest = { type: 'INFER', meta: frame.meta, bitmap: frame.bitmap };
+      try {
+        w.postMessage(request, [frame.bitmap]); // chuyển quyền sở hữu bitmap sang worker; worker chịu trách nhiệm đóng
+      } catch (e) {
+        inferSlot = null;
+        closeBitmap(frame.bitmap);
+        reject(new AppError('INFERENCE_FAILED', 'Không gửi được khung hình sang worker.', false, e));
+      }
+    });
+  }
+
+  return {
+    get ready() {
+      return isReady;
+    },
+    init,
+    infer,
+    dispose: () => teardown(null),
+  };
+}
+</file>
+
+</files>

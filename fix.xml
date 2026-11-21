@@ -1,0 +1,1139 @@
+This file is a merged representation of a subset of the codebase, containing specifically included files, combined into a single document by Repomix.
+The content has been processed where content has been compressed (code blocks are separated by ⋮---- delimiter).
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of a subset of the repository's contents that is considered the most important context.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Only files matching these patterns are included: src/config/app-config.ts, src/decision/decision-engine.ts, src/analyzer/temporal-stabilizer.ts, src/analyzer/frame-analyzer.ts, src/voice/speech-manager.ts, src/app/app.ts, src/voice/prompt-manager.ts, src/voice/native-tts-engine.ts, native-tts-adapter.ts, src/vision/model-manager.ts, inference-client.ts, inference-worker.ts, src/main.ts, capacitor.config.ts, vite.config.ts, scripts/copy-ort-wasm.mjs
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Content has been compressed - code blocks are separated by ⋮---- delimiter
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+scripts/
+  copy-ort-wasm.mjs
+src/
+  analyzer/
+    frame-analyzer.ts
+    temporal-stabilizer.ts
+  app/
+    app.ts
+  config/
+    app-config.ts
+  decision/
+    decision-engine.ts
+  vision/
+    model-manager.ts
+  voice/
+    native-tts-engine.ts
+    prompt-manager.ts
+    speech-manager.ts
+  main.ts
+capacitor.config.ts
+vite.config.ts
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="scripts/copy-ort-wasm.mjs">
+// Chép runtime của onnxruntime-web (file .wasm và .mjs đi kèm, bản SIMD) vào public/ort/
+// để APK chứa sẵn và chạy offline. Bỏ biến thể jsep, webgpu, asyncify, jspi.
+// Chạy tự động ở postinstall, predev, prebuild.
+⋮----
+const mb = (bytes) =>
+⋮----
+// Xóa bản chép cũ để không sót file của phiên bản trước.
+</file>
+
+<file path="src/analyzer/temporal-stabilizer.ts">
+import type { AppConfig, BBox, Denomination, Detection, FrameAnalysis } from '../contracts';
+import { iou } from '../utils/geometry';
+import { mean } from '../utils/math';
+⋮----
+/** Cấu hình bộ ổn định, lấy từ config.analyzer.stabilizer. */
+export type StabilizerConfig = AppConfig['analyzer']['stabilizer'];
+⋮----
+/** Kết luận ổn định của một khung, đúng kiểu FrameAnalysis['stability']. */
+export type StabilityInfo = FrameAnalysis['stability'];
+⋮----
+/** Phần tối thiểu của một hộp để ghép giữa hai khung: mệnh giá và vị trí (pixel, khung gốc). */
+export type MatchableBox = Pick<Detection, 'denomination' | 'bbox'>;
+⋮----
+/** Một khung hình đưa vào bộ ổn định. */
+export interface StabilizerFrame {
+  /** Mốc thời gian chụp khung, mili-giây (FrameMeta.timestamp, cùng hệ quy chiếu performance.now()). */
+  timestamp: number;
+  /** Khung có hợp lệ để xét ổn định không (xem isFrameValid). */
+  valid: boolean;
+  /** Các detection CHẮC của khung, theo thứ tự trái → phải. */
+  sure: readonly Detection[];
+}
+⋮----
+/** Mốc thời gian chụp khung, mili-giây (FrameMeta.timestamp, cùng hệ quy chiếu performance.now()). */
+⋮----
+/** Khung có hợp lệ để xét ổn định không (xem isFrameValid). */
+⋮----
+/** Các detection CHẮC của khung, theo thứ tự trái → phải. */
+⋮----
+/** Bộ ổn định theo thời gian (Detection Tracker): giữ cửa sổ các khung gần nhất. */
+export interface TemporalStabilizer {
+  /** Ghi một khung mới vào cửa sổ rồi trả kết luận ổn định cho CHÍNH khung đó. */
+  push(frame: StabilizerFrame): StabilityInfo;
+  /** Xóa toàn bộ cửa sổ. */
+  reset(): void;
+}
+⋮----
+/** Ghi một khung mới vào cửa sổ rồi trả kết luận ổn định cho CHÍNH khung đó. */
+push(frame: StabilizerFrame): StabilityInfo;
+/** Xóa toàn bộ cửa sổ. */
+reset(): void;
+⋮----
+/** Bản chụp một hộp chắc của khung cũ: tách khỏi đối tượng của người gọi để họ sửa sau này cũng không làm hỏng cửa sổ. */
+interface TrackedBox {
+  readonly denomination: Denomination;
+  readonly confidence: number;
+  readonly bbox: BBox;
+}
+⋮----
+interface Entry {
+  readonly timestamp: number;
+  readonly valid: boolean;
+  readonly boxes: readonly TrackedBox[];
+}
+⋮----
+interface Agreeing {
+  readonly boxes: readonly TrackedBox[];
+  /** matchOf[i] = chỉ số trong `boxes` được ghép với hộp thứ i của khung mới nhất. */
+  readonly matchOf: readonly number[];
+}
+⋮----
+/** matchOf[i] = chỉ số trong `boxes` được ghép với hộp thứ i của khung mới nhất. */
+⋮----
+/**
+ * Khung HỢP LỆ để xét ổn định khi: có ít nhất một tờ chắc, KHÔNG có tờ chưa chắc,
+ * không chồng lấn và không xung đột lớp. Vị trí (quá nhỏ, chạm mép) và chất lượng ảnh (mờ, tối)
+ * không nằm trong điều kiện này: việc chặn theo chúng thuộc về bộ ra quyết định.
+ */
+export function isFrameValid(f: Pick<FrameAnalysis, 'sure' | 'unsure' | 'overlap' | 'conflict'>): boolean
+⋮----
+/**
+ * Ghép hộp của hai khung: mỗi hộp của `a` phải ghép được với ĐÚNG MỘT hộp của `b` (và ngược lại),
+ * cùng mệnh giá và IoU ≥ matchIou, ghép tham lam theo IoU giảm dần (hòa thì theo chỉ số nhỏ trước).
+ * Ghép đủ cặp kéo theo cùng số tờ và cùng đa tập mệnh giá nên không cần kiểm riêng.
+ * Hộp suy biến có IoU 0 nên không bao giờ ghép được.
+ *
+ * @param a Hộp của khung thứ nhất, pixel khung gốc.
+ * @param b Hộp của khung thứ hai, pixel khung gốc.
+ * @param matchIou Ngưỡng IoU, không đơn vị trong (0, 1] (config.analyzer.stabilizer.matchIou).
+ * @returns matchOf với matchOf[i] = chỉ số hộp của `b` ghép với a[i]; null nếu hai khung không đồng thuận.
+ */
+export function matchDetections(
+  a: readonly MatchableBox[],
+  b: readonly MatchableBox[],
+  matchIou: number,
+): number[] | null
+⋮----
+function assertValidConfig(c: StabilizerConfig): void
+⋮----
+function snapshotBox(d: Detection): TrackedBox
+⋮----
+function toEntry(frame: StabilizerFrame): Entry
+⋮----
+// Khung tự khai "hợp lệ" nhưng không có hộp chắc nào thì không thể làm bằng chứng ổn định.
+⋮----
+/** Detection của khung mới nhất, confidence = trung bình confidence của hộp được ghép ở mọi khung đồng thuận (kể cả chính nó). */
+function buildConsensus(latest: readonly Detection[], agreeing: readonly Agreeing[]): Detection[]
+⋮----
+/**
+ * Tạo bộ ổn định theo thời gian.
+ *
+ * Cửa sổ giữ tối đa windowSize khung gần nhất (kể cả khung không hợp lệ). Mỗi lần push:
+ * 1. Bỏ các mục cũ hơn maxAgeMs (mili-giây) so với mốc thời gian của khung hiện tại; mục có mốc SAU khung hiện tại
+ *    (đồng hồ lùi) hoặc mốc không xác định (NaN) cũng bị bỏ, để bằng chứng cũ không sống sót qua một lần lùi đồng hồ.
+ * 2. Thêm khung hiện tại rồi cắt còn windowSize mục mới nhất.
+ * 3. Kết luận (Fail Safe): stable chỉ có thể true khi CHÍNH khung hiện tại hợp lệ. Khi đó
+ *    agree = 1 + số khung hợp lệ khác trong cửa sổ ĐỒNG THUẬN với khung hiện tại (xem matchDetections);
+ *    stable = agree ≥ minAgree. Khung hiện tại không hợp lệ cho stable false, agree 0.
+ * 4. consensus chỉ khác null khi stable: các Detection (bản sao) của khung hiện tại, trái → phải,
+ *    với confidence là trung bình mọi khung đồng thuận.
+ * `window` trong kết quả luôn bằng windowSize (sức chứa), không phải số mục đang có.
+ *
+ * Bộ ổn định chụp lại dữ liệu hộp khi push nên người gọi sửa Detection sau đó không ảnh hưởng cửa sổ.
+ * Ném RangeError nếu cấu hình không hợp lệ (windowSize, minAgree nguyên và 1 ≤ minAgree ≤ windowSize; 0 < matchIou ≤ 1; maxAgeMs ≥ 0).
+ *
+ * @param config config.analyzer.stabilizer: windowSize (khung), minAgree (khung), matchIou (không đơn vị), maxAgeMs (mili-giây).
+ */
+export function createTemporalStabilizer(config: StabilizerConfig): TemporalStabilizer
+⋮----
+function push(frame: StabilizerFrame): StabilityInfo
+⋮----
+function reset(): void
+</file>
+
+<file path="src/voice/prompt-manager.ts">
+import { isDenomination } from '../config/denominations';
+import type {
+  AppErrorCode,
+  Denomination,
+  GuidanceCode,
+  RecognitionResult,
+  SettingAck,
+  Settings,
+  SpeechIntent,
+} from '../contracts';
+import { denominationToSpeech, moneyToSpeech, numberToVietnameseWords } from './vietnamese-number';
+⋮----
+/** Mức ưu tiên của câu nói. Số lớn hơn thì được nói trước và được phép ngắt số nhỏ hơn. */
+⋮----
+export type SpeechPriority = 0 | 1 | 2 | 3;
+⋮----
+/** Khóa các file âm thanh ghi sẵn trong public/audio (mỗi khóa ứng với đúng một câu cố định). */
+⋮----
+export type AudioKey = (typeof AUDIO_KEYS)[number];
+⋮----
+export interface Prompt {
+  /** Câu sẽ đọc: tiếng Việt, viết hoa chữ đầu, số đã đọc thành chữ, mỗi câu kết thúc bằng dấu câu. */
+  text: string;
+  /** Khóa file mp3 ghi sẵn; chỉ có ở câu cố định có thu âm. */
+  audioKey?: AudioKey;
+  priority: SpeechPriority;
+  /** Mục mới có cùng supersedeKey sẽ thay mục đang chờ trong hàng đợi. */
+  supersedeKey: string;
+}
+⋮----
+/** Câu sẽ đọc: tiếng Việt, viết hoa chữ đầu, số đã đọc thành chữ, mỗi câu kết thúc bằng dấu câu. */
+⋮----
+/** Khóa file mp3 ghi sẵn; chỉ có ở câu cố định có thu âm. */
+⋮----
+/** Mục mới có cùng supersedeKey sẽ thay mục đang chờ trong hàng đợi. */
+⋮----
+/* ───── Câu cố định (khớp từng chữ với đặc tả) ───── */
+⋮----
+// Đây là LỜI HƯỚNG DẪN, KHÔNG khẳng định tiền đang bị gấp.
+⋮----
+/** Mỗi mã lỗi một câu nêu việc cần làm. */
+⋮----
+/** Chỉ ba câu lỗi có thu âm sẵn (nội dung mp3 phải khớp câu tương ứng ở trên). */
+⋮----
+/** Các xác nhận cùng một cài đặt dùng chung khóa thay thế: xác nhận mới thay xác nhận cũ đang chờ. */
+⋮----
+/* ───── Hàm phụ ───── */
+⋮----
+/** Tra bảng câu; thiếu thì ném lỗi để KHÔNG BAO GIỜ đọc ra chữ "undefined". */
+function lookup<K extends string>(table: Readonly<Record<K, string>>, key: K, what: string): string
+⋮----
+function capitalize(text: string): string
+⋮----
+/** Câu một mệnh đề: viết hoa chữ đầu và thêm dấu chấm cuối. */
+function sentence(text: string): string
+⋮----
+function makePrompt(text: string, priority: SpeechPriority, supersedeKey: string, audioKey?: AudioKey): Prompt
+⋮----
+/**
+ * Kiểm tra kết quả nhất quán trước khi đọc: có tờ tiền, count khớp số mệnh giá, total khớp tổng các mệnh giá,
+ * mọi mệnh giá hợp lệ. Sai một chỗ là ném RangeError (Fail Safe: thà không đọc còn hơn đọc sai số tiền).
+ */
+function assertConsistent(result: RecognitionResult): void
+⋮----
+interface DenominationGroup {
+  denomination: Denomination;
+  count: number;
+}
+⋮----
+/** Nhóm các tờ cùng mệnh giá, theo thứ tự xuất hiện đầu tiên từ trái sang phải. */
+function groupByDenomination(denominations: readonly Denomination[]): DenominationGroup[]
+⋮----
+/** Dựng câu đọc kết quả theo độ chi tiết. Dùng chung cho RESULT và REPLAY. */
+function buildResultText(result: RecognitionResult, verbosity: Settings['verbosity']): string
+⋮----
+/**
+ * Dựng câu nói cho một ý định nói.
+ * Ném RangeError khi dữ liệu không đủ tin cậy để đọc (kết quả không nhất quán, mã không có câu);
+ * nơi gọi phải bắt lỗi và KHÔNG đọc gì thay vì đoán.
+ */
+export function buildPrompt(intent: SpeechIntent, settings: Pick<Settings, 'verbosity'>): Prompt
+</file>
+
+<file path="capacitor.config.ts">
+import type { CapacitorConfig } from '@capacitor/cli';
+</file>
+
+<file path="vite.config.ts">
+import { defineConfig } from 'vitest/config';
+⋮----
+/** Header cross-origin isolation: CHỈ để thử onnxruntime-web đa luồng trên máy tính (dev/preview). */
+⋮----
+base: './', // bắt buộc cho Android WebView: mọi đường dẫn tài nguyên là tương đối
+⋮----
+assetsInlineLimit: 0, // không nhúng tài nguyên vào JS: model/wasm/âm thanh luôn là file riêng
+⋮----
+environment: 'node', // file nào cần DOM thì khai báo: // @vitest-environment happy-dom
+</file>
+
+<file path="src/analyzer/frame-analyzer.ts">
+import type { AppConfig, Detection, FrameAnalysis, IFrameAnalyzer, InferenceResult } from '../contracts';
+import { center } from '../utils/geometry';
+import { measureBlur } from './blur-detector';
+import { measureBrightness } from './brightness-analyzer';
+import { splitByConfidence } from './confidence-analyzer';
+import { detectClassConflict } from './conflict-detector';
+import { detectOverlap } from './overlap-detector';
+import { analyzePosition } from './position-analyzer';
+import { createTemporalStabilizer, isFrameValid } from './temporal-stabilizer';
+⋮----
+/** Sắp từ trái sang phải (tâm x tăng dần, hòa thì theo tâm y), ổn định. Trả mảng mới, không sửa đầu vào. */
+function sortLeftToRight(detections: readonly Detection[]): Detection[]
+⋮----
+/**
+ * Tạo bộ phân tích khung hình. Chỉ MÔ TẢ khung hình (chắc hay không, chồng lấn, xung đột, vị trí, mờ, tối, ổn định),
+ * tuyệt đối không quyết định đọc hay không, không nói, không tính tổng.
+ *
+ * Mỗi lần analyze: sắp detection trái → phải, tách sure/unsure (A1), rồi chạy A2 đến A6 trên mọi detection có
+ * độ tin cậy ≥ confLow (cả chắc lẫn chưa chắc), cuối cùng đưa khung vào bộ ổn định (A7).
+ * Ngưỡng: confLow, confSure lấy từ config.inference; mọi ngưỡng còn lại từ config.analyzer. Không có hằng số ma thuật.
+ * Trạng thái duy nhất giữ lại giữa các khung: cửa sổ của bộ ổn định và emptyStreak.
+ * Không sửa InferenceResult đầu vào; kết quả dùng mảng mới (các đối tượng Detection được dùng chung với đầu vào).
+ * Ném RangeError nếu config.analyzer.stabilizer không hợp lệ (xem createTemporalStabilizer).
+ *
+ * @param config Cấu hình ứng dụng (DEFAULT_CONFIG hoặc bản đã hiệu chỉnh).
+ */
+export function createFrameAnalyzer(config: AppConfig): IFrameAnalyzer
+⋮----
+/** Phân tích một kết quả suy luận; meta.timestamp (mili-giây) là mốc thời gian cho cửa sổ ổn định. */
+function analyze(r: InferenceResult): FrameAnalysis
+⋮----
+/** Xóa cửa sổ ổn định và đưa emptyStreak về 0 (ví dụ khi camera tạm dừng rồi chạy lại). */
+function reset(): void
+</file>
+
+<file path="src/app/app.ts">
+/**
+ * Bộ ráp ứng dụng (P11): nối camera → suy luận → phân tích → quyết định → giọng nói thành một vòng chạy liên tục,
+ * cùng vòng đời app, nút Back, đèn pin và các màn hình. File này CHỈ NỐI DÂY:
+ * - mọi quyết định "đọc hay không đọc" là của DecisionEngine; app chỉ chuyển đầu vào và phát lại đầu ra;
+ * - mọi việc chạm DOM hay plugin nằm sau hai cổng nhỏ (AppUi, AppLifecyclePort) hoặc các interface của Khối B,
+ *   nên chạy được trong Node với đồ giả. Không import lớp cụ thể của module khác.
+ *
+ * Mọi lời nói đều đi ra từ DecisionOutput.speech (kể cả WELCOME, PERMISSION_PRIMER, CAMERA_READY do engine phát
+ * khi vào trạng thái khởi động). Ngoại lệ có chủ đích: lỗi giọng tiếng Việt, xác nhận đèn không hỗ trợ.
+ */
+import { DEFAULT_CONFIG } from '../config/app-config';
+import { AppError } from '../contracts';
+import type {
+  AppConfig, AppErrorCode, AppState, CameraStatus, CapturedFrame, DecisionOutput, DecisionStatus, Detection, FrameMeta,
+  ICameraService, IDecisionEngine, IFrameAnalyzer, IHaptics, IInferenceClient, InferenceResult, InferenceTimings,
+  ISpeech, ITorchPort, Platform, RecognitionResult, Settings, SystemEvent, TtsCapabilities, UtteranceEvent,
+} from '../contracts';
+import { createLogger } from '../utils/logger';
+import { mean } from '../utils/math';
+import type { Clock } from '../utils/time';
+⋮----
+/** Số mili-giây trong một giây (đổi fps sang khoảng cách lấy mẫu). */
+⋮----
+/**
+ * Nhịp thích ứng (mục 9): khi độ trễ trung bình của `window` khung gần nhất vượt `latencyFactor` lần khoảng cách
+ * lấy mẫu thì hạ fps `step` bậc, không thấp hơn `minFps`. AppConfig chưa có các tham số này nên tạm đặt ở đây
+ * (xem "Đề xuất sửa hợp đồng").
+ */
+⋮----
+/** Số khung liên tiếp suy luận lỗi (không nghiêm trọng) thì coi là INFERENCE_FAILED. Cũng nên nằm trong AppConfig. */
+⋮----
+/** Mã lỗi dùng khi khởi động hỏng vì một ngoại lệ không lường trước (không phải AppError). */
+⋮----
+/* ───── Cổng và kiểu của app ───── */
+⋮----
+/** Màn hình đang hiện: nút Back và việc tạm dừng quét phụ thuộc vào đây. */
+export type AppScreen = 'camera' | 'settings' | 'error';
+⋮----
+/** Thao tác của người dùng do lớp giao diện báo lên (nút hoặc cử chỉ). */
+export type UiAction = 'REPLAY' | 'TOGGLE_TORCH' | 'OPEN_SETTINGS' | 'CLOSE_SETTINGS' | 'RETRY';
+⋮----
+/** Số liệu của khung vừa xử lý, dùng cho lớp debug. KHÔNG chứa ảnh (Privacy First). */
+export interface ScanFrameView {
+  meta: FrameMeta;
+  detections: readonly Detection[];
+  timings: InferenceTimings;
+  /** Từ lúc nhận khung đến lúc quyết định xong (mili-giây). */
+  latencyMs: number;
+  /** Tốc độ lấy mẫu đang đặt cho camera (khung/giây). */
+  samplingFps: number;
+}
+⋮----
+/** Từ lúc nhận khung đến lúc quyết định xong (mili-giây). */
+⋮----
+/** Tốc độ lấy mẫu đang đặt cho camera (khung/giây). */
+⋮----
+/** Dữ liệu để vẽ vùng trạng thái chữ to và lớp debug; được đẩy sau mỗi khung và mỗi lần đổi trạng thái. */
+export interface AppView {
+  state: AppState;
+  status: DecisionStatus | null;
+  reasons: readonly string[];
+  /** Kết quả đã công bố gần nhất (để hiện chữ to); null nếu chưa có. */
+  result: RecognitionResult | null;
+  /** null khi cập nhật không đến từ một khung hình (sự kiện hệ thống). */
+  frame: ScanFrameView | null;
+}
+⋮----
+/** Kết quả đã công bố gần nhất (để hiện chữ to); null nếu chưa có. */
+⋮----
+/** null khi cập nhật không đến từ một khung hình (sự kiện hệ thống). */
+⋮----
+/** Cổng giao diện: app chỉ gọi các hàm này, không chạm DOM. Bản thật nằm ở src/ui (kèm accessibility-manager). */
+export interface AppUi {
+  /** Hiện cổng khởi động; lớp giao diện gọi unlock() RỒI onStart() ngay trong sự kiện kích hoạt. */
+  showStartGate(o: { unlock: () => void; onStart: () => void }): void;
+  hideStartGate(): void;
+  showCamera(): void;
+  showSettings(): void;
+  showError(e: { code: AppErrorCode; detail?: string }): void;
+  render(view: AppView): void;
+  /** Trạng thái nút đèn: có hỗ trợ không, đang bật không (phản ánh đèn THẬT). */
+  setTorch(t: { supported: boolean; on: boolean }): void;
+  onAction(handler: (a: UiAction) => void): () => void;
+}
+⋮----
+/** Hiện cổng khởi động; lớp giao diện gọi unlock() RỒI onStart() ngay trong sự kiện kích hoạt. */
+showStartGate(o:
+hideStartGate(): void;
+showCamera(): void;
+showSettings(): void;
+showError(e:
+render(view: AppView): void;
+/** Trạng thái nút đèn: có hỗ trợ không, đang bật không (phản ánh đèn THẬT). */
+setTorch(t:
+onAction(handler: (a: UiAction)
+⋮----
+/** Cổng vòng đời: hợp nhất visibilitychange và appStateChange của Capacitor, cộng nút Back của Android. */
+export interface AppLifecyclePort {
+  /** handler(true) khi app hiện, handler(false) khi ẩn. Hai nguồn có thể báo trùng: người nhận phải chịu được. */
+  onVisibilityChange(handler: (visible: boolean) => void): () => void;
+  onBackButton(handler: () => void): () => void;
+  /** Thu nhỏ app, không thoát hẳn. Ngoài Android thì không làm gì. */
+  minimize(): Promise<void>;
+}
+⋮----
+/** handler(true) khi app hiện, handler(false) khi ẩn. Hai nguồn có thể báo trùng: người nhận phải chịu được. */
+onVisibilityChange(handler: (visible: boolean)
+onBackButton(handler: ()
+/** Thu nhỏ app, không thoát hẳn. Ngoài Android thì không làm gì. */
+minimize(): Promise<void>;
+⋮----
+/** Phần của settings-manager (P10) mà app dùng. */
+export interface AppSettings {
+  load(): Promise<Settings>;
+  get(): Settings;
+  set(p: Partial<Settings>): Promise<Settings>;
+  subscribe(h: (s: Settings) => void): () => void;
+}
+⋮----
+load(): Promise<Settings>;
+get(): Settings;
+set(p: Partial<Settings>): Promise<Settings>;
+subscribe(h: (s: Settings)
+⋮----
+/** Kết quả kiểm tra gói tài nguyên, đúng với kiểu trả về của checkBundledAssets (P09). */
+export interface AssetCheck {
+  ok: boolean;
+  missing: string[];
+  warnings: string[];
+  error?: AppError;
+}
+⋮----
+export interface AppDeps {
+  camera: ICameraService;
+  inference: IInferenceClient;
+  analyzer: IFrameAnalyzer;
+  decision: IDecisionEngine;
+  speech: ISpeech;
+  haptics: IHaptics;
+  settings: AppSettings;
+  /** Thường là () => checkBundledAssets({ baseUrl }). */
+  assets: () => Promise<AssetCheck>;
+  /** Cổng đèn native (dự phòng); app dùng nó để chắc chắn đèn tắt khi dừng. Camera đã nhận cùng cổng này khi dựng. */
+  torchPort?: ITorchPort;
+  platform: Platform;
+  clock: Clock;
+  /** Mở rộng so với danh sách trong đề: app cần cổng giao diện và cổng vòng đời để không chạm DOM/plugin. */
+  ui: AppUi;
+  lifecycle: AppLifecyclePort;
+  /** Mặc định DEFAULT_CONFIG. */
+  config?: AppConfig;
+}
+⋮----
+/** Thường là () => checkBundledAssets({ baseUrl }). */
+⋮----
+/** Cổng đèn native (dự phòng); app dùng nó để chắc chắn đèn tắt khi dừng. Camera đã nhận cùng cổng này khi dựng. */
+⋮----
+/** Mở rộng so với danh sách trong đề: app cần cổng giao diện và cổng vòng đời để không chạm DOM/plugin. */
+⋮----
+/** Mặc định DEFAULT_CONFIG. */
+⋮----
+export interface App {
+  /** Chạy toàn bộ trình tự khởi động. Không bao giờ ném lỗi: lỗi được báo bằng giọng nói và màn hình lỗi. */
+  start(): Promise<void>;
+  dispose(): void;
+}
+⋮----
+/** Chạy toàn bộ trình tự khởi động. Không bao giờ ném lỗi: lỗi được báo bằng giọng nói và màn hình lỗi. */
+start(): Promise<void>;
+dispose(): void;
+⋮----
+/* ───── Hàm phụ thuần ───── */
+⋮----
+const codeOf = (e: unknown, fallback: AppErrorCode): AppErrorCode =>
+⋮----
+/** Chạy fn trong một Promise để lỗi ném đồng bộ cũng thành lời từ chối. */
+function attempt<T>(fn: () => Promise<T>): Promise<T>
+⋮----
+function discard(frame: CapturedFrame): void
+⋮----
+export function createApp(deps: AppDeps): App
+⋮----
+const permanent: Array<() => void> = []; // listener sống suốt đời app; dispose gỡ hết
+⋮----
+let frameOff: (() => void) | null = null; // chỉ có khi đang quét
+⋮----
+let runId = 0; // tăng mỗi lần start/dispose: kết quả bất đồng bộ của lượt cũ bị bỏ
+⋮----
+let cameraUp = false; // camera.start() đã xong trong lượt này
+let scanning = false; // camera đang chạy theo ý app (đối chiếu với pause/resume)
+⋮----
+const stale = (run: number): boolean =>
+const halted = (run: number): boolean =>
+⋮----
+function safely(label: string, fn: () => void): void
+⋮----
+/* ───── Kênh ra: lời nói và giao diện ───── */
+⋮----
+function publish(out: DecisionOutput, frame: ScanFrameView | null): void
+⋮----
+/** Gửi sự kiện hệ thống cho engine, phát lại lời nói (trừ khi giữ lại) và cập nhật giao diện. */
+function send(event: SystemEvent, holdSpeech = false): DecisionOutput
+⋮----
+function renderTorch(): void
+⋮----
+/* ───── Dừng và báo lỗi ───── */
+⋮----
+function haltScanning(): void
+⋮----
+torchOn = false; // dừng camera là đèn tắt
+⋮----
+/** Lỗi nghiêm trọng: dừng quét, gửi FAILURE, nói ERROR bằng giọng VÀ hiện màn hình lỗi (không để màn hình đen im lặng). */
+function fail(code: AppErrorCode, cause?: unknown): void
+⋮----
+/* ───── Vòng quét ───── */
+⋮----
+/** Hạ fps một bậc khi độ trễ trung bình quá lớn so với khoảng cách lấy mẫu. */
+function trackLatency(ms: number): void
+⋮----
+function onInferenceError(e: unknown): void
+⋮----
+async function onFrame(frame: CapturedFrame): Promise<void>
+⋮----
+if (!scanning) return discard(frame); // khung đến muộn sau khi tạm dừng: bên nhận phải đóng bitmap
+⋮----
+inferenceFailures = 0; // infer trả lời được (kể cả null) nghĩa là bộ suy luận còn sống
+if (result === null) return; // khung bị bỏ: không phân tích
+⋮----
+function startLoop(): void
+⋮----
+/** Đưa camera về đúng trạng thái app muốn: chạy khi đang hiện, ở màn camera; ngược lại tạm dừng. */
+function syncCamera(): void
+⋮----
+/* ───── Trình tự khởi động ───── */
+⋮----
+async function checkAssets(): Promise<AssetCheck>
+⋮----
+async function loadSettings(): Promise<void>
+⋮----
+// Đèn luôn tắt khi mở app (app không tự bật đèn): đưa giá trị đã lưu về đúng thực tế, lúc giọng nói chưa sẵn sàng.
+⋮----
+async function initSpeech(): Promise<TtsCapabilities>
+⋮----
+/** Đổi cách đọc (giọng app / trình đọc màn hình) thì phải chọn lại engine. */
+function onSettings(s: Settings): void
+⋮----
+function waitForGate(): Promise<void>
+⋮----
+unlock: () => safely('speech.unlock', () => speech.unlock()), // trong chính sự kiện kích hoạt
+⋮----
+function onCameraStarted(): void
+⋮----
+/** Quyền camera: engine nói PERMISSION_PRIMER khi nhận PERMISSION_REQUESTED, rồi mới mở camera; mô hình nạp song song. */
+async function begin(run: number): Promise<void>
+⋮----
+async function boot(run: number): Promise<void>
+⋮----
+// 1. Boot: kiểm tra gói, nạp cài đặt, chọn engine giọng nói (cần có trước khi nói được lỗi).
+⋮----
+const welcome = send('APP_STARTED', true); // lời chào chỉ được nói SAU khi giọng nói đã được mở khóa
+⋮----
+// 2. Bắt đầu: cần một lần chạm nếu engine đòi, hoặc nếu người dùng tắt "Tự bật camera".
+⋮----
+if (!caps.vietnameseVoice) speech.say({ kind: 'ERROR', code: 'TTS_NO_VIETNAMESE_VOICE' }); // vẫn chạy, qua engine dự phòng
+⋮----
+// 3. Camera và mô hình.
+⋮----
+async function start(): Promise<void>
+⋮----
+/** Thử lại sau lỗi: làm lại từ đầu (không hiện lại cổng vì người dùng vừa chạm). */
+async function retry(): Promise<void>
+⋮----
+/* ───── Thao tác người dùng ───── */
+⋮----
+function replay(): void
+⋮----
+/** Đèn chỉ đổi khi người dùng bấm nút hoặc giữ màn hình; không được thì nói TORCH_UNSUPPORTED. */
+async function toggleTorch(): Promise<void>
+⋮----
+await settings.set({ torchEnabled: next }); // settings-manager lưu rồi nói TORCH_ON / TORCH_OFF
+⋮----
+function openSettings(): void
+⋮----
+syncCamera(); // đang chỉnh cài đặt thì không quét: lời xác nhận không bị hướng dẫn chen ngang
+⋮----
+function closeSettings(): void
+⋮----
+function onAction(a: UiAction): void
+⋮----
+/* ───── Vòng đời, nút Back, trạng thái camera, lời nói ───── */
+⋮----
+/** Hai nguồn (visibilitychange, appStateChange) có thể báo trùng: chỉ hành động khi trạng thái thật sự đổi. */
+function onVisibility(visible: boolean): void
+⋮----
+analyzer.reset(); // cửa sổ ổn định cũ không còn đúng sau khi camera tạm dừng
+⋮----
+if (scanning) haptics.play('START'); // báo bằng rung: quét đã tiếp tục (việc tiếp tục không có lời nói)
+⋮----
+function onBack(): void
+⋮----
+/** Lỗi camera giữa chừng (mất camera, không mở lại được) cũng phải báo, không để màn hình đen im lặng. */
+function onCameraStatus(status: CameraStatus, error?: AppError): void
+⋮----
+/** RESULT_SPEECH_ENDED chỉ gửi khi một câu RESULT hoặc REPLAY vừa đọc xong. */
+function onUtterance(e: UtteranceEvent): void
+⋮----
+function bind(): void
+⋮----
+if (platform === 'android-native') permanent.push(lifecycle.onBackButton(onBack)); // Back chỉ có trên Android
+⋮----
+function dispose(): void
+⋮----
+pendingGate?.(); // start() đang chờ cổng thì được thả ra rồi tự thoát
+</file>
+
+<file path="src/config/app-config.ts">
+import type { AppConfig, Settings } from '../contracts';
+⋮----
+/** Mọi ngưỡng ở đây là điểm xuất phát để thử nghiệm, chưa phải giá trị đã được chứng minh. */
+⋮----
+blurThreshold: 60,   // phương sai Laplacian: PHẢI hiệu chỉnh trên điện thoại thật
+lowLightMean: 60,    // độ sáng trung bình 0..255
+</file>
+
+<file path="src/vision/model-manager.ts">
+import { AppError } from '../contracts';
+import type { AppConfig, ClassesJson, ModelConfigJson, ModelInfo, ModelManifest, RawModelOutput } from '../contracts';
+import { createLogger } from '../utils/logger';
+import { systemClock } from '../utils/time';
+import type { Clock } from '../utils/time';
+import type { InferenceSession } from 'onnxruntime-web/wasm';
+⋮----
+/**
+ * Nạp và chạy mô hình ONNX bằng onnxruntime-web. Thuần logic, không phụ thuộc trình duyệt nên chạy được
+ * trong Worker lẫn Node; fetch, ORT và thông tin môi trường đều nhận qua tham số để test bằng đồ giả.
+ */
+⋮----
+/** Số luồng WASM tối đa khi trang được cô lập đa nguồn gốc (crossOriginIsolated). */
+⋮----
+type Backend = ModelInfo['backend'];
+⋮----
+/** Phần của onnxruntime-web mà module này dùng; đồ giả trong test chỉ cần thỏa cấu trúc này. */
+export type OrtModule = Pick<typeof import('onnxruntime-web/wasm'), 'env' | 'InferenceSession' | 'Tensor'>;
+/** Phần của Response mà module cần; fetch thật thỏa cấu trúc này. */
+export interface FetchResponseLike { ok: boolean; status: number; json(): Promise<unknown>; arrayBuffer(): Promise<ArrayBuffer> }
+export type FetchLike = (url: string) => Promise<FetchResponseLike>;
+/** Thông tin môi trường chạy, đọc từ globalThis (test tiêm giá trị giả). */
+export interface RuntimeEnv { crossOriginIsolated: boolean; hardwareConcurrency: number; hasWebGpu: boolean; userAgent: string }
+⋮----
+export interface LoadModelOptions {
+  baseUrl: string;
+  ortBaseUrl: string;
+  config: AppConfig['inference'];
+  fetchFn?: FetchLike;
+  /** Nạp ORT theo backend; mặc định import động onnxruntime-web/wasm hoặc onnxruntime-web/webgpu. */
+  ortLoader?: (backend: Backend) => Promise<OrtModule>;
+  runtime?: RuntimeEnv;
+  now?: Clock;
+}
+⋮----
+/** Nạp ORT theo backend; mặc định import động onnxruntime-web/wasm hoặc onnxruntime-web/webgpu. */
+⋮----
+/** Phần worker-core cần của một mô hình đã nạp. */
+export interface ModelRunner {
+  readonly info: ModelInfo;
+  predict(tensor: Float32Array): Promise<RawModelOutput>;
+  dispose(): Promise<void>;
+}
+⋮----
+predict(tensor: Float32Array): Promise<RawModelOutput>;
+dispose(): Promise<void>;
+⋮----
+export interface LoadedModel extends ModelRunner {
+  readonly manifest: ModelManifest;
+  readonly config: ModelConfigJson;
+  /** Nguyên văn classes.json; giá trị được kiểm bằng buildClassMap ở nơi dùng. */
+  readonly classes: ClassesJson;
+}
+⋮----
+/** Nguyên văn classes.json; giá trị được kiểm bằng buildClassMap ở nơi dùng. */
+⋮----
+const withSlash = (url: string): string =>
+const fileName = (url: string): string =>
+const isRecord = (v: unknown): v is Record<string, unknown> =>
+const isClasses = (v: unknown): v is ClassesJson =>
+const isModelConfig = (v: unknown): v is ModelConfigJson =>
+const isManifest = (v: unknown): v is ModelManifest =>
+⋮----
+function readRuntimeEnv(): RuntimeEnv
+⋮----
+function describeRuntime(r: RuntimeEnv): string
+⋮----
+/** WebView thường không cô lập đa nguồn gốc nên chỉ dùng đa luồng khi crossOriginIsolated. */
+function pickThreads(r: RuntimeEnv): number
+⋮----
+/** Bản wasm-only dùng ort-wasm-simd-threaded.{mjs,wasm}: đúng các file scripts/copy-ort-wasm.mjs chép vào public/ort. */
+function importOrt(backend: Backend): Promise<OrtModule>
+⋮----
+async function fetchOk(fetchFn: FetchLike, url: string): Promise<FetchResponseLike>
+⋮----
+async function fetchJson<T>(fetchFn: FetchLike, url: string, guard: (v: unknown) => v is T): Promise<T>
+⋮----
+async function fetchBytes(fetchFn: FetchLike, url: string): Promise<ArrayBuffer>
+⋮----
+async function verifyBytes(buffer: ArrayBuffer, manifest: ModelManifest, checksum: boolean): Promise<void>
+⋮----
+/** F4: tạo ort.Tensor [1,3,S,S], chạy session, trả RawModelOutput; luôn giải phóng tensor tạm. */
+function makePredict(ort: OrtModule, session: InferenceSession, manifest: ModelManifest, size: number)
+⋮----
+/**
+ * F1-F3: đọc manifest/config/classes, tải onnx, kiểm kích thước và sha256, khởi tạo ORT (WASM, hoặc thử WebGPU trước
+ * nếu config.preferWebGpu và có navigator.gpu), chạy nóng một lần. Lỗi: MODEL_MISSING, MODEL_CORRUPT, MODEL_INIT_FAILED.
+ */
+export async function loadModel(o: LoadModelOptions): Promise<LoadedModel>
+⋮----
+await predict(new Float32Array(3 * size * size)); // F3: chạy nóng với tensor toàn 0
+</file>
+
+<file path="src/voice/native-tts-engine.ts">
+import { DEFAULT_SETTINGS } from '../config/app-config';
+import { AppError } from '../contracts';
+import type { ITtsEngine, TtsCapabilities, TtsHooks } from '../contracts';
+import { createLogger } from '../utils/logger';
+import { getPlatform } from '../utils/platform';
+import { createCapacitorTtsPort } from './native-tts-adapter';
+⋮----
+export interface NativeTtsVoice {
+  lang: string;
+  name?: string;
+  /** true nếu giọng chạy cục bộ (không cần Internet); undefined nếu plugin không cho biết. */
+  localService?: boolean;
+}
+⋮----
+/** true nếu giọng chạy cục bộ (không cần Internet); undefined nếu plugin không cho biết. */
+⋮----
+/**
+ * Cổng nhỏ che plugin TTS native. Mọi lỗi của plugin phải ra ngoài dưới dạng AppError TTS_UNAVAILABLE.
+ * speak luôn dùng hàng đợi kiểu flush: câu mới thay câu đang đọc; promise hoàn tất khi đọc xong.
+ */
+export interface NativeTtsPort {
+  isLanguageSupported(lang: string): Promise<boolean>;
+  listVoices(): Promise<NativeTtsVoice[]>;
+  speak(o: { text: string; lang: string; rate: number }): Promise<void>;
+  stop(): Promise<void>;
+}
+⋮----
+isLanguageSupported(lang: string): Promise<boolean>;
+listVoices(): Promise<NativeTtsVoice[]>;
+speak(o:
+stop(): Promise<void>;
+⋮----
+export interface NativeTtsDeps {
+  port: NativeTtsPort;
+  isNative: () => boolean;
+}
+⋮----
+function isVietnamese(lang: string): boolean
+⋮----
+function toAppError(e: unknown): AppError
+⋮----
+/** Engine TTS native với cổng tiêm vào (dùng cho test và cho createNativeTtsEngine). */
+export function createNativeTtsEngineWith(deps: NativeTtsDeps): ITtsEngine
+⋮----
+let current = 0; // id của câu đang chờ plugin; 0 = không có câu nào
+⋮----
+function stopQuietly(): void
+⋮----
+async function init(): Promise<TtsCapabilities>
+⋮----
+// KHÔNG CHẮC: nếu plugin không cho biết giọng nào chạy cục bộ thì coi giọng Việt là chạy ngoại tuyến (xem Giả định).
+⋮----
+function speak(text: string, opts: { rate: number; lang: string; audioKey?: string }, hooks: TtsHooks): void
+⋮----
+current = 0; // câu cũ bị thay: kết quả muộn của nó sẽ bị bỏ qua
+⋮----
+function cancel(): void
+⋮----
+/** Engine TTS native thật: chỉ available trong APK Android. */
+export function createNativeTtsEngine(): ITtsEngine
+</file>
+
+<file path="src/voice/speech-manager.ts">
+import type {
+  AppConfig,
+  HapticEvent,
+  IHaptics,
+  ISpeech,
+  ITtsEngine,
+  RecognitionResult,
+  Settings,
+  SpeechIntent,
+  TtsCapabilities,
+  TtsHooks,
+  UtteranceEvent,
+} from '../contracts';
+import { createLogger } from '../utils/logger';
+import { systemClock } from '../utils/time';
+import { buildPrompt } from './prompt-manager';
+import type { Prompt } from './prompt-manager';
+⋮----
+/**
+ * Ước lượng thời gian đọc để đặt watchdog: độ dài chữ × hệ số / tốc độ + đệm.
+ * AppConfig.speech chưa có các tham số này nên tạm đặt ở đây (xem "Đề xuất sửa hợp đồng").
+ */
+⋮----
+export interface SpeechManagerOptions {
+  engines: ITtsEngine[];
+  haptics: IHaptics;
+  getSettings: () => Settings;
+  config: AppConfig['speech'];
+  now?: () => number;
+}
+⋮----
+/** Hẹn giờ được tiêm vào để test không phải chờ thật. */
+export interface SpeechTimers {
+  setTimeout(handler: () => void, ms: number): unknown;
+  clearTimeout(handle: unknown): void;
+}
+⋮----
+setTimeout(handler: ()
+clearTimeout(handle: unknown): void;
+⋮----
+/** Cắt câu dài theo dấu chấm thành các câu ngắn (mỗi câu giữ dấu chấm của nó). */
+export function splitIntoUtterances(text: string): string[]
+⋮----
+/** Thời gian chờ tối đa cho một câu: số lớn hơn giữa maxUtteranceMs và ước lượng theo độ dài chữ. */
+export function utteranceTimeoutMs(text: string, rate: number, maxUtteranceMs: number): number
+⋮----
+function hapticFor(intent: SpeechIntent): HapticEvent | null
+⋮----
+interface QueueItem {
+  readonly kind: SpeechIntent['kind'];
+  readonly prompt: Prompt;
+  readonly chunks: readonly string[];
+  readonly enqueuedAt: number;
+  next: number;
+  started: boolean;
+}
+⋮----
+interface ActiveUtterance {
+  readonly id: number;
+  readonly item: QueueItem;
+  readonly watchdog: unknown;
+}
+⋮----
+interface ProbedEngine {
+  engine: ITtsEngine;
+  caps: TtsCapabilities;
+}
+⋮----
+type EndOutcome = 'ended' | 'error' | 'cancelled' | 'watchdog';
+⋮----
+/** Chọn engine: aria-live (nếu chọn đọc qua trình đọc màn hình) → engine đầu tiên có giọng Việt → audio-clip → engine nào dùng được. */
+function chooseEngine(probed: ProbedEngine[], speechOutput: Settings['speechOutput']): ProbedEngine | null
+⋮----
+/**
+ * Bộ điều phối giọng nói với hẹn giờ tiêm vào (dùng cho test và cho createSpeechManager).
+ * Bảo đảm: tại mọi thời điểm chỉ có MỘT utterance đang phát; mỗi utterance có đúng một sự kiện start và một end
+ * (kể cả khi bị hủy, lỗi hay watchdog); hook muộn của utterance cũ bị bỏ qua. Phải await init() trước khi say().
+ */
+export function createSpeechManagerWithTimers(o: SpeechManagerOptions, timers: SpeechTimers): ISpeech
+⋮----
+const spokenAt = new Map<string, number>(); // câu → lần cuối người dùng được báo (bắt đầu đọc hoặc đọc xong)
+⋮----
+let queue: QueueItem[] = []; // luôn sắp theo ưu tiên giảm dần; đầu hàng là mục đang đọc dở hoặc sắp đọc
+⋮----
+function safely(label: string, fn: () => void): void
+⋮----
+function emit(phase: UtteranceEvent['phase'], kind: UtteranceEvent['kind']): void
+⋮----
+function playHaptic(intent: SpeechIntent): void
+⋮----
+function isActive(id: number): boolean
+⋮----
+function removeItem(item: QueueItem): void
+⋮----
+/** Bỏ hướng dẫn chờ quá guidanceStaleMs (chỉ mục chưa đọc câu nào) và quên các câu đã quá cửa sổ chống lặp. */
+function dropStale(): void
+⋮----
+function isRepeat(text: string): boolean
+⋮----
+function remainingGapMs(): number
+⋮----
+/** Kết thúc utterance đang phát (đúng một lần), rồi đọc tiếp. Hook của utterance cũ (id lệch) bị bỏ qua. */
+function endUtterance(id: number, outcome: EndOutcome): void
+⋮----
+if (outcome !== 'ended' || item.next >= item.chunks.length) removeItem(item); // lỗi, hủy, watchdog: bỏ phần còn lại
+if (outcome === 'error' && item.next === 1) spokenAt.delete(item.prompt.text); // chưa nghe được gì: cho phép thử lại
+⋮----
+function cancelActive(): void
+⋮----
+function cancelEverything(): void
+⋮----
+function onWatchdog(id: number): void
+⋮----
+function startChunk(engine: ITtsEngine, item: QueueItem): void
+⋮----
+if (!isActive(id)) return; // một bộ nghe đã hủy hoặc ngắt ngay trong sự kiện start
+⋮----
+/** Đọc mục đầu hàng đợi nếu đang rảnh và đã đủ khoảng lặng; chưa đủ thì hẹn giờ. */
+function pump(): void
+⋮----
+function accept(intent: SpeechIntent, prompt: Prompt, settings: Settings): void
+⋮----
+// Ưu tiên cao hơn: xóa mục thấp hơn (kể cả mục đang đọc). Cùng supersedeKey: thay mục đang chờ.
+⋮----
+function say(intent: SpeechIntent): void
+⋮----
+// Fail Safe: dữ liệu không đáng tin thì KHÔNG đọc số tiền; kết quả hỏng được thay bằng lời từ chối an toàn.
+⋮----
+async function probe(engine: ITtsEngine): Promise<ProbedEngine>
+⋮----
+async function init(): Promise<TtsCapabilities>
+⋮----
+/** true khi có một utterance đang phát (từ start đến end); không tính khoảng lặng giữa hai câu. */
+get isSpeaking(): boolean
+⋮----
+unlock(): void
+⋮----
+replayLast(): void
+cancelAll(): void
+onUtterance(handler: (e: UtteranceEvent) => void): () => void
+⋮----
+/** Bộ điều phối giọng nói thật (hẹn giờ của hệ thống). */
+export function createSpeechManager(o: SpeechManagerOptions): ISpeech
+</file>
+
+<file path="src/main.ts">
+/**
+ * Điểm vào của ứng dụng: dựng các bản cài THẬT rồi nối vào createApp. Không có logic nghiệp vụ ở đây.
+ * Thứ tự dựng: cài đặt → giao diện (cho thẻ video) → camera → suy luận → rung → giọng nói → app.
+ * Lớp debug chỉ bật khi có ?debug=1 hoặc khi dựng ở chế độ development (vite --mode development); bản release không có.
+ */
+⋮----
+import { createAriaLiveEngine } from './accessibility/aria-live-engine';
+import { createSettingsManager } from './accessibility/settings-manager';
+import { createFrameAnalyzer } from './analyzer/frame-analyzer';
+import { createApp } from './app/app';
+import type { App } from './app/app';
+import { createAppLifecyclePort } from './app/app-lifecycle-adapter';
+import { createNativeTorchPort } from './app/native-torch';
+import { createCameraService } from './camera/camera-controller';
+import { DEFAULT_CONFIG } from './config/app-config';
+import type { SettingAck } from './contracts';
+import { createDecisionEngine } from './decision/decision-engine';
+import { checkBundledAssets } from './offline/asset-check';
+import { createSettingsStore } from './offline/settings-store';
+import { createAppUi } from './ui/app-ui';
+import { createLogger } from './utils/logger';
+import { getPlatform } from './utils/platform';
+import { systemClock } from './utils/time';
+import { createInferenceClient } from './vision/inference-client';
+import { createAudioClipEngine } from './voice/audio-clip-engine';
+import { createHaptics } from './voice/haptic-service';
+import { createNativeTtsEngine } from './voice/native-tts-engine';
+import { createSpeechManager } from './voice/speech-manager';
+import { createWebSpeechEngine } from './voice/web-speech-engine';
+⋮----
+function bootstrap(): App
+⋮----
+const base = import.meta.env.BASE_URL; // './' (Vite base): mọi tài nguyên nằm sẵn trong APK
+⋮----
+// Lời xác nhận khi đổi cài đặt đi qua bộ nói; bộ nói được dựng sau cài đặt nên nối muộn.
+let acknowledge: (what: SettingAck) => void = () =>
+⋮----
+acknowledge = (what) => speech.say(
+⋮----
+/** Lưới an toàn cuối cùng: nếu không dựng nổi giao diện thì vẫn phải có chữ (không để màn hình đen im lặng). */
+function showFatal(message: string): void
+⋮----
+void bootstrap().start(); // không dispose ở pagehide: WebView đóng thì camera và worker tự dừng, còn dispose nhầm là tắt app vĩnh viễn
+</file>
+
+<file path="src/decision/decision-engine.ts">
+import type {
+  AppConfig, AppErrorCode, DecisionInput, DecisionOutput, DecisionStatus, Denomination, FrameAnalysis,
+  GuidanceCode, IDecisionEngine, RecognitionResult, SpeechIntent, SystemEvent,
+} from '../contracts';
+import { INITIAL_SNAPSHOT, phaseOf, transition } from './state-manager';
+import type { AnalysisTrigger, StateTrigger, TransitionResult } from './state-manager';
+import { calculateTotal } from './total-calculator';
+import type { TotalCalculation } from './total-calculator';
+⋮----
+/** Bộ nhớ ngắn hạn của việc quét. Xóa khi APP_FOREGROUNDED và reset(). */
+interface ShortTermMemory {
+  /** Chữ ký (mệnh giá từ trái sang phải) của kết quả đã công bố; null = chưa có hoặc tiền đã rời khung. */
+  announcedSignature: string | null;
+  /** `now` của khung đầu chuỗi khung trống hiện tại; null = đang không trống. */
+  emptySince: number | null;
+  /** `now` của khung đầu chuỗi khung chưa ổn định hiện tại; null = đang ổn định hoặc đã rẽ sang nhánh khác. */
+  unstableSince: number | null;
+  /** `now` lần cuối phát mỗi mã guidance (cooldown tính riêng theo từng mã). */
+  guidanceAt: Partial<Record<GuidanceCode, number>>;
+}
+⋮----
+/** Chữ ký (mệnh giá từ trái sang phải) của kết quả đã công bố; null = chưa có hoặc tiền đã rời khung. */
+⋮----
+/** `now` của khung đầu chuỗi khung trống hiện tại; null = đang không trống. */
+⋮----
+/** `now` của khung đầu chuỗi khung chưa ổn định hiện tại; null = đang ổn định hoặc đã rẽ sang nhánh khác. */
+⋮----
+/** `now` lần cuối phát mỗi mã guidance (cooldown tính riêng theo từng mã). */
+⋮----
+/** Lý do chặn ở nhánh 5; vừa là DecisionStatus vừa là GuidanceCode. */
+type Block = 'PARTIAL_IN_FRAME' | 'BLUR' | 'LOW_LIGHT' | 'MULTI_NOT_ALLOWED';
+⋮----
+const freshMemory = (): ShortTermMemory =>
+⋮----
+/** Sao chép để module khác không sửa nhầm bản engine giữ: đọc lại phải y hệt lần đã đọc. */
+const cloneResult = (r: RecognitionResult): RecognitionResult =>
+⋮----
+const guidanceReason = (speech: SpeechIntent | null): string =>
+⋮----
+/** calculateTotal nhưng không ném lỗi: null nếu danh sách chốt hỏng (rỗng hoặc có giá trị lạ). */
+function safeTotal(denominations: Denomination[]): TotalCalculation | null
+⋮----
+/** Lời nói khi VÀO một trạng thái khởi động mới; null nếu trạng thái không đổi hoặc không có lời. */
+function entrySpeech(t: TransitionResult): SpeechIntent | null
+⋮----
+/**
+ * DecisionEngine (Module 6). XÁC ĐỊNH: cùng chuỗi đầu vào cho cùng chuỗi đầu ra; không đồng hồ, không DOM,
+ * không I/O; thời gian chỉ đến từ trường `now` của đầu vào. Fail Safe: result khác null (và shouldCalculateTotal)
+ * CHỈ xảy ra ở nhánh 7 của ANALYSIS, sau khi nhánh 1..6 đều đã loại trừ mọi nghi ngờ.
+ *
+ * Mã lý do (`reasons`) = [mã chính, ...mã phụ]:
+ * - SYSTEM hợp lệ: [tên sự kiện] + BOTH_READY | WAIT_CAMERA | WAIT_MODEL | MEMORY_CLEARED;
+ *   trái phép: ['ILLEGAL_TRANSITION', 'SỰ_KIỆN@TRẠNG_THÁI'] (bỏ qua, không đổi trạng thái).
+ * - FAILURE: ['FAILURE', mã lỗi] (+ DUPLICATE khi đang ERROR cùng mã: im lặng). USER_REPLAY: ['USER_REPLAY', HAS_RESULT | NO_RESULT].
+ * - ANALYSIS bị bỏ qua: ['ANALYSIS_IGNORED', ERROR_STATE | NOT_READY | BACKGROUNDED | SPEAKING] (+ SIGNATURE_RESET).
+ * - ANALYSIS nhánh 1..7: NO_DETECTIONS (+ SIGNATURE_RESET) · CONFLICT · OVERLAP · UNSURE_PRESENT + CAUSE_<mã> ·
+ *   BLOCKED_<PARTIAL_IN_FRAME | BLUR | LOW_LIGHT | MULTI_NOT_ALLOWED> · UNSTABLE (+ NO_CONSENSUS | TOTAL_FAILED) ·
+ *   ANTI_REPEAT · CONFIRMED; nhánh có lời hướng dẫn kèm GUIDANCE_SPOKEN | GUIDANCE_COOLDOWN | GUIDANCE_WAIT (chưa đủ thời gian chờ).
+ *
+ * ERROR là trạng thái cuối: mọi FAILURE dẫn tới đó; thoát bằng reset() rồi APP_STARTED.
+ * Trạng thái sau nhánh 4 và 5 đều là UNCERTAIN; sau anti-repeat là DETECTING.
+ */
+export function createDecisionEngine(config: AppConfig['decision']): IDecisionEngine
+⋮----
+function apply(trigger: StateTrigger): TransitionResult
+⋮----
+/** Dựng đầu ra. shouldCalculateTotal luôn đi cùng result: chỉ nhánh công bố mới truyền result. */
+function outputOf(
+    reasons: string[],
+    speech: SpeechIntent | null = null,
+    status: DecisionStatus | null = null,
+    result: RecognitionResult | null = null,
+  ): DecisionOutput
+⋮----
+function systemReasons(event: SystemEvent, t: TransitionResult): string[]
+⋮----
+function onSystem(event: SystemEvent): DecisionOutput
+⋮----
+function onFailure(code: AppErrorCode): DecisionOutput
+⋮----
+apply('FAILURE'); // hợp lệ ở mọi trạng thái: ưu tiên cao nhất
+⋮----
+function onReplay(): DecisionOutput
+⋮----
+/** Ghi nhận khung trống/không trống. Trả true nếu vừa xóa chữ ký đã công bố (tiền đã rời khung đủ lâu). */
+function trackEmpty(a: FrameAnalysis, now: number): boolean
+⋮----
+/** Phát guidance nếu mã này đã qua cooldown (tính riêng từng mã); ngược lại null. */
+function guide(code: GuidanceCode, now: number): SpeechIntent | null
+⋮----
+/** Nhánh 4: lời hướng dẫn hữu ích nhất cho khung còn tờ chưa chắc, xét theo thứ tự config.guidancePriority. */
+function unsureGuidance(a: FrameAnalysis): GuidanceCode
+⋮----
+/** Nhánh 5: khung chỉ có tờ chắc nhưng bị chặn theo cờ cấu hình; null nếu không bị chặn. */
+function blockOf(a: FrameAnalysis, noteCount: number): Block | null
+⋮----
+/** Đầu ra của một nhánh KHÔNG công bố: đổi trạng thái theo `trigger`, ngắt chuỗi "chưa ổn định". */
+function observe(trigger: AnalysisTrigger, status: DecisionStatus, reasons: string[], speech: SpeechIntent | null = null): DecisionOutput
+⋮----
+function onAnalysis(a: FrameAnalysis, now: number): DecisionOutput
+⋮----
+// 1. Không có detection nào: NO_MONEY chỉ được nói sau khi trống liên tục đủ noMoneyGuidanceDelayMs.
+⋮----
+// 2. Xung đột lớp.
+⋮----
+// 3. Chồng lấn.
+⋮----
+// 4. Còn tờ chưa chắc.
+⋮----
+// 5. Chỉ có tờ chắc nhưng bị chặn. Số tờ lấy số lớn hơn giữa detections và consensus để khung không nhất quán không lọt chính sách.
+⋮----
+// 6. Chưa ổn định (hoặc "ổn định" mà không có danh sách chốt dùng được): im lặng, quá unstableGuidanceMs thì HOLD_STEADY.
+⋮----
+// 7. Danh sách chốt: trùng chữ ký đã công bố thì im lặng (anti-repeat), ngược lại công bố kết quả mới.
+⋮----
+get state()
+get lastResult()
+handle(input: DecisionInput): DecisionOutput
+reset(): void
+</file>
+
+</files>

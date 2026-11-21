@@ -2,9 +2,9 @@ import type { AppConfig, Settings } from '../contracts';
 
 /** Mọi ngưỡng ở đây là điểm xuất phát để thử nghiệm, chưa phải giá trị đã được chứng minh. */
 export const DEFAULT_CONFIG: AppConfig = {
-  inference: { confLow: 0.25, confSure: 0.7, nmsIou: 0.7, agnosticNms: false, maxDetections: 20, targetFps: 3, preferWebGpu: false, verifyChecksum: true },
+  inference: { confLow: 0.25, confSure: 0.7, nmsIou: 0.45, agnosticNms: true, maxDetections: 20, targetFps: 5, preferWebGpu: false, verifyChecksum: true },
   analyzer: {
-    grayThumbWidth: 256, overlapRatio: 0.15, conflictIou: 0.5, minAreaRatio: 0.04, edgeMarginRatio: 0.01,
+    grayThumbWidth: 256, overlapRatio: 0.25, conflictIou: 0.5, minAreaRatio: 0.04, edgeMarginRatio: 0.05,
     blurThreshold: 60,   // phương sai Laplacian: PHẢI hiệu chỉnh trên điện thoại thật
     lowLightMean: 60,    // độ sáng trung bình 0..255
     stabilizer: { windowSize: 5, minAgree: 4, matchIou: 0.5, maxAgeMs: 2500 },
